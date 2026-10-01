@@ -178,8 +178,11 @@ export class OkxClient {
       );
     }
     // Spec §8/§14 — code !== "0" is an error, never a completed trade.
+    // For batch-style endpoints (trade/order) the REAL reason sits in
+    // data[].sCode/sMsg even when top-level code is "0" or "1" — surface it.
     if (json.code !== "0") {
-      throw new OkxApiError(json.code, json.msg, res.status);
+      const detail = Array.isArray(json.data) ? JSON.stringify(json.data).slice(0, 300) : "";
+      throw new OkxApiError(json.code, `${json.msg}${detail ? ` | ${detail}` : ""}`, res.status);
     }
     return json.data;
   }

@@ -50,7 +50,8 @@ async function main(): Promise<void> {
   if (!inst) throw new Error("BTC-USDT-SWAP not found");
   console.log(`[instrument] tickSz=${inst.tickSz} lotSz=${inst.lotSz} minSz=${inst.minSz} ctVal=${inst.ctVal}${inst.ctValCcy}`);
 
-  // §8 step 3: position mode — verify, do not blindly set (§7.9)
+  // §8 step 3: position mode — set once at init, then verify via queries.
+  await client.post("/api/v5/account/set-position-mode", { posMode: "long_short_mode" }, true);
   const poss = await getPositions(client);
   console.log(`[positions] open=${poss.length} (reconciled with exchange — §45)`);
   if (poss.length > 0) throw new Error(`unexpected open positions from previous run: ${poss.map(p => p.posSide).join(",")} — close manually first (§23 unexpected_position)`);
@@ -61,8 +62,14 @@ async function main(): Promise<void> {
 
   const day = new Date().toISOString().slice(0, 10).replaceAll("-", "");
   const seq = { n: 0 };
+  // §15 example format uses hyphens, but OKX validates clOrdId as
+  // LETTERS+DIGITS ONLY (≤32). Keep the semantic shape, drop separators.
   const nextCl = (kind: string, side: string) =>
-    `EVQ-BTC-${kind}-${side}-${day}-${String(++seq.n).padStart(6, "0")}`.slice(0, 32); // §15
+    `EVQBTC${kind}${side}${day}${String(++seq.n).padStart(6, "0")}`.slice(0, 32);
+
+  // $100-scale simulation: walk the MINIMUM valid size (minSz contracts),
+  // never 1 full contract — 1 ct (0.01 BTC ≈ $844) would exceed USDT margin.
+  const SZ = inst.minSz; // §24 — from instrument metadata
 
   async function roundTrip(kind: "LONG" | "SHORT"): Promise<void> {
     const posSide = kind === "LONG" ? "long" : "short";
@@ -72,7 +79,7 @@ async function main(): Promise<void> {
     const clOpen = nextCl(kind === "LONG" ? "L" : "S", "OPEN");
     const placed = await placeOrder(client, {
       instId: "BTC-USDT-SWAP", tdMode: "isolated", side: openSide, posSide,
-      ordType: "market", sz: "1", clOrdId: clOpen,
+      ordType: "market", sz: SZ, clOrdId: clOpen,
     });
     console.log(`[${kind}] opened ordId=${placed.ordId} clOrdId=${clOpen}`);
 
@@ -88,7 +95,7 @@ async function main(): Promise<void> {
     const clClose = nextCl(kind === "LONG" ? "L" : "S", "CLOSE");
     const closed = await placeOrder(client, {
       instId: "BTC-USDT-SWAP", tdMode: "isolated", side: closeSide, posSide,
-      ordType: "market", sz: "1", clOrdId: clClose,
+      ordType: "market", sz: SZ, clOrdId: clClose,
     });
     const closedFill = await waitForOrderTerminal(client, "BTC-USDT-SWAP", closed.ordId, { timeoutMs: 30_000, pollMs: 1_000 });
     if (closedFill.state !== "filled") throw new Error(`close order ended ${closedFill.state} (§14)`);
