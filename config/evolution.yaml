@@ -1,0 +1,14 @@
+# Learning & evolution schedule — spec §3, §31, §34, §36, §48
+review_every_closed_trade: true
+signal_evolution_interval_trades: 20
+strategy_evolution_interval_trades: 50
+minimum_validation_sample: 30
+
+constraints:
+  max_weight_change_per_cycle_pct: 10      # §31
+  max_param_changes_per_challenger: 2      # §36
+  # promotion criteria are FIXED — evolution may not rewrite these (§48)
+  champion_vs_challenger:
+    requires_out_of_sample: true
+    requires_walk_forward: true
+    min_sample_each_side: 30

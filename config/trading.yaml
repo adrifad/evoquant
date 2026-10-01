@@ -1,0 +1,25 @@
+# Initial trading configuration — spec §3
+exchange: okx
+environment: demo   # spec §44: anything else aborts startup
+
+instrument:
+  id: BTC-USDT-SWAP
+  type: SWAP
+
+timeframe: 15m
+
+account:
+  margin_mode: isolated
+  position_mode: long_short_mode
+
+leverage:
+  default: 3
+  hard_max: 5
+
+decision:
+  minimum_confidence: 0.70   # calibrated confidence (spec §33)
+
+strategies_enabled:
+  - TREND_FOLLOWING_V1
+  - BREAKOUT_V1
+  - MEAN_REVERSION_V1

@@ -1,0 +1,25 @@
+# Risk limits — spec §3, §23. HARD CODES: values here are validated
+# against absolute maximums in src/risk/limits.ts; out-of-range config
+# fails startup. The AI/evolution layer must never write this file.
+hard_limits:
+  risk_per_trade_pct: 0.5
+  max_daily_loss_pct: 3.0
+  max_drawdown_pct: 10.0
+  max_leverage: 5
+  max_concurrent_positions: 1
+  allowed_symbols:
+    - BTC-USDT-SWAP
+
+kill_switch:
+  # any of these = NO NEW ENTRIES (spec §23)
+  - api_state_uncertain
+  - position_mismatch
+  - repeated_order_failure
+  - clock_drift_exceeded
+  - database_unavailable
+  - invalid_instrument_metadata
+  - unexpected_position
+  - max_daily_loss_reached
+  - max_drawdown_reached
+
+clock_drift_max_ms: 1000

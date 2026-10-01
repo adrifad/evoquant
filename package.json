@@ -1,0 +1,25 @@
+{
+  "name": "evoquant",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Self-Evolving AI Quant Trading System — OKX Demo only. Adaptive Quant Intelligence.",
+  "engines": { "node": ">=22" },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "node --test tests/",
+    "smoke:public": "node --experimental-strip-types src/scripts/smoke-public.ts",
+    "smoke:demo": "node --experimental-strip-types src/scripts/smoke-demo.ts",
+    "bot": "node --experimental-strip-types src/core/main.ts"
+  },
+  "dependencies": {
+    "better-sqlite3": "^12.2.0",
+    "yaml": "^2.8.0",
+    "zod": "^4.1.0"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/node": "^24.0.0",
+    "typescript": "^5.9.0"
+  }
+}
