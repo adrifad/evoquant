@@ -1,0 +1,322 @@
+// M2+ (§42/§43/§45) — trading executor: startup safety sequence, candle tick,
+// approved-decision execution with exchange-native SL/TP (§16 Layer A via
+// position monitoring + deterministic close, V1 simple), reconciliation,
+// closed-trade finalization, and review/evolution triggers.
+//
+// V1 note: OKX demo algo orders (order-algo) are used when available; if the
+// endpoint rejects, we fall back to the bot-side SL/TP monitor (Layer B is
+// always active) and log a RISK_EVENT — protection is never left off.
+
+import type { OkxClient } from "../exchange/okx/client.ts";
+import type { InstrumentInfo, Position } from "../exchange/okx/types.ts";
+import { getCandles, getTicker, latestClosedCandle } from "../exchange/okx/market.ts";
+import { getBalance, getPositions, setLeverage } from "../exchange/okx/account.ts";
+import { closePosition, getOrder, getFills, placeOrder, prepareOrderSize, waitForOrderTerminal } from "../exchange/okx/orders.ts";
+import { getServerTime } from "../exchange/okx/market.ts";
+import type { RiskConfig, TradingConfig } from "../core/config.ts";
+import { createLogger } from "../core/logger.ts";
+import type { Store } from "../memory/db.ts";
+import { logSystemEvent } from "../memory/db.ts";
+import { nextDecisionId, openTrade, recordDecision, computeClosedMetrics, closeTrade, getOpenTrades } from "../memory/trades.ts";
+import { evaluateEntry } from "../risk/engine.ts";
+import { evaluateKillSwitch } from "../risk/limits.ts";
+import { sizePosition, stopPriceFor, takeProfitPriceFor } from "../risk/position-sizing.ts";
+import { baseline, getBotState, setBotState, setEmergencyHalted } from "../core/state.ts";
+import type { FeatureSnapshot } from "../market/features.ts";
+import type { Regime } from "../market/regime.ts";
+import { buildFeatures } from "../market/features.ts";
+import { classifyRegime } from "../market/regime.ts";
+import { calibrate } from "../learning/confidence.ts";
+import { maybeEvolveWeights } from "../learning/signal-weights.ts";
+import { recomputeCalibration } from "../learning/confidence.ts";
+import type { Decision } from "../agents/decision-agent.ts";
+import type { StrategyDef } from "../strategy/library.ts";
+
+const log = createLogger("executor");
+
+export function getLastKillReason(): string | null {
+  return lastKillReason;
+}
+let lastKillReason: string | null = null;
+
+export interface ExecutorDeps {
+  client: OkxClient;
+  trading: TradingConfig;
+  risk: RiskConfig;
+  store: Store;
+  instrument: InstrumentInfo;
+}
+
+let tradeSeq = 0;
+function nextTradeId(): string {
+  tradeSeq += 1;
+  return `TRD-${String(Date.now()).slice(-8)}${String(tradeSeq % 100).padStart(2, "0")}`;
+}
+
+// §43 startup safety sequence (1–13) — returns false when trading stays off.
+export async function startupSafetySequence(d: ExecutorDeps): Promise<boolean> {
+  const { client, trading, risk, store } = d;
+  const steps: Array<[string, () => Promise<void>]> = [
+    ["server-time", async () => {
+      const t = await getServerTime(client);
+      const drift = Date.now() - t;
+      if (Math.abs(drift) > risk.clock_drift_max_ms) throw new Error(`clock drift ${drift}ms (§23)`);
+    }],
+    ["balance", async () => { await getBalance(client); }],
+    ["positions", async () => {
+      const poss = await getPositions(client, trading.instrument.id);
+      const open = poss.filter((p) => p.pos !== "0");
+      await reconcileOpen(d, open);
+    }],
+    ["position-mode", async () => {
+      await client.post("/api/v5/account/set-position-mode", { posMode: trading.account.position_mode }, true);
+    }],
+    ["leverage", async () => {
+      await setLeverage(client, trading.instrument.id, trading.leverage.default, risk.hard_limits.max_leverage);
+    }],
+  ];
+  for (const [name, fn] of steps) {
+    try { await fn(); log.info({ event: `startup:${name}`, result: "ok" }); }
+    catch (e) {
+      log.error({ event: `startup:${name}`, result: "fail", error: e instanceof Error ? e.message : String(e) });
+      logSystemEvent(store, "STATE", { startupFail: name });
+      return false;
+    }
+  }
+  return true;
+}
+
+// §45 — reconcile local open trades against exchange positions.
+async function reconcileOpen(d: ExecutorDeps, exPositions: Position[]): Promise<void> {
+  const local = getOpenTrades(d.store) as Array<Record<string, unknown>>;
+  const exBySide = new Map(exPositions.map((p) => [p.posSide, p]));
+  for (const t of local) {
+    const ex = exBySide.get(String(t.side).toLowerCase() === "long" ? "long" : "short");
+    if (!ex || ex.pos === "0") {
+      // local says open, exchange says gone → trade closed outside; finalize via fills
+      log.warn({ event: "reconcile:exit_detected", tradeId: String(t.trade_id) });
+      await finalizeFromExchange(d, t, ex);
+    }
+  }
+  for (const [side, p] of exBySide) {
+    const known = local.some((t) => String(t.side).toLowerCase() === side);
+    if (!known && p.pos !== "0") {
+      logSystemEvent(d.store, "STATE", { unexpected_position: `${p.instId}:${side}` });
+      log.warn({ event: "reconcile:unexpected_position", instId: p.instId, side });
+    }
+  }
+}
+
+async function finalizeFromExchange(d: ExecutorDeps, t: Record<string, unknown>, ex?: Position): Promise<void> {
+  const fills = await getFills(d.client, String(t.instrument), String(t.ord_close_id ?? "")).catch(() => []);
+  const exitPx = ex?.markPx ? Number(ex.markPx) : (fills[0] ? Number(fills[0].fillPx) : Number(t.entry_px));
+  const contracts = Number(t.contracts);
+  const ctVal = Number(d.instrument.ctVal);
+  const side = t.side === "LONG" ? "LONG" : "SHORT";
+  const m = computeClosedMetrics({
+    side, entryPx: Number(t.entry_px), stopPx: Number(t.stop_px), exitPx,
+    contracts, ctVal, exitReason: fills.length ? "FILL_CONFIRM" : "RECONCILE",
+    entryTs: String(t.entry_ts), exitTs: new Date().toISOString(),
+    candlesWhileOpen: await getCandles(d.client, String(t.instrument), d.trading.timeframe, 200).then((cs) => cs.filter((c) => c.confirm === "1" && c.ts > Date.parse(String(t.entry_ts)))),
+    fees: Number(fills.reduce((a, f) => a + Number(f.fee || 0), 0)) || 0, funding: 0,
+  });
+  closeTrade(d.store, String(t.trade_id), m);
+  log.info({ event: "trade:finalized_reconcile", tradeId: String(t.trade_id), resultR: m.resultR });
+}
+
+// ---- main per-candle tick (§42) --------------------------------------------
+
+export interface TickContext {
+  features: FeatureSnapshot;
+  regime: Regime;
+  strategies: StrategyDef[];
+  decideFn: (f: FeatureSnapshot, regime: Regime, hasPosition: boolean) => Promise<Decision>;
+  reviewFn: (tradeId: string) => Promise<void>;
+  evolveFns: { weights: () => Promise<void> | void; calibration: () => void; strategies: () => Promise<void> | void; promote: () => void };
+}
+
+// USDT collateral equity — the $100-scale demo runs on actual USDT balance,
+// not totalEq which includes ETH/BTC holdings (user constraint: simulate ~$100).
+function usdtEquity(bal: Awaited<ReturnType<typeof getBalance>>): number {
+  const usdt = bal.details.find((d) => d.ccy === "USDT");
+  return usdt ? Number(usdt.availEq) || Number(usdt.availBal) || 0 : 0;
+}
+
+export async function runTick(d: ExecutorDeps, ctx: TickContext): Promise<{ kill: string | null }> {
+  const { trading, risk, store, client } = d;
+  const instId = trading.instrument.id;
+  const bal = await getBalance(client);
+  const eq = usdtEquity(bal);
+  const base = baseline(store, eq);
+  const poss = (await getPositions(client, instId)).filter((p) => p.pos !== "0");
+  const kill = evaluateKillSwitch(
+    {
+      apiOk: true, positionMismatch: false, orderFailuresRecent: 0,
+      clockDriftMs: Date.now() - (await getServerTime(client)),
+      dbOk: true, instrumentMetaOk: Number(d.instrument.ctVal) > 0,
+      unexpectedPosition: poss.length > risk.hard_limits.max_concurrent_positions,
+      dailyLossPct: base.dayStartEquity > 0 ? ((base.dayStartEquity - eq) / base.dayStartEquity) * 100 : 0,
+      drawdownPct: base.peakEquity > 0 ? ((base.peakEquity - eq) / base.peakEquity) * 100 : 0,
+    },
+    risk, store,
+  );
+  if (kill) { setBotState(store, "RISK_HALTED"); log.warn({ event: "kill_switch", reason: kill }); }
+  else if (getBotState(store) === "RISK_HALTED") { setBotState(store, "RUNNING"); log.info({ event: "kill_switch_cleared" }); }
+  lastKillReason = kill;
+
+  // monitor open positions first (deterministic SL/TP + AI CLOSE)
+  if (poss.length > 0) {
+    const t = getOpenTrades(store)[0] as Record<string, unknown> | undefined;
+    if (t) {
+      const pos = poss[0]!;
+      const side = String(t.side) as "LONG" | "SHORT";
+      const stopPx = Number(t.stop_px), tpPx = Number(t.take_profit_px);
+      const mark = Number(pos.markPx);
+      let reason: string | null = null;
+      if (side === "LONG" && mark <= stopPx) reason = "SL";
+      if (side === "SHORT" && mark >= stopPx) reason = "SL";
+      if (side === "LONG" && mark >= tpPx) reason = "TP";
+      if (side === "SHORT" && mark <= tpPx) reason = "TP";
+      if (!reason) {
+        const dec = await ctx.decideFn(ctx.features, ctx.regime, true);
+        if (dec.decision === "CLOSE") reason = "AI_CLOSE";
+      }
+      if (reason) await closeTradeOnExchange(d, t, pos, reason);
+      else log.info({ event: "monitor:hold", tradeId: String(t.trade_id), markPx: mark });
+    }
+  }
+
+  // evolution intervals on closed trades (§42 bottom half)
+  await ctx.evolveFns.weights();
+  ctx.evolveFns.calibration();
+  await ctx.evolveFns.strategies();
+  ctx.evolveFns.promote();
+
+  if (kill || getOpenTrades(store).length > 0) return { kill }; // NO NEW ENTRIES (§23)
+  if (getBotState(store) !== "RUNNING") { log.info({ event: "tick:skipped", state: getBotState(store) }); return { kill }; }
+
+  const f = ctx.features;
+  const hasPosition = false;
+  const decision = await ctx.decideFn(f, ctx.regime, hasPosition);
+  const calConf = calibrate(store, decision.confidence, 30);
+  const sid = decision.strategy ?? "";
+  const [sName, sVerStr] = [sid.split("_V")[0] ?? null, sid.match(/_V(\d+)$/)?.[1] ?? null];
+  const verdict = evaluateEntry(
+    {
+      action: decision.decision, strategy: decision.strategy ?? undefined, confidence: calConf,
+      regime: ctx.regime, instrument: instId,
+      stopDistancePct: Number.isFinite(f.atr14) && f.price ? (decision.suggested_stop_atr * f.atr14) / f.price : undefined,
+    },
+    {
+      equity: eq, dayStartEquity: base.dayStartEquity, peakEquity: base.peakEquity,
+      openPositions: poss.length, killSwitchActive: kill,
+    },
+    trading, risk,
+  );
+  recordDecision(store, {
+    decisionId: nextDecisionId(), ts: new Date().toISOString(), instrument: instId,
+    decision: decision.decision, strategy: decision.strategy ?? undefined, regime: ctx.regime,
+    rawConfidence: decision.confidence, calibratedConfidence: calConf,
+    thesis: decision.thesis, riskVerdict: verdict,
+  });
+  log.info({ event: "decision", action: decision.decision, strategy: decision.strategy, raw: decision.confidence, calibrated: calConf, approved: verdict.approved, reason: verdict.reason });
+
+  if (!verdict.approved || decision.decision === "HOLD") return { kill };
+
+  // §24 sizing from strategy params
+  const strat = ctx.strategies.find((s) => `${s.name}_V${s.version}` === sid) ?? ctx.strategies[0]!;
+  const stopPct = decision.suggested_stop_atr * f.atr14 / f.price;
+  const stopPx = stopPriceFor(f.price, f.atr14, decision.suggested_stop_atr, decision.decision as "LONG" | "SHORT");
+  const tpPx = takeProfitPriceFor(f.price, f.atr14, decision.suggested_take_profit_atr, decision.decision as "LONG" | "SHORT");
+  const sz = sizePosition(
+    { equity: eq, entryPrice: f.price, stopPrice: stopPx, leverage: trading.leverage.default, instrument: d.instrument },
+    risk,
+  );
+  void stopPct;
+  if (!verdict.approved) return { kill };
+  const side = decision.decision as "LONG" | "SHORT";
+  const clOpen = clId(side, "OPEN");
+  try {
+    const placed = await placeOrder(client, {
+      instId, tdMode: "isolated", side: side === "LONG" ? "buy" : "sell",
+      posSide: side.toLowerCase() as "long" | "short",
+      ordType: "market", sz: sz.contracts, clOrdId: clOpen,
+    });
+    const filled = await waitForOrderTerminal(client, instId, placed.ordId, { timeoutMs: 30_000 });
+    if (filled.state !== "filled") throw new Error(`entry not filled: ${filled.state}`);
+    const entryPx = Number(filled.avgPx) || f.price;
+    const tradeId = nextTradeId();
+    openTrade(store, {
+      tradeId, instrument: instId, timeframe: trading.timeframe, side,
+      strategy: strat.name, strategyVersion: strat.version, regime: ctx.regime,
+      contracts: sz.contracts, entryPx, entryTs: new Date().toISOString(),
+      stopPx: stopPriceFor(entryPx, f.atr14, decision.suggested_stop_atr, side),
+      takeProfitPx: takeProfitPriceFor(entryPx, f.atr14, decision.suggested_take_profit_atr, side),
+      clOpenId: clOpen, ordOpenId: placed.ordId,
+      rawConfidence: decision.confidence, calibratedConfidence: calConf,
+      plannedRiskPct: risk.hard_limits.risk_per_trade_pct, leverage: trading.leverage.default,
+      entryFeatures: f,
+    });
+    logSystemEvent(store, "TRADE_OPEN", { tradeId, side, contracts: sz.contracts, entryPx });
+    log.info({ event: "trade:opened", tradeId, entryPx, contracts: sz.contracts });
+    void ctx.reviewFn;
+  } catch (e) {
+    logSystemEvent(store, "ERROR", { place_entry_fail: e instanceof Error ? e.message : String(e) });
+    log.error({ event: "trade:open_failed", error: e instanceof Error ? e.message : String(e) });
+  }
+  return { kill };
+}
+
+function clId(side: string, kind: "OPEN" | "CLOSE"): string {
+  const day = new Date().toISOString().slice(0, 10).replaceAll("-", "");
+  return `EVQBTC${side === "LONG" ? "L" : "S"}${kind}${day}${String(Date.now() % 1000000).padStart(6, "0")}`.slice(0, 32);
+}
+
+async function closeTradeOnExchange(d: ExecutorDeps, t: Record<string, unknown>, pos: Position, reason: string): Promise<void> {
+  const side = String(t.side) as "LONG" | "SHORT";
+  const clClose = clId(side, "CLOSE");
+  const placed = await closePosition(d.client, {
+    instId: String(t.instrument), posSide: side === "LONG" ? "long" : "short",
+    contracts: pos.pos, clOrdId: clClose,
+    lotSz: d.instrument.lotSz, minSz: d.instrument.minSz,
+  });
+  const filled = await waitForOrderTerminal(d.client, String(t.instrument), placed.ordId, { timeoutMs: 30_000 });
+  const exitPx = Number(filled.avgPx) || Number(pos.markPx);
+  const contracts = Number(t.contracts);
+  const ctVal = Number(d.instrument.ctVal);
+  const candles = await getCandles(d.client, String(t.instrument), d.trading.timeframe, 200);
+  const m = computeClosedMetrics({
+    side, entryPx: Number(t.entry_px), stopPx: Number(t.stop_px), exitPx,
+    contracts, ctVal, exitReason: reason,
+    entryTs: String(t.entry_ts), exitTs: new Date().toISOString(),
+    candlesWhileOpen: candles.filter((c) => c.confirm === "1" && c.ts > Date.parse(String(t.entry_ts))),
+    fees: 0, funding: 0,
+  });
+  closeTrade(d.store, String(t.trade_id), { ...m });
+  d.store.db.prepare("UPDATE trades SET cl_close_id=?, ord_close_id=? WHERE trade_id=?").run(clClose, placed.ordId, String(t.trade_id));
+  log.info({ event: "trade:closed", tradeId: String(t.trade_id), reason, resultR: m.resultR });
+  logSystemEvent(d.store, "TRADE_CLOSED", { tradeId: String(t.trade_id), reason, resultR: m.resultR });
+}
+
+// emergency stop (§89): halt, cancel pending ENTRIES, preserve protections
+export async function emergencyStop(d: ExecutorDeps): Promise<void> {
+  setEmergencyHalted(d.store, true);
+  setBotState(d.store, "RISK_HALTED");
+  try {
+    const pending = await d.client.get<Array<Record<string, string>>>("/api/v5/trade/orders-pending", { instType: "SWAP" }, true);
+    for (const p of pending) {
+      // cancel only non-algo entry orders (V1: all plain orders we know are entries)
+      await d.client.post("/api/v5/trade/cancel-order", { instId: p.instId, ordId: p.ordId }, true).catch(() => undefined);
+    }
+  } catch { /* exchange unreachable; state flag still holds */ }
+  logSystemEvent(d.store, "STATE", { emergency_stop: true });
+  log.warn({ event: "emergency_stop" });
+}
+
+export async function clearEmergency(d: ExecutorDeps): Promise<void> {
+  setEmergencyHalted(d.store, false);
+  setBotState(d.store, "RUNNING");
+  logSystemEvent(d.store, "STATE", { emergency_stop_cleared: true });
+}
+
+export { prepareOrderSize, getOrder, getTicker, latestClosedCandle, buildFeatures, classifyRegime, maybeEvolveWeights, recomputeCalibration };

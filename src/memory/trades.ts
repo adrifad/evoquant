@@ -14,8 +14,8 @@ export function recordDecision(
   store: Store,
   d: {
     decisionId: string; ts: string; instrument: string; decision: string;
-    strategy?: string; regime: string; rawConfidence?: number; calibratedConfidence?: number;
-    thesis?: string[]; riskVerdict: unknown;
+    strategy?: string | undefined; regime: string; rawConfidence?: number | undefined; calibratedConfidence?: number | undefined;
+    thesis?: string[] | undefined; riskVerdict: unknown;
   },
 ): void {
   store.db
@@ -49,7 +49,7 @@ export function openTrade(
       `INSERT INTO trades(trade_id,status,instrument,timeframe,side,strategy,strategy_version,regime,contracts,
         entry_px,entry_ts,stop_px,take_profit_px,cl_open_id,ord_open_id,
         raw_confidence,calibrated_confidence,planned_risk_pct,leverage,entry_features)
-       VALUES(?, 'OPEN', ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+       VALUES(?, 'OPEN', ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
     )
     .run(
       t.tradeId, t.instrument, t.timeframe, t.side, t.strategy, t.strategyVersion, t.regime, t.contracts,

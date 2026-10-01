@@ -3,6 +3,7 @@
 // NOTE: no secrets are ever written here.
 
 import Database from "better-sqlite3";
+import { mkdirSync } from "node:fs";
 import path from "node:path";
 
 const SCHEMA = `
@@ -103,7 +104,9 @@ export interface Store {
 }
 
 export function openStore(root: string): Store {
-  const file = path.join(root, "data", "trader.db");
+  const dir = path.join(root, "data");
+  mkdirSync(dir, { recursive: true });
+  const file = path.join(dir, "trader.db");
   const db = new Database(file);
   db.pragma("journal_mode = WAL");
   db.pragma("foreign_keys = ON");

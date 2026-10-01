@@ -24,7 +24,7 @@ const TradingSchema = z.object({
   exchange: z.literal("okx"),
   environment: z.literal("demo"),
   instrument: z.object({ id: z.string(), type: z.literal("SWAP") }),
-  timeframe: z.string(),
+  timeframe: z.enum(["1m", "3m", "5m", "15m", "30m", "1H", "2H", "4H", "6H", "12H", "1D", "1W"]),
   account: z.object({
     margin_mode: z.literal("isolated"),
     position_mode: z.literal("long_short_mode"),
