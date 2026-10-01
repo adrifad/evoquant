@@ -7,7 +7,7 @@
   "engines": { "node": ">=22" },
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "test": "node --test tests/",
+    "test": "node --test --experimental-strip-types tests/*.test.ts",
     "smoke:public": "node --experimental-strip-types src/scripts/smoke-public.ts",
     "smoke:demo": "node --experimental-strip-types src/scripts/smoke-demo.ts",
     "bot": "node --experimental-strip-types src/core/main.ts"
