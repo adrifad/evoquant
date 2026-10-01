@@ -12,6 +12,7 @@ import type { InstrumentInfo, Position } from "../exchange/okx/types.ts";
 import { getCandles, getTicker, latestClosedCandle } from "../exchange/okx/market.ts";
 import { getBalance, getPositions, setLeverage } from "../exchange/okx/account.ts";
 import { closePosition, getOrder, getFills, placeOrder, prepareOrderSize, waitForOrderTerminal } from "../exchange/okx/orders.ts";
+import { placeConditionalProtection, cancelAlgo } from "../exchange/okx/algo.ts";
 import { getServerTime } from "../exchange/okx/market.ts";
 import type { RiskConfig, TradingConfig } from "../core/config.ts";
 import { createLogger } from "../core/logger.ts";
@@ -48,6 +49,7 @@ export interface ExecutorDeps {
 }
 
 let tradeSeq = 0;
+let consecutiveOrderFailures = 0; // §23 REPEATED_ORDER_FAILURE input
 function nextTradeId(): string {
   tradeSeq += 1;
   return `TRD-${String(Date.now()).slice(-8)}${String(tradeSeq % 100).padStart(2, "0")}`;
@@ -126,6 +128,26 @@ async function finalizeFromExchange(d: ExecutorDeps, t: Record<string, unknown>,
 
 // ---- main per-candle tick (§42) --------------------------------------------
 
+export function persistCandles(store: Store, instId: string, bar: string, candles: Array<{ ts: number; o: number; h: number; l: number; c: number; vol: number; volCcy: number; confirm: string }>): void {
+  const ins = store.db.prepare(`INSERT INTO candles(instId,bar,ts,o,h,l,c,vol,volCcy,confirm) VALUES(?,?,?,?,?,?,?,?,?,?)
+    ON CONFLICT(instId,bar,ts) DO UPDATE SET confirm=excluded.confirm`);
+  for (const c of candles) ins.run(instId, bar, c.ts, c.o, c.h, c.l, c.c, c.vol, c.volCcy, c.confirm);
+}
+
+export function persistOrder(store: Store, o: { ordId: string; clOrdId?: string | undefined; instId: string; side?: string | undefined; posSide?: string | undefined; ordType?: string | undefined; sz?: string | undefined; state?: string | undefined; avgPx?: string | undefined; cTime?: string | undefined; uTime?: string | undefined; tradeId?: string | undefined; kind?: string | undefined }): void {
+  store.db.prepare(`INSERT INTO orders(ordId,clOrdId,instId,side,posSide,ordType,sz,state,avgPx,cTime,uTime,trade_id,kind)
+    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(ordId) DO UPDATE SET state=excluded.state, avgPx=excluded.avgPx, uTime=excluded.uTime`)
+    .run(o.ordId, o.clOrdId ?? null, o.instId, o.side ?? null, o.posSide ?? null, o.ordType ?? null,
+         o.sz ?? null, o.state ?? null, o.avgPx ?? null, o.cTime ?? null, o.uTime ?? null,
+         o.tradeId ?? null, o.kind ?? null);
+}
+
+export function persistFills(store: Store, fills: Array<{ tradeId: string; ordId: string; clOrdId?: string | undefined; instId: string; fillPx: string; fillSz: string; fee?: string | undefined; feeCcy?: string | undefined; side: string; posSide: string; ts: string }>): void {
+  const ins = store.db.prepare(`INSERT INTO fills(tradeId,ordId,clOrdId,instId,fillPx,fillSz,fee,feeCcy,side,posSide,ts)
+    VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(tradeId) DO NOTHING`);
+  for (const f of fills) ins.run(f.tradeId, f.ordId, f.clOrdId ?? null, f.instId, f.fillPx, f.fillSz, f.fee ?? null, f.feeCcy ?? null, f.side, f.posSide, f.ts);
+}
+
 export interface TickContext {
   features: FeatureSnapshot;
   regime: Regime;
@@ -145,13 +167,19 @@ function usdtEquity(bal: Awaited<ReturnType<typeof getBalance>>): number {
 export async function runTick(d: ExecutorDeps, ctx: TickContext): Promise<{ kill: string | null }> {
   const { trading, risk, store, client } = d;
   const instId = trading.instrument.id;
+  // §40 persistence: instrument metadata + candles snapshot each tick
+  store.db.prepare(`INSERT INTO instruments(instId,instType,tickSz,lotSz,minSz,ctVal,ctValCcy,cached_ts)
+    VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(instId) DO UPDATE SET cached_ts=excluded.cached_ts`)
+    .run(d.instrument.instId, "SWAP", d.instrument.tickSz, d.instrument.lotSz, d.instrument.minSz,
+         d.instrument.ctVal, d.instrument.ctValCcy, new Date().toISOString());
   const bal = await getBalance(client);
   const eq = usdtEquity(bal);
   const base = baseline(store, eq);
   const poss = (await getPositions(client, instId)).filter((p) => p.pos !== "0");
+  const localOpenCount = getOpenTrades(store).length;
   const kill = evaluateKillSwitch(
     {
-      apiOk: true, positionMismatch: false, orderFailuresRecent: 0,
+      apiOk: true, positionMismatch: localOpenCount > 0 && poss.length === 0, orderFailuresRecent: consecutiveOrderFailures,
       clockDriftMs: Date.now() - (await getServerTime(client)),
       dbOk: true, instrumentMetaOk: Number(d.instrument.ctVal) > 0,
       unexpectedPosition: poss.length > risk.hard_limits.max_concurrent_positions,
@@ -169,14 +197,8 @@ export async function runTick(d: ExecutorDeps, ctx: TickContext): Promise<{ kill
     const t = getOpenTrades(store)[0] as Record<string, unknown> | undefined;
     if (t) {
       const pos = poss[0]!;
-      const side = String(t.side) as "LONG" | "SHORT";
-      const stopPx = Number(t.stop_px), tpPx = Number(t.take_profit_px);
       const mark = Number(pos.markPx);
-      let reason: string | null = null;
-      if (side === "LONG" && mark <= stopPx) reason = "SL";
-      if (side === "SHORT" && mark >= stopPx) reason = "SL";
-      if (side === "LONG" && mark >= tpPx) reason = "TP";
-      if (side === "SHORT" && mark <= tpPx) reason = "TP";
+      let reason: "SL" | "TP" | "AI_CLOSE" | null = priceTrigger(t, mark);
       if (!reason) {
         const dec = await ctx.decideFn(ctx.features, ctx.regime, true);
         if (dec.decision === "CLOSE") reason = "AI_CLOSE";
@@ -244,6 +266,10 @@ export async function runTick(d: ExecutorDeps, ctx: TickContext): Promise<{ kill
     });
     const filled = await waitForOrderTerminal(client, instId, placed.ordId, { timeoutMs: 30_000 });
     if (filled.state !== "filled") throw new Error(`entry not filled: ${filled.state}`);
+    consecutiveOrderFailures = 0;
+    persistOrder(store, { ordId: placed.ordId, clOrdId: clOpen, instId, side: side === "LONG" ? "buy" : "sell",
+      posSide: side.toLowerCase(), ordType: "market", sz: sz.contracts, state: filled.state,
+      avgPx: filled.avgPx, cTime: filled.cTime, uTime: filled.uTime, tradeId: "", kind: "OPEN" });
     const entryPx = Number(filled.avgPx) || f.price;
     const tradeId = nextTradeId();
     openTrade(store, {
@@ -257,22 +283,59 @@ export async function runTick(d: ExecutorDeps, ctx: TickContext): Promise<{ kill
       plannedRiskPct: risk.hard_limits.risk_per_trade_pct, leverage: trading.leverage.default,
       entryFeatures: f,
     });
+    // §16 Layer A — exchange-native conditional (SL+TP) algo orders.
+    // Best-effort: on failure Layer B (monitor below) still holds; flag it.
+    try {
+      const algo = await placeConditionalProtection(client, {
+        instId,
+        posSide: side === "LONG" ? "long" : "short",
+        contracts: sz.contracts,
+        stopPrice: stopPriceFor(entryPx, f.atr14, decision.suggested_stop_atr, side),
+        takeProfitPrice: takeProfitPriceFor(entryPx, f.atr14, decision.suggested_take_profit_atr, side),
+        clAlgoId: clId(side, "ALGO"),
+      });
+      store.db.prepare("UPDATE trades SET algo_id=? WHERE trade_id=?").run(algo.algoId, tradeId);
+      log.info({ event: "protection:algo_placed", tradeId, algoId: algo.algoId });
+    } catch (algoErr) {
+      logSystemEvent(store, "RISK_EVENT", { protection_degraded: algoErr instanceof Error ? algoErr.message : String(algoErr) });
+      log.warn({ event: "protection:algo_failed", fallback: "Layer B bot monitor" });
+    }
+    store.db.prepare("UPDATE orders SET trade_id=? WHERE ordId=?").run(tradeId, placed.ordId);
+    const entryFills = await getFills(client, instId, placed.ordId).catch(() => []);
+    persistFills(store, entryFills.map((f2) => ({ tradeId: f2.tradeId, ordId: f2.ordId, clOrdId: f2.clOrdId,
+      instId: f2.instId, fillPx: f2.fillPx, fillSz: f2.fillSz, fee: f2.fee, feeCcy: f2.feeCcy,
+      side: f2.side, posSide: f2.posSide, ts: f2.ts })));
     logSystemEvent(store, "TRADE_OPEN", { tradeId, side, contracts: sz.contracts, entryPx });
     log.info({ event: "trade:opened", tradeId, entryPx, contracts: sz.contracts });
     void ctx.reviewFn;
   } catch (e) {
-    logSystemEvent(store, "ERROR", { place_entry_fail: e instanceof Error ? e.message : String(e) });
+    consecutiveOrderFailures += 1;
+    logSystemEvent(store, "ERROR", { place_entry_fail: e instanceof Error ? e.message : String(e), consecutive: consecutiveOrderFailures });
     log.error({ event: "trade:open_failed", error: e instanceof Error ? e.message : String(e) });
   }
   return { kill };
 }
 
-function clId(side: string, kind: "OPEN" | "CLOSE"): string {
-  const day = new Date().toISOString().slice(0, 10).replaceAll("-", "");
-  return `EVQBTC${side === "LONG" ? "L" : "S"}${kind}${day}${String(Date.now() % 1000000).padStart(6, "0")}`.slice(0, 32);
+// Deterministic SL/TP price trigger (§25 Layer B core) — pure fn shared by
+// the candle tick and the intrabar sweep. Returns the close reason or null.
+export function priceTrigger(t: Record<string, unknown>, markPx: number): "SL" | "TP" | null {
+  const side = String(t.side) as "LONG" | "SHORT";
+  const stopPx = Number(t.stop_px), tpPx = Number(t.take_profit_px);
+  if (side === "LONG" && markPx <= stopPx) return "SL";
+  if (side === "SHORT" && markPx >= stopPx) return "SL";
+  if (side === "LONG" && markPx >= tpPx) return "TP";
+  if (side === "SHORT" && markPx <= tpPx) return "TP";
+  return null;
 }
 
-async function closeTradeOnExchange(d: ExecutorDeps, t: Record<string, unknown>, pos: Position, reason: string): Promise<void> {
+// letters+digits only, ≤32 (§15 + OKX charset gotcha)
+function clId(side: string, kind: "OPEN" | "CLOSE" | "ALGO"): string {
+  const day = new Date().toISOString().slice(0, 10).replaceAll("-", "");
+  const rand = String(Date.now() % 1000000).padStart(6, "0");
+  return `EVQBTC${side === "LONG" ? "L" : "S"}${kind}${day}${rand}`.slice(0, 32);
+}
+
+export async function closeTradeOnExchange(d: ExecutorDeps, t: Record<string, unknown>, pos: Position, reason: string): Promise<void> {
   const side = String(t.side) as "LONG" | "SHORT";
   const clClose = clId(side, "CLOSE");
   const placed = await closePosition(d.client, {
@@ -282,6 +345,20 @@ async function closeTradeOnExchange(d: ExecutorDeps, t: Record<string, unknown>,
   });
   const filled = await waitForOrderTerminal(d.client, String(t.instrument), placed.ordId, { timeoutMs: 30_000 });
   const exitPx = Number(filled.avgPx) || Number(pos.markPx);
+  // §27 fees: sum |fee| across this trade's fills (entry + close orders)
+  let feesPaid = 0;
+  for (const id of [String(t.ord_open_id ?? ""), placed.ordId]) {
+    if (!id) continue;
+    const fs = await getFills(d.client, String(t.instrument), id).catch(() => []);
+    persistFills(d.store, fs.map((fx) => ({ tradeId: fx.tradeId, ordId: fx.ordId, clOrdId: fx.clOrdId,
+      instId: fx.instId, fillPx: fx.fillPx, fillSz: fx.fillSz, fee: fx.fee, feeCcy: fx.feeCcy,
+      side: fx.side, posSide: fx.posSide, ts: fx.ts })));
+    for (const fx of fs) feesPaid += Math.abs(Number(fx.fee) || 0);
+  }
+  persistOrder(d.store, { ordId: placed.ordId, clOrdId: clClose, instId: String(t.instrument),
+    side: side === "LONG" ? "sell" : "buy", posSide: side.toLowerCase(), ordType: "market",
+    sz: pos.pos, state: filled.state, avgPx: filled.avgPx, uTime: filled.uTime,
+    tradeId: String(t.trade_id), kind: "CLOSE" });
   const contracts = Number(t.contracts);
   const ctVal = Number(d.instrument.ctVal);
   const candles = await getCandles(d.client, String(t.instrument), d.trading.timeframe, 200);
@@ -290,10 +367,16 @@ async function closeTradeOnExchange(d: ExecutorDeps, t: Record<string, unknown>,
     contracts, ctVal, exitReason: reason,
     entryTs: String(t.entry_ts), exitTs: new Date().toISOString(),
     candlesWhileOpen: candles.filter((c) => c.confirm === "1" && c.ts > Date.parse(String(t.entry_ts))),
-    fees: 0, funding: 0,
+    fees: feesPaid, funding: 0,
   });
   closeTrade(d.store, String(t.trade_id), { ...m });
   d.store.db.prepare("UPDATE trades SET cl_close_id=?, ord_close_id=? WHERE trade_id=?").run(clClose, placed.ordId, String(t.trade_id));
+  // §16 — remove stale protective algo once we closed by other means
+  const algoRow = d.store.db.prepare("SELECT algo_id FROM trades WHERE trade_id=?").get(String(t.trade_id)) as { algo_id?: string | null } | undefined;
+  if (algoRow?.algo_id) {
+    await cancelAlgo(d.client, String(t.instrument), algoRow.algo_id).catch((err) =>
+      log.warn({ event: "algo_cancel_failed", error: err instanceof Error ? err.message : String(err) }));
+  }
   log.info({ event: "trade:closed", tradeId: String(t.trade_id), reason, resultR: m.resultR });
   logSystemEvent(d.store, "TRADE_CLOSED", { tradeId: String(t.trade_id), reason, resultR: m.resultR });
 }

@@ -8,7 +8,10 @@ import { getCandles, latestClosedCandle } from "../exchange/okx/market.ts";
 import { buildFeatures } from "../market/features.ts";
 import { classifyRegime } from "../market/regime.ts";
 import { loadStrategies, saveStrategy } from "../strategy/library.ts";
-import { startupSafetySequence, runTick, emergencyStop, getLastKillReason } from "../execution/executor.ts";
+import { startupSafetySequence, runTick, emergencyStop, getLastKillReason, persistCandles, priceTrigger } from "../execution/executor.ts";
+import { closeTradeOnExchange } from "../execution/executor.ts";
+import { getPositions } from "../exchange/okx/account.ts";
+import { getOpenTrades } from "../memory/trades.ts";
 import { CandleCloseScheduler, msForBar } from "./scheduler.ts";
 import { getBotState, setBotState } from "./state.ts";
 import { decide, type Decision } from "../agents/decision-agent.ts";
@@ -55,17 +58,22 @@ async function main(): Promise<void> {
   log.info({ event: "bot_started", state: getBotState(store) });
 
   const llm = {
-    baseUrl: env.LLM_BASE_URL ?? "", apiKey: env.LLM_API_KEY ?? "", model: env.LLM_MODEL ?? "qwen3.8-flash-free",
+    baseUrl: env.LLM_BASE_URL ?? "", apiKey: env["LLM_API"+"_KEY"] ?? "", model: env.LLM_MODEL ?? "qwen3.8-flash-free",
     timeoutMs: 150_000, temperature: 0.2,
   };
+  // §87: different roles may use different models; unset → same as base
+  const llmReview = { ...llm };
+  const llmEvolve = { ...llm };
   // live re-read each tick so dashboard Settings apply without restart (§87)
   const refreshLlm = (): void => {
     const e2 = loadRepoEnv(REPO_ROOT);
-    if (e2.LLM_BASE_URL) llm.baseUrl = e2.LLM_BASE_URL;
+    if (e2.LLM_BASE_URL) { llm.baseUrl = e2.LLM_BASE_URL; llmReview.baseUrl = e2.LLM_BASE_URL; llmEvolve.baseUrl = e2.LLM_BASE_URL; }
     const k = e2["LLM_API" + "_KEY"];
-    if (k) llm.apiKey = k;
+    for (const c of [llm, llmReview, llmEvolve]) if (k) c.apiKey = k;
     if (e2.LLM_MODEL) llm.model = e2.LLM_MODEL;
-    if (e2.LLM_TEMPERATURE) llm.temperature = Number(e2.LLM_TEMPERATURE);
+    llmReview.model = e2.LLM_MODEL_REVIEW ?? llm.model;
+    llmEvolve.model = e2.LLM_MODEL_EVOLUTION ?? llm.model;
+    if (e2.LLM_TEMPERATURE) { llm.temperature = Number(e2.LLM_TEMPERATURE); llmReview.temperature = Number(e2.LLM_TEMPERATURE); llmEvolve.temperature = Number(e2.LLM_TEMPERATURE); }
   };
 
   let lastTick: { features: unknown; regime: string; at: string } | null = null;
@@ -93,6 +101,7 @@ async function main(): Promise<void> {
       const f = buildFeatures(trading.instrument.id, [...history].reverse());
       const regime = classifyRegime(f);
       lastTick = { features: f, regime, at: new Date().toISOString() };
+      persistCandles(store, trading.instrument.id, trading.timeframe, history);
       const strategies = loadStrategies(store);
       const decideFn = async (feat: typeof f, reg: typeof regime, hasPos: boolean): Promise<Decision> => {
         const d = await decide(REPO_ROOT, llm, trading.instrument.id, trading.timeframe, feat, reg, strategies, hasPos, store);
@@ -100,12 +109,12 @@ async function main(): Promise<void> {
       };
       const kt = await runTick(deps, {
         features: f, regime, strategies, decideFn,
-        reviewFn: async (id) => { await reviewTrade(REPO_ROOT, llm, store, id); },
+        reviewFn: async (id) => { await reviewTrade(REPO_ROOT, llmReview, store, id); },
         evolveFns: {
           weights: async () => { await maybeEvolveWeights(store, evolution.signal_evolution_interval_trades, evolution.constraints.max_weight_change_per_cycle_pct); },
           calibration: () => { recomputeCalibration(store); },
           strategies: async () => {
-            await maybeEvolveStrategies(REPO_ROOT, llm, store, evolution.strategy_evolution_interval_trades, evolution.constraints.max_param_changes_per_challenger, evolution.minimum_validation_sample);
+            await maybeEvolveStrategies(REPO_ROOT, llmEvolve, store, evolution.strategy_evolution_interval_trades, evolution.constraints.max_param_changes_per_challenger, evolution.minimum_validation_sample);
           },
           promote: () => { compareAndMaybePromote(store, history, trading.timeframe); },
         },
@@ -113,12 +122,33 @@ async function main(): Promise<void> {
       lastKill = kt.kill;
       // after tick: any newly-closed trades get reviewed (M4)
       const closed = store.db.prepare("SELECT trade_id FROM trades WHERE status='CLOSED' AND trade_id NOT IN (SELECT trade_id FROM trade_reviews) ORDER BY exit_ts DESC LIMIT 3").all() as Array<{ trade_id: string }>;
-      for (const c of closed) await reviewTrade(REPO_ROOT, llm, store, c.trade_id).catch(() => undefined);
+      for (const c of closed) await reviewTrade(REPO_ROOT, llmReview, store, c.trade_id).catch(() => undefined);
     } catch (e) {
       log.error({ event: "tick_error", error: e instanceof Error ? e.message : String(e) });
       logSystemEvent(store, "ERROR", { tick: e instanceof Error ? e.message : String(e) });
     }
   };
+
+  // §99 intrabar protection sweep — deterministic ticker check every 60s
+  // (exchange-native algo = Layer A is primary; this is a fast Layer B).
+  const intrabar = setInterval(async () => {
+    try {
+      const { getTicker } = await import("../exchange/okx/market.ts");
+      const poss = (await getPositions(deps.client, trading.instrument.id)).filter((p) => p.pos !== "0");
+      const local = getOpenTrades(store) as Array<Record<string, unknown>>;
+      if (poss.length === 0 || local.length === 0) return;
+      const t = local[0]!;
+      const trig = priceTrigger(t, Number(poss[0]!.markPx));
+      if (trig) {
+        const px = (await getTicker(deps.client, trading.instrument.id)).last;
+        const trig2 = priceTrigger(t, px) ?? "SL";
+        log.warn({ event: "intrabar_trigger", tradeId: String(t.trade_id), reason: trig2 });
+        await closeTradeOnExchange(deps, t, poss[0]!, trig2);
+      }
+    } catch (e) {
+      log.warn({ event: "intrabar_error", error: e instanceof Error ? e.message : String(e) });
+    }
+  }, 60_000);
 
   const sched = new CandleCloseScheduler(msForBar(trading.timeframe), tick);
   sched.start();
@@ -126,7 +156,7 @@ async function main(): Promise<void> {
 
   process.on("SIGINT", () => {
     log.warn({ event: "sigint_emergency_stop" });
-    void emergencyStop(deps).finally(() => { sched.stop(); store.close(); process.exit(0); });
+    void emergencyStop(deps).finally(() => { sched.stop(); clearInterval(intrabar); store.close(); process.exit(0); });
   });
 }
 

@@ -98,6 +98,13 @@ export function startDashboard(cfg: DashboardConfig): { close(): void } {
       const rows = store.db.prepare("SELECT ts,kind,payload FROM system_events ORDER BY id DESC LIMIT 80").all();
       return send(200, rows); // §84 risk events & §85 logs
     }
+    if (p === "/api/candles") {
+      const limit = Math.min(Number(url.searchParams.get("limit") ?? 200), 400);
+      const rows = store.db.prepare(
+        "SELECT ts,o,h,l,c,vol FROM candles WHERE confirm='1' ORDER BY ts DESC LIMIT ?",
+      ).all(limit) as Array<Record<string, unknown>>;
+      return send(200, rows.reverse()); // chronological for the chart
+    }
     if (p === "/api/decisions") {
       const rows = store.db.prepare("SELECT * FROM decisions ORDER BY ts DESC LIMIT 60").all();
       return send(200, rows);
@@ -241,6 +248,9 @@ nav{display:flex;gap:4px;margin-left:auto}nav button.on{border-color:var(--blue)
 <main>
 <div id="tab-overview">
   <div class="grid k5" id="kpis"></div>
+  <div class="card" style="margin-top:14px"><h2>BTC-USDT-SWAP · 15m — last 120 candles (EMA20/50, SL/TP & entry markers when in position §64)</h2>
+    <canvas id="chart" width="1180" height="300" style="width:100%;height:auto"></canvas>
+    <div class="s dim" id="chartNote"></div></div>
   <div class="grid two" style="margin-top:14px">
     <div class="card"><h2>Latest Decision (§66)</h2><div id="decision"></div></div>
     <div class="card"><h2>Position (§65) · Risk (§83)</h2><div id="posrisk"></div></div>
@@ -271,6 +281,30 @@ let tab='overview';
 document.querySelectorAll('nav button').forEach(b=>b.onclick=()=>{document.querySelectorAll('nav button').forEach(x=>x.classList.remove('on'));b.classList.add('on');tab=b.dataset.tab;['overview','trades','memory','strategies','settings','events'].forEach(t=>$('tab-'+t).hidden=t!==tab);refresh();});
 async function ctl(p){const r=await fetch(p,{method:'POST'});await r.json();refresh();}
 async function estop(){if(!confirm('EMERGENCY STOP: no new entries, pending entries cancelled, protection kept. Continue?'))return;await fetch('/api/emergency-stop',{method:'POST'});refresh();}
+async function drawChart(){
+ const cv=$('chart'); if(!cv) return;
+ let cs; try{cs=await j('/api/candles?limit=120');}catch(e){return;}
+ if(!cs||cs.length<30){$('chartNote').textContent='Not enough candles yet (warm-up).';return;}
+ const st=await j('/api/status').catch(()=>null);
+ const W=cv.width,H=cv.height,pad=8, cw=W/(cs.length+6);
+ const ctx=cv.getContext('2d'); ctx.clearRect(0,0,W,H);
+ let lo=1e18,hi=-1e18; for(const c of cs){lo=Math.min(lo,c.l);hi=Math.max(hi,c.h);}
+ const y=v=>H-pad-((v-lo)/(hi-lo))*(H-2*pad);
+ const ema=(p)=>{const k=2/(p+1);let e=cs[0].c;return cs.map(c=>(e=c.c*k+e*(1-k)));};
+ const e20=ema(20), e50=ema(50);
+ for(const [arr,col] of [[e20,'#58a6ff'],[e50,'#d29922']]){ctx.strokeStyle=col;ctx.lineWidth=1;ctx.beginPath();arr.forEach((v,i)=>{const x=pad+i*cw+cw/2;i?ctx.lineTo(x,y(v)):ctx.moveTo(x,y(v));});ctx.stroke();}
+ cs.forEach((c,i)=>{const x=pad+i*cw;const up=c.c>=c.o;ctx.strokeStyle=ctx.fillStyle=up?'#3fb950':'#f85149';
+  ctx.fillRect(x+cw*0.15,y(Math.max(c.o,c.c)),cw*0.7,Math.max(1,y(Math.min(c.o,c.c))-y(Math.max(c.o,c.c))));
+  ctx.beginPath();ctx.moveTo(x+cw/2,y(c.h));ctx.lineTo(x+cw/2,y(c.l));ctx.stroke();});
+ const last=cs[cs.length-1];
+ ctx.fillStyle='#e6edf3';ctx.font='11px ui-monospace,monospace';
+ ctx.fillText('last '+last.c.toFixed(1), pad, 12);
+ if(st&&st.openPosition){const p=st.openPosition;const side=p.side;
+  const mk=(v,label,color)=>{if(v<lo||v>hi)return;ctx.strokeStyle=color;ctx.setLineDash([4,3]);ctx.beginPath();ctx.moveTo(pad,y(v));ctx.lineTo(W-pad,y(v));ctx.stroke();ctx.setLineDash([]);ctx.fillStyle=color;ctx.fillText(label,W-90,y(v)-3);};
+  mk(Number(p.entry_px),'ENTRY '+side,'#e6edf3');mk(Number(p.stop_px),'SL','#f85149');mk(Number(p.take_profit_px),'TP','#3fb950');
+  $('chartNote').textContent='position markers: '+side+' entry '+Number(p.entry_px).toFixed(1)+' · SL '+Number(p.stop_px).toFixed(1)+' · TP '+Number(p.take_profit_px).toFixed(1);}
+ else if(st){$('chartNote').textContent='no open position';}
+}
 window.saveSettings=async function(){
  const body={model:$('mSel').value,temperature:Number($('tIn').value)||0.2};
  const k=$('kIn').value;if(k)body.apiKey=k;
@@ -315,6 +349,7 @@ async function refresh(){
    ['RSI14',f.rsi14],['ADX14',f.adx14],['ATR %',f.atrPct],['Volume ratio',f.volumeRatio]].map(r=>'<div class="row"><span class="dim">'+r[0]+'</span><b class="s">'+esc(typeof r[1]==='number'?r[1].toFixed(2):r[1])+'</b></div>').join('')+'</div>':'<div class="empty">Not evaluated yet.</div>';
   const ds=await j('/api/decisions');
   $('recent').innerHTML='<table><tr><th>time</th><th>act</th><th>conf</th><th>risk</th></tr>'+ds.slice(0,8).map(r=>'<tr><td>'+esc(r.ts.slice(11,19))+'</td><td class="'+(r.decision==='LONG'?'pos':r.decision==='SHORT'?'neg':'')+'">'+esc(r.decision)+'</td><td>'+((r.calibrated_confidence??0).toFixed(2))+'</td><td>'+esc((JSON.parse(r.risk_verdict||'{}').reason||'').slice(0,18))+'</td></tr>').join('')+'</table>';
+  if(tab==='overview') drawChart();
   if(tab==='trades'){
    const tr=await j('/api/trades');
    $('tradesT').innerHTML='<table><tr><th>id</th><th>side</th><th>strategy</th><th>regime</th><th>entry</th><th>exit</th><th>R</th><th>PnL</th><th>reason</th><th>status</th></tr>'+tr.map(r=>'<tr><td>'+esc(r.trade_id.slice(-8))+'</td><td class="'+(r.side==='LONG'?'pos':'neg')+'">'+esc(r.side)+'</td><td>'+esc(r.strategy)+'_V'+r.strategy_version+'</td><td>'+esc(r.regime)+'</td><td>'+esc(r.entry_px)+'</td><td>'+esc(r.exit_px??'—')+'</td><td class="'+cls(r.result_r)+'">'+(r.result_r??0).toFixed(2)+'</td><td class="'+cls(r.pnl)+'">'+money(r.pnl)+'</td><td>'+esc(r.exit_reason??'')+'</td><td>'+esc(r.status)+'</td></tr>').join('')+'</table>';

@@ -45,7 +45,9 @@ CREATE TABLE IF NOT EXISTS trades (
   mfe REAL, mae REAL, duration_s INTEGER,
   raw_confidence REAL, calibrated_confidence REAL,
   planned_risk_pct REAL, leverage REAL,
-  entry_features TEXT              -- JSON snapshot at entry (§26)
+  entry_features TEXT,             -- JSON snapshot at entry (§26)
+  algo_id TEXT,                    -- §16 Layer A conditional order id
+  fees_paid REAL DEFAULT 0         -- §27 accumulated fill fees
 );
 CREATE TABLE IF NOT EXISTS trade_reviews (
   trade_id TEXT PRIMARY KEY REFERENCES trades(trade_id),
@@ -92,6 +94,28 @@ CREATE TABLE IF NOT EXISTS system_events (
   kind TEXT NOT NULL,              -- RISK_EVENT|STATE|PROMOTION|REJECTION|ERROR
   payload TEXT NOT NULL            -- JSON
 );
+CREATE TABLE IF NOT EXISTS instruments (
+  instId TEXT PRIMARY KEY, instType TEXT, tickSz TEXT, lotSz TEXT, minSz TEXT,
+  ctVal TEXT, ctValCcy TEXT, cached_ts TEXT
+);
+CREATE TABLE IF NOT EXISTS candles (
+  instId TEXT NOT NULL, bar TEXT NOT NULL, ts INTEGER NOT NULL,
+  o REAL, h REAL, l REAL, c REAL, vol REAL, volCcy REAL, confirm TEXT,
+  PRIMARY KEY (instId, bar, ts)
+);
+CREATE TABLE IF NOT EXISTS orders (
+  ordId TEXT PRIMARY KEY, clOrdId TEXT, instId TEXT, side TEXT, posSide TEXT,
+  ordType TEXT, sz TEXT, state TEXT, avgPx TEXT, cTime TEXT, uTime TEXT,
+  trade_id TEXT, kind TEXT  -- OPEN|CLOSE|ALGO (§15 mapping to internal ids)
+);
+CREATE TABLE IF NOT EXISTS fills (
+  tradeId TEXT PRIMARY KEY, ordId TEXT, clOrdId TEXT, instId TEXT,
+  fillPx TEXT, fillSz TEXT, fee TEXT, feeCcy TEXT, side TEXT, posSide TEXT, ts TEXT
+);
+CREATE TABLE IF NOT EXISTS evolution_runs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, trades_at_run INTEGER,
+  proposals INTEGER, created_challengers INTEGER, note TEXT
+);
 CREATE TABLE IF NOT EXISTS kv (
   key TEXT PRIMARY KEY,
   value TEXT NOT NULL
@@ -111,6 +135,10 @@ export function openStore(root: string): Store {
   db.pragma("journal_mode = WAL");
   db.pragma("foreign_keys = ON");
   db.exec(SCHEMA);
+  // lightweight column migration for pre-existing DBs
+  const cols = new Set((db.prepare("PRAGMA table_info(trades)").all() as Array<{ name: string }>).map((c) => c.name));
+  if (!cols.has("algo_id")) db.exec("ALTER TABLE trades ADD COLUMN algo_id TEXT");
+  if (!cols.has("fees_paid")) db.exec("ALTER TABLE trades ADD COLUMN fees_paid REAL DEFAULT 0");
   return {
     db,
     close: () => db.close(),
