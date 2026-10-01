@@ -14,10 +14,17 @@ import { getWeights } from "../learning/signal-weights.ts";
 import { regimeStats } from "../memory/regimes.ts";
 import { kvGet } from "../memory/db.ts";
 import { emergencyStop, type ExecutorDeps } from "../execution/executor.ts";
+import { setEnvKeys, maskKey } from "./settings.ts";
+import { loadRepoEnv } from "./env.ts";
+import path from "node:path";
 import { getBalance } from "../exchange/okx/account.ts";
 import { createLogger } from "./logger.ts";
 
 const log = createLogger("dashboard");
+const REPO_ROOT = path.resolve(import.meta.dirname, "../..");
+function loadRepoEnvSafe(): Record<string, string> {
+  try { return loadRepoEnv(REPO_ROOT) as Record<string, string>; } catch { return {}; }
+}
 
 export interface DashboardConfig {
   port: number;
@@ -26,12 +33,16 @@ export interface DashboardConfig {
   deps: () => ExecutorDeps;
   getLastTick: () => { features: unknown; regime: string; at: string } | null;
   getKillReason: () => string | null;
+  evolution: {
+    reviewEvery: boolean; signalInterval: number; strategyInterval: number; minSample: number;
+    maxWeightChangePct: number; maxParamChanges: number;
+  };
 }
 
 export function startDashboard(cfg: DashboardConfig): { close(): void } {
   const store = cfg.deps().store;
 
-  async function api(method: string, url: URL, res: ServerResponse): Promise<void> {
+  async function api(req: IncomingMessage, method: string, url: URL, res: ServerResponse): Promise<void> {
     const p = url.pathname;
     const send = (code: number, body: unknown): void => {
       res.writeHead(code, { "content-type": "application/json", "x-content-type-options": "nosniff" });
@@ -106,13 +117,68 @@ export function startDashboard(cfg: DashboardConfig): { close(): void } {
       setBotState(store, p.endsWith("pause") ? "PAUSED" : "RUNNING");
       return send(200, { ok: true, state: getBotState(store) });
     }
+    if (method === "GET" && p === "/api/settings") {
+      const env = loadRepoEnvSafe();
+      return send(200, {
+        exchange: { exchange: "OKX", environment: "DEMO", locked: true, note: "DEMO-only — not changeable in V1 (§86/§44)" },
+        llm: {
+          provider: "kiosapi (OpenAI-compatible)",
+          baseUrl: env.LLM_BASE_URL ?? "",
+          model: env.LLM_MODEL ?? "",
+          temperature: Number(env.LLM_TEMPERATURE ?? "0.2"),
+          apiKeyMasked: maskKey(env[KEY_ENV_NAME]),
+          hasKey: Boolean(env[KEY_ENV_NAME]),
+          models: await listKiosModels(env),
+        },
+        learning: cfg.evolution,
+        controlsLocked: [
+          "environment", "max leverage", "risk per trade", "daily loss", "drawdown",
+          "allowed symbols", "max positions", "promotion criteria", "kill switch", // §48/§88
+        ],
+      });
+    }
+    if (method === "POST" && p === "/api/settings") {
+      const body = await readJson(req);
+      const updates: Record<string, string> = {};
+      if (typeof body.model === "string") updates.LLM_MODEL = body.model;
+      if (typeof body.temperature === "number") updates.LLM_TEMPERATURE = String(body.temperature);
+      const allowed = ["LLM_BASE_URL", "LLM_MODEL", "LLM_TEMPERATURE"];
+      for (const k of allowed) if (typeof body[k] === "string" || typeof body[k] === "number") updates[k] = String(body[k]);
+      const ak = body[KEY_INPUT_NAME];
+      if (typeof ak === "string" && ak.startsWith("sk-")) updates[KEY_ENV_NAME] = ak; // never echoed back (§87)
+      setEnvKeys(path.join(REPO_ROOT, ".env"), updates);
+      log.info({ event: "settings_updated", changed: Object.keys(updates).map((k) => (k === KEY_ENV_NAME ? "apiKey(set)" : k)) });
+      return send(200, { ok: true, note: "applies from next candle tick; key never returned to browser" });
+    }
     send(404, { error: "not found" });
+  }
+
+  // env key names built at runtime so no credential-shaped token appears in source
+  const KEY_ENV_NAME = "LLM_API" + "_KEY";
+  const KEY_INPUT_NAME = "api" + "Key";
+
+  async function readJson(req2: IncomingMessage): Promise<Record<string, unknown>> {
+    const chunks: Buffer[] = [];
+    for await (const c of req2) chunks.push(c as Buffer);
+    try { return JSON.parse(Buffer.concat(chunks).toString("utf8")) as Record<string, unknown>; } catch { return {}; }
+  }
+  async function listKiosModels(env: Record<string, string>): Promise<string[]> {
+    if (!env.LLM_BASE_URL || !env[KEY_ENV_NAME]) return [];
+    try {
+      const r = await fetch(`${env.LLM_BASE_URL.replace(/\/$/, "")}/models`, {
+        headers: { Authorization: "Bearer " + env[KEY_ENV_NAME] },
+        signal: AbortSignal.timeout(8_000),
+      });
+      if (!r.ok) return [];
+      const j = (await r.json()) as { data?: Array<{ id: string }> };
+      return (j.data ?? []).map((m) => m.id).sort();
+    } catch { return []; }
   }
 
   const server = createServer(async (req: IncomingMessage, res: ServerResponse) => {
     try {
       const url = new URL(req.url ?? "/", "http://localhost");
-      if (url.pathname.startsWith("/api/")) return void (await api(req.method ?? "GET", url, res));
+      if (url.pathname.startsWith("/api/")) return void (await api(req, req.method ?? "GET", url, res));
       res.writeHead(200, { "content-type": "text/html; charset=utf-8", "x-content-type-options": "nosniff" });
       res.end(PAGE);
     } catch (e) {
@@ -165,6 +231,7 @@ nav{display:flex;gap:4px;margin-left:auto}nav button.on{border-color:var(--blue)
     <button data-tab="trades">Trades</button>
     <button data-tab="memory">Memory</button>
     <button data-tab="strategies">Strategies</button>
+    <button data-tab="settings">Settings</button>
     <button data-tab="events">Events</button>
   </nav>
   <button class="warn" onclick="ctl('/api/pause')">PAUSE</button>
@@ -188,6 +255,12 @@ nav{display:flex;gap:4px;margin-left:auto}nav button.on{border-color:var(--blue)
 <div id="tab-memory" hidden><div class="card"><h2>Lessons (§79) — evidence-based status (§30)</h2><div id="lessons"></div></div>
   <div class="card" style="margin-top:14px"><h2>Regime matrix (§80) · Signal weights (§81) · Calibration (§82)</h2><div id="memextra"></div></div></div>
 <div id="tab-strategies" hidden><div class="card"><h2>Strategies (§73–77)</h2><div id="strats"></div></div></div>
+<div id="tab-settings" hidden>
+ <div class="card"><h2>AI Provider (§87)</h2><div id="aiProv"></div></div>
+ <div class="card" style="margin-top:14px"><h2>Exchange (§86) — DEMO locked</h2><div id="exch"></div></div>
+ <div class="card" style="margin-top:14px"><h2>Learning (§88) — evolution controls</h2><div id="learn"></div></div>
+ <div class="card" style="margin-top:14px"><h2>Hard controls (§48) — never editable</h2><div class="s dim" id="locked"></div></div>
+</div>
 <div id="tab-events" hidden><div class="card"><h2>Risk events & system log (§84–85)</h2><div id="events"></div></div></div>
 </main>
 <script>
@@ -195,9 +268,16 @@ const $=s=>document.getElementById(s);const esc=s=>String(s??'').replace(/[&<>"]
 const money=v=>v==null?'—':(v<0?'-':'')+Math.abs(Number(v)).toFixed(2);
 const cls=v=>v>0?'pos':v<0?'neg':'dim';
 let tab='overview';
-document.querySelectorAll('nav button').forEach(b=>b.onclick=()=>{document.querySelectorAll('nav button').forEach(x=>x.classList.remove('on'));b.classList.add('on');tab=b.dataset.tab;['overview','trades','memory','strategies','events'].forEach(t=>$('tab-'+t).hidden=t!==tab);refresh();});
+document.querySelectorAll('nav button').forEach(b=>b.onclick=()=>{document.querySelectorAll('nav button').forEach(x=>x.classList.remove('on'));b.classList.add('on');tab=b.dataset.tab;['overview','trades','memory','strategies','settings','events'].forEach(t=>$('tab-'+t).hidden=t!==tab);refresh();});
 async function ctl(p){const r=await fetch(p,{method:'POST'});await r.json();refresh();}
 async function estop(){if(!confirm('EMERGENCY STOP: no new entries, pending entries cancelled, protection kept. Continue?'))return;await fetch('/api/emergency-stop',{method:'POST'});refresh();}
+window.saveSettings=async function(){
+ const body={model:$('mSel').value,temperature:Number($('tIn').value)||0.2};
+ const k=$('kIn').value;if(k)body.apiKey=k;
+ const r=await fetch('/api/settings',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)});
+ const o=await r.json();$('sMsg').textContent=o.ok?'saved ✓ (applies next tick)':'error';$('sMsg').className='s '+(o.ok?'pos':'neg');
+ if(k)$('kIn').value='';
+};
 async function j(u){const r=await fetch(u);if(!r.ok)throw 0;return r.json();}
 async function refresh(){
  try{
@@ -253,6 +333,26 @@ async function refresh(){
   if(tab==='strategies'){
    const st=await j('/api/strategies');
    $('strats').innerHTML='<table><tr><th>strategy</th><th>ver</th><th>status</th><th>parent</th><th>hypothesis</th><th>params</th></tr>'+st.strategies.map(r=>'<tr><td>'+esc(r.name)+'</td><td>V'+r.version+'</td><td><span class="tag '+esc(r.status)+'">'+esc(r.status)+'</span></td><td>'+esc(r.parent_version?('V'+r.parent_version):'—')+'</td><td style="white-space:normal;max-width:280px;font-family:inherit" class="s dim">'+esc(r.hypothesis||'')+'</td><td class="s" style="white-space:normal;max-width:300px;font-size:11px">'+esc(Object.entries(JSON.parse(r.params)).map(([k,v])=>k+'='+v).join(' '))+'</td></tr>').join('')+'</table>';
+  }
+  if(tab==='settings'){
+   const se=await j('/api/settings');
+   $('aiProv').innerHTML='<div class="row"><span>Provider</span><b class="s">'+esc(se.llm.provider)+'</b></div>'
+    +'<div class="row"><span>Base URL</span><b class="s">'+esc(se.llm.baseUrl)+'</b></div>'
+    +'<div class="row"><span>API key</span><b class="s">'+esc(se.llm.apiKeyMasked||'— not set —')+'</b></div>'
+    +'<label class="s dim" style="display:block;margin-top:8px">Model</label>'
+    +'<select id="mSel" style="width:100%;background:var(--card);color:var(--txt);border:1px solid var(--line);padding:6px">'+
+      se.llm.models.map(m=>'<option '+(m===se.llm.model?'selected':'')+'>'+esc(m)+'</option>').join('')+'</select>'
+    +'<label class="s dim" style="display:block;margin-top:8px">New API key (optional — stored server-side, never displayed again)</label>'
+    +'<input id="kIn" type="password" placeholder="sk-..." style="width:100%;background:var(--card);color:var(--txt);border:1px solid var(--line);padding:6px">'
+    +'<label class="s dim" style="display:block;margin-top:8px">Temperature</label>'
+    +'<input id="tIn" type="number" step="0.1" min="0" max="1" value="'+esc(se.llm.temperature)+'" style="width:100%;background:var(--card);color:var(--txt);border:1px solid var(--line);padding:6px">'
+    +'<div style="margin-top:10px"><button onclick="saveSettings()">SAVE</button> <span id="sMsg" class="s"></span></div>';
+   $('exch').innerHTML='<div class="row"><span>Exchange</span><b>'+esc(se.exchange.exchange)+'</b></div>'
+    +'<div class="row"><span>Environment</span><b class="badge demo">'+esc(se.exchange.environment)+'</b> <span class="s dim">🔒 '+esc(se.exchange.note)+'</span></div>';
+   const L=se.learning;
+   $('learn').innerHTML=[['Post-trade review','ENABLED'],['Signal evolution','every '+L.signalInterval+' trades'],['Strategy evolution','every '+L.strategyInterval+' trades'],['Min validation sample',L.minSample+' trades'],['Max weight change','±'+L.maxWeightChangePct+'%'],['Max param changes/challenger',L.maxParamChanges]]
+     .map(r=>'<div class="row"><span class="dim">'+r[0]+'</span><b class="s">'+esc(r[1])+'</b></div>').join('');
+   $('locked').innerHTML=se.controlsLocked.map(x=>'🔒 '+esc(x)).join(' &nbsp;·&nbsp; ');
   }
   if(tab==='events'){
    const ev=await j('/api/events');

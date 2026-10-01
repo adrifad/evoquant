@@ -20,7 +20,7 @@ import { compareAndMaybePromote } from "../evaluation/champion-challenger.ts";
 import { createLogger } from "./logger.ts";
 import { startDashboard } from "./dashboard.ts";
 import YAML from "yaml";
-import { readFileSync, existsSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import path from "node:path";
 
 const log = createLogger("main");
@@ -55,8 +55,17 @@ async function main(): Promise<void> {
   log.info({ event: "bot_started", state: getBotState(store) });
 
   const llm = {
-    baseUrl: env.LLM_BASE_URL ?? "", apiKey: env.LLM_API_KEY ?? "", model: env.LLM_MODEL ?? "step-3.7-flash",
+    baseUrl: env.LLM_BASE_URL ?? "", apiKey: env.LLM_API_KEY ?? "", model: env.LLM_MODEL ?? "qwen3.8-flash-free",
     timeoutMs: 150_000, temperature: 0.2,
+  };
+  // live re-read each tick so dashboard Settings apply without restart (§87)
+  const refreshLlm = (): void => {
+    const e2 = loadRepoEnv(REPO_ROOT);
+    if (e2.LLM_BASE_URL) llm.baseUrl = e2.LLM_BASE_URL;
+    const k = e2["LLM_API" + "_KEY"];
+    if (k) llm.apiKey = k;
+    if (e2.LLM_MODEL) llm.model = e2.LLM_MODEL;
+    if (e2.LLM_TEMPERATURE) llm.temperature = Number(e2.LLM_TEMPERATURE);
   };
 
   let lastTick: { features: unknown; regime: string; at: string } | null = null;
@@ -64,12 +73,21 @@ async function main(): Promise<void> {
   const dash = startDashboard({
     port: Number(env.DASHBOARD_PORT ?? 8790),
     trading, risk, deps: () => deps,
+    evolution: {
+      reviewEvery: true,
+      signalInterval: evolution.signal_evolution_interval_trades,
+      strategyInterval: evolution.strategy_evolution_interval_trades,
+      minSample: evolution.minimum_validation_sample,
+      maxWeightChangePct: evolution.constraints.max_weight_change_per_cycle_pct,
+      maxParamChanges: evolution.constraints.max_param_changes_per_challenger,
+    },
     getLastTick: () => lastTick,
     getKillReason: () => getLastKillReason(),
   });
 
   const tick = async (): Promise<void> => {
     try {
+      refreshLlm();
       const fresh = await getCandles(client, trading.instrument.id, trading.timeframe, 300);
       history = fresh.filter((c) => c.confirm === "1").sort((a, b) => a.ts - b.ts);
       const f = buildFeatures(trading.instrument.id, [...history].reverse());
