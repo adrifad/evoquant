@@ -250,10 +250,17 @@ export async function runTick(d: ExecutorDeps, ctx: TickContext): Promise<{ kill
   const stopPct = decision.suggested_stop_atr * f.atr14 / f.price;
   const stopPx = stopPriceFor(f.price, f.atr14, decision.suggested_stop_atr, decision.decision as "LONG" | "SHORT");
   const tpPx = takeProfitPriceFor(f.price, f.atr14, decision.suggested_take_profit_atr, decision.decision as "LONG" | "SHORT");
-  const sz = sizePosition(
-    { equity: eq, entryPrice: f.price, stopPrice: stopPx, leverage: trading.leverage.default, instrument: d.instrument },
-    risk,
-  );
+  let sz;
+  try {
+    sz = sizePosition(
+      { equity: eq, entryPrice: f.price, stopPrice: stopPx, leverage: trading.leverage.default, instrument: d.instrument },
+      risk,
+      trading.sizing,
+    );
+  } catch (szErr) {
+    logSystemEvent(store, "RISK_EVENT", { sizing_rejected: szErr instanceof Error ? szErr.message : String(szErr), mode: trading.sizing.mode });
+    return { kill };
+  }
   void stopPct;
   if (!verdict.approved) return { kill };
   const side = decision.decision as "LONG" | "SHORT";
@@ -280,7 +287,8 @@ export async function runTick(d: ExecutorDeps, ctx: TickContext): Promise<{ kill
       takeProfitPx: takeProfitPriceFor(entryPx, f.atr14, decision.suggested_take_profit_atr, side),
       clOpenId: clOpen, ordOpenId: placed.ordId,
       rawConfidence: decision.confidence, calibratedConfidence: calConf,
-      plannedRiskPct: risk.hard_limits.risk_per_trade_pct, leverage: trading.leverage.default,
+      plannedRiskPct: trading.sizing.mode === "percent_of_equity" ? trading.sizing.position_pct : risk.hard_limits.risk_per_trade_pct,
+      leverage: trading.leverage.default,
       entryFeatures: f,
     });
     // §16 Layer A — exchange-native conditional (SL+TP) algo orders.

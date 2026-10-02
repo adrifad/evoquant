@@ -17,7 +17,15 @@ leverage:
   hard_max: 5
 
 decision:
-  minimum_confidence: 0.70   # calibrated confidence (spec §33)
+  minimum_confidence: 0.55   # calibrated confidence (spec §33; lowered for V1 demo learning phase)
+
+# Position sizing mode (spec §24):
+#   risk_based        = size from stop distance; loss at stop = risk_per_trade_pct
+#   percent_of_equity = position notional = position_pct % of equity
+#                       (modal $100, position_pct 1 → posisi $1 per trade)
+sizing:
+  mode: percent_of_equity
+  position_pct: 10.0
 
 strategies_enabled:
   - TREND_FOLLOWING_V1

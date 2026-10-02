@@ -34,6 +34,10 @@ const TradingSchema = z.object({
     hard_max: z.number().int().min(1).lte(ABSOLUTE_MAX.leverage),
   }),
   decision: z.object({ minimum_confidence: z.number().min(0).max(1) }),
+  sizing: z.object({
+    mode: z.enum(["risk_based", "percent_of_equity"]).default("risk_based"),
+    position_pct: z.number().min(0.1).max(50).default(1),
+  }).default({ mode: "risk_based", position_pct: 1 }),
   strategies_enabled: z.array(z.string()).min(1),
 });
 

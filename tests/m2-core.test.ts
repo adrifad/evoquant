@@ -178,6 +178,33 @@ test("stop/tp symmetric by side", () => {
   assert.equal(takeProfitPriceFor(100, 2, 3, "LONG"), 106);
 });
 
+// ---- percent-of-equity sizing (user request: % dari modal) ---------------
+test("percent_of_equity sizing: 1% of $1000 equity = $10 notional", () => {
+  const inst = { instId: "BTC-USDT-SWAP", tickSz: "0.01", lotSz: "0.01", minSz: "0.01", ctVal: "0.01", ctValCcy: "BTC" };
+  const res = sizePosition({ equity: 1000, entryPrice: 100_000, stopPrice: 98_500, leverage: 3, instrument: inst }, risk, { mode: "percent_of_equity", position_pct: 1 });
+  // $10 target / ($1000 per contract) = 0.01 contracts exactly; notional = 0.01×0.01×100k = $10
+  assert.equal(res.contracts, "0.01");
+  assert.equal(res.mode, "percent_of_equity");
+  assert.ok(Math.abs(res.notionalUsdt - 10) < 0.01);
+});
+
+test("percent_of_equity below OKX minimum size throws (minSz floor)", () => {
+  const inst = { instId: "BTC-USDT-SWAP", tickSz: "0.01", lotSz: "0.01", minSz: "0.01", ctVal: "0.01", ctValCcy: "BTC" };
+  // $100 equity × 1% = $1 target; 1 contract-lot = 0.01 ct = $10 notional → below minSz
+  assert.throws(
+    () => sizePosition({ equity: 100, entryPrice: 100_000, stopPrice: 98_500, leverage: 3, instrument: inst }, risk, { mode: "percent_of_equity", position_pct: 1 }),
+    /[Mm]in|Sizing/,
+  );
+});
+
+test("percent_of_equity within bounds never exceeds margin budget", () => {
+  const inst = { instId: "BTC-USDT-SWAP", tickSz: "0.01", lotSz: "0.01", minSz: "0.01", ctVal: "0.01", ctValCcy: "BTC" };
+  const res = sizePosition({ equity: 1000, entryPrice: 100_000, stopPrice: 99_000, leverage: 3, instrument: inst }, risk, { mode: "percent_of_equity", position_pct: 50 });
+  assert.equal(res.notionalUsdt, 500);        // 50% × $1000 = $500 notional
+  assert.equal(res.clampedByMargin, false);   // 500 < 90%×3×1000
+  assert.ok(res.marginUsdt <= res.notionalUsdt / 3 + 0.01);
+});
+
 // ---- closed metrics (§27) --------------------------------------------------
 test("MFE/MAE/R from synthetic path", () => {
   const path = [
