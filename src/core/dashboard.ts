@@ -55,7 +55,7 @@ export function startDashboard(cfg: DashboardConfig): { close(): void } {
     if (p === "/api/status") {
       const bal = await getBalance(cfg.deps().client).catch(() => null);
       const usdt = bal?.details.find((d) => d.ccy === "USDT");
-      const eq = usdt ? Number(usdt.availEq) : 0;
+      const eq = usdt ? Number(usdt.eq) || Number(usdt.availEq) || 0 : 0; // eq incl. locked margin
       const base = baseline(store, eq);
       const open = store.db.prepare("SELECT * FROM trades WHERE status='OPEN'").all();
       const closed = store.db.prepare("SELECT COUNT(*) c, COALESCE(SUM(pnl),0) p, COALESCE(AVG(result_r),0) e FROM trades WHERE status='CLOSED'").get() as { c: number; p: number; e: number };

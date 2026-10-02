@@ -184,9 +184,12 @@ export interface TickContext {
 
 // USDT collateral equity — the $100-scale demo runs on actual USDT balance,
 // not totalEq which includes ETH/BTC holdings (user constraint: simulate ~$100).
+// MUST use `eq` (includes margin locked in isolated positions): `availEq`
+// drops when a position is opened, which would fake a daily loss (probe
+// 2026-10-02: margin $2.89 moved availEq 98.4→95.5 while eq stayed 101.48).
 function usdtEquity(bal: Awaited<ReturnType<typeof getBalance>>): number {
   const usdt = bal.details.find((d) => d.ccy === "USDT");
-  return usdt ? Number(usdt.availEq) || Number(usdt.availBal) || 0 : 0;
+  return usdt ? Number(usdt.eq) || Number(usdt.availEq) || Number(usdt.availBal) || 0 : 0;
 }
 
 export async function runTick(d: ExecutorDeps, ctx: TickContext, symbol: TickSymbol): Promise<{ kill: string | null }> {
