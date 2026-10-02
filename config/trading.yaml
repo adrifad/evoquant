@@ -23,7 +23,7 @@ account:
   position_mode: long_short_mode
 
 leverage:
-  default: 3
+  default: 5      # user request 2026-10-02 (spec §3 hard_max = 5)
   hard_max: 5
 
 decision:
