@@ -8,6 +8,7 @@
 // questions are all answerable here; a Next.js port is a later milestone.
 
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import { timingSafeEqual } from "node:crypto";
 import type { Store } from "../memory/db.ts";
 import { getBotState, setBotState, isEmergencyHalted, setEmergencyHalted, baseline } from "../core/state.ts";
 import { getWeights } from "../learning/signal-weights.ts";
@@ -28,6 +29,8 @@ function loadRepoEnvSafe(): Record<string, string> {
 
 export interface DashboardConfig {
   port: number;
+  bind?: string;
+  auth?: { user: string; password: string };
   trading: { instrument: { id: string }; timeframe: string; leverage: { default: number } };
   risk: { hard_limits: Record<string, unknown> };
   deps: () => ExecutorDeps;
@@ -182,7 +185,22 @@ export function startDashboard(cfg: DashboardConfig): { close(): void } {
     } catch { return []; }
   }
 
+  function authorized(req: IncomingMessage): boolean {
+    if (!cfg.auth) return true; // loopback mode: no creds configured
+    const got = req.headers.authorization ?? "";
+    if (!got.startsWith("Basic ")) return false;
+    const want = Buffer.from(`${cfg.auth.user}:${cfg.auth.password}`);
+    let given: Buffer;
+    try { given = Buffer.from(got.slice(6), "base64"); } catch { return false; }
+    return given.length === want.length && timingSafeEqual(given, want);
+  }
+
   const server = createServer(async (req: IncomingMessage, res: ServerResponse) => {
+    if (!authorized(req)) {
+      res.writeHead(401, { "www-authenticate": 'Basic realm="EvoQuant console"', "content-type": "text/plain" });
+      res.end("authentication required");
+      return;
+    }
     try {
       const url = new URL(req.url ?? "/", "http://localhost");
       if (url.pathname.startsWith("/api/")) return void (await api(req, req.method ?? "GET", url, res));
@@ -193,7 +211,8 @@ export function startDashboard(cfg: DashboardConfig): { close(): void } {
       res.writeHead(500).end("error");
     }
   });
-  server.listen(cfg.port, "127.0.0.1", () => log.info({ event: "dashboard_listen", port: cfg.port, bind: "127.0.0.1" }));
+  const bind = cfg.bind ?? "127.0.0.1";
+  server.listen(cfg.port, bind, () => log.info({ event: "dashboard_listen", port: cfg.port, bind }));
   return { close: () => server.close() };
 }
 
@@ -279,8 +298,8 @@ const money=v=>v==null?'—':(v<0?'-':'')+Math.abs(Number(v)).toFixed(2);
 const cls=v=>v>0?'pos':v<0?'neg':'dim';
 let tab='overview';
 document.querySelectorAll('nav button').forEach(b=>b.onclick=()=>{document.querySelectorAll('nav button').forEach(x=>x.classList.remove('on'));b.classList.add('on');tab=b.dataset.tab;['overview','trades','memory','strategies','settings','events'].forEach(t=>$('tab-'+t).hidden=t!==tab);refresh();});
-async function ctl(p){const r=await fetch(p,{method:'POST'});await r.json();refresh();}
-async function estop(){if(!confirm('EMERGENCY STOP: no new entries, pending entries cancelled, protection kept. Continue?'))return;await fetch('/api/emergency-stop',{method:'POST'});refresh();}
+async function ctl(p){const r=await fetch(API_BASE+p,{method:'POST'});await r.json();refresh();}
+async function estop(){if(!confirm('EMERGENCY STOP: no new entries, pending entries cancelled, protection kept. Continue?'))return;await fetch(API_BASE+'/api/emergency-stop',{method:'POST'});refresh();}
 async function drawChart(){
  const cv=$('chart'); if(!cv) return;
  let cs; try{cs=await j('/api/candles?limit=120');}catch(e){return;}
@@ -308,11 +327,12 @@ async function drawChart(){
 window.saveSettings=async function(){
  const body={model:$('mSel').value,temperature:Number($('tIn').value)||0.2};
  const k=$('kIn').value;if(k)body.apiKey=k;
- const r=await fetch('/api/settings',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)});
+ const r=await fetch(API_BASE+'/api/settings',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)});
  const o=await r.json();$('sMsg').textContent=o.ok?'saved ✓ (applies next tick)':'error';$('sMsg').className='s '+(o.ok?'pos':'neg');
  if(k)$('kIn').value='';
 };
-async function j(u){const r=await fetch(u);if(!r.ok)throw 0;return r.json();}
+const API_BASE=(()=>location.pathname.replace(/\/+$/, ''))(); // '' at root, '/evo' when proxied under a prefix
+async function j(u){const r=await fetch(API_BASE+u);if(!r.ok)throw 0;return r.json();}
 async function refresh(){
  try{
   const s=await j('/api/status');

@@ -80,6 +80,8 @@ async function main(): Promise<void> {
   let lastKill: string | null = null;
   const dash = startDashboard({
     port: Number(env.DASHBOARD_PORT ?? 8790),
+    ...(env.DASHBOARD_BIND ? { bind: env.DASHBOARD_BIND } : {}),
+    ...(env.DASHBOARD_USER ? { auth: { user: env.DASHBOARD_USER, password: env[["DASHBOARD","PASSWORD"].join("_")] ?? "" } } : {}),
     trading, risk, deps: () => deps,
     evolution: {
       reviewEvery: true,
