@@ -79,6 +79,13 @@ export async function startupSafetySequence(d: ExecutorDeps): Promise<boolean> {
       await reconcileOpen(d, open);
     }],
     ["position-mode", async () => {
+      // only set when different — OKX rejects with 59000 while positions exist
+      const cfg = await client.get<Array<Record<string, string>>>("/api/v5/account/config", undefined, true);
+      const mode = cfg[0]?.posMode ?? "";
+      if (mode === trading.account.position_mode) {
+        log.info({ event: "position-mode", result: "already set", mode });
+        return;
+      }
       await client.post("/api/v5/account/set-position-mode", { posMode: trading.account.position_mode }, true);
     }],
     ["leverage", async () => {
