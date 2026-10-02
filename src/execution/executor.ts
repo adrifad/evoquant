@@ -141,8 +141,24 @@ async function reconcileOpen(d: ExecutorDeps, exPositions: Position[]): Promise<
 }
 
 async function finalizeFromExchange(d: ExecutorDeps, t: Record<string, unknown>, ex?: Position): Promise<void> {
-  const fills = await getFills(d.client, String(t.instrument), String(t.ord_close_id ?? "")).catch(() => []);
-  const exitPx = ex?.markPx ? Number(ex.markPx) : (fills[0] ? Number(fills[0].fillPx) : Number(t.entry_px));
+  // Exit print resolution (algo/external closes have NO local close order id):
+  // symbol history fills ≥ entry → latest OPPOSITE-side fill is the exit.
+  const closeId = String(t.ord_close_id ?? "");
+  const entryMs = Date.parse(String(t.entry_ts));
+  const sideL = String(t.side) === "LONG";
+  const exitSide = sideL ? "sell" : "buy";
+  let exitFill: Awaited<ReturnType<typeof getFills>>[number] | undefined;
+  let fills: Awaited<ReturnType<typeof getFills>> = [];
+  if (closeId) fills = await getFills(d.client, String(t.instrument), closeId).catch(() => []);
+  if (fills.length === 0) {
+    const { getFillsHistory } = await import("../exchange/okx/orders.ts");
+    const sym = await getFillsHistory(d.client, String(t.instrument)).catch(() => []);
+    fills = sym.filter((f) => Number(f.ts) >= entryMs);
+    exitFill = fills.filter((f) => f.side === exitSide).sort((a, b) => Number(b.ts) - Number(a.ts))[0];
+  } else {
+    exitFill = fills[0];
+  }
+  const exitPx = ex?.markPx ? Number(ex.markPx) : (exitFill ? Number(exitFill.fillPx) : Number(t.entry_px));
   const contracts = Number(t.contracts);
   const meta = d.instruments[String(t.instrument)] ?? Object.values(d.instruments)[0];
   const ctVal = Number(meta?.ctVal ?? 0);
@@ -152,7 +168,7 @@ async function finalizeFromExchange(d: ExecutorDeps, t: Record<string, unknown>,
     contracts, ctVal, exitReason: fills.length ? "FILL_CONFIRM" : "RECONCILE",
     entryTs: String(t.entry_ts), exitTs: new Date().toISOString(),
     candlesWhileOpen: await getCandles(d.client, String(t.instrument), d.trading.timeframe, 200).then((cs) => cs.filter((c) => c.confirm === "1" && c.ts > Date.parse(String(t.entry_ts)))),
-    fees: Number(fills.reduce((a, f) => a + Number(f.fee || 0), 0)) || 0, funding: 0,
+    fees: fills.reduce((a, f) => a + Math.abs(Number(f.fee) || 0), 0), funding: 0, // positive-cost convention
   });
   closeTrade(d.store, String(t.trade_id), m);
   log.info({ event: "trade:finalized_reconcile", tradeId: String(t.trade_id), resultR: m.resultR });
@@ -228,6 +244,15 @@ export async function runTick(d: ExecutorDeps, ctx: TickContext, symbol: TickSym
   else if (getBotState(store) === "RISK_HALTED") { setBotState(store, "RUNNING"); log.info({ event: "kill_switch_cleared" }); }
   lastKillReason = kill;
 
+  // orphan heal: local OPEN but exchange has no position (algo SL/TP closed it,
+  // or tick race) → finalize from this trade's own fills so bookkeeping self-heals.
+  if (localOpenSym.length > 0 && possSym.length === 0) {
+    for (const t of localOpenSym) {
+      log.warn({ event: "monitor:orphan_detected", tradeId: String(t.trade_id), instId });
+      await finalizeFromExchange(d, t, undefined);
+    }
+  }
+
   // monitor open positions on THIS symbol (deterministic SL/TP + AI CLOSE)
   if (possSym.length > 0 && localOpenSym.length > 0) {
     const t = localOpenSym[0]!;
@@ -293,6 +318,14 @@ export async function runTick(d: ExecutorDeps, ctx: TickContext, symbol: TickSym
     );
   } catch (szErr) {
     logSystemEvent(store, "RISK_EVENT", { sizing_rejected: szErr instanceof Error ? szErr.message : String(szErr), instId, mode: trading.sizing.mode });
+    return { kill };
+  }
+  // RACE GUARD: decision took ~60-90s; re-check slots before placing (§23)
+  const freshPoss = (await getPositions(client)).filter((p) => p.pos !== "0");
+  const freshLocal = (getOpenTrades(store) as Array<Record<string, unknown>>);
+  if (freshPoss.length >= risk.hard_limits.max_concurrent_positions ||
+      freshLocal.some((x) => String(x.instrument) === instId && String(x.status) === "OPEN")) {
+    logSystemEvent(store, "RISK_EVENT", { race_guard: "entry skipped — slot/symbol taken during LLM", instId });
     return { kill };
   }
   const clOpen = clId(side, "OPEN", instId);

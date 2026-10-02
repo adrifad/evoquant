@@ -128,7 +128,10 @@ async function main(): Promise<void> {
     },
   });
 
+  let ticking = false;
   const tick = async (): Promise<void> => {
+    if (ticking) { log.info({ event: "tick_skipped_overlapping" }); return; } // mutex: 15m ticks can overrun while LLM is slow
+    ticking = true;
     try {
       refreshLlm();
       const strategies = loadStrategies(store);
@@ -176,7 +179,7 @@ async function main(): Promise<void> {
     } catch (e) {
       log.error({ event: "tick_error", error: e instanceof Error ? e.message : String(e) });
       logSystemEvent(store, "ERROR", { tick: e instanceof Error ? e.message : String(e) });
-    }
+    } finally { ticking = false; }
   };
 
   // §99 intrabar protection sweep — deterministic ticker check every 60s
