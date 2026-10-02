@@ -137,7 +137,7 @@ test("kill switch blocks; daily loss and drawdown block (§22 diagram)", () => {
 
 test("position conflict + disallowed symbol (§23)", () => {
   const v1 = evaluateEntry({ action: "LONG", confidence: 0.9, regime: "TRENDING_BULLISH", instrument: "BTC-USDT-SWAP", stopDistancePct: 0.01 },
-    { ...state, openPositions: 1 }, trading, risk);
+    { ...state, openPositions: risk.hard_limits.max_concurrent_positions }, trading, risk);
   assert.equal(v1.reason, "POSITION_ALREADY_OPEN");
   const v2 = evaluateEntry({ action: "LONG", confidence: 0.9, regime: "TRENDING_BULLISH", instrument: "DOGE-USDT-SWAP", stopDistancePct: 0.01 },
     state, tradingStrict, riskStrict);

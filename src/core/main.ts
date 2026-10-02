@@ -151,21 +151,23 @@ async function main(): Promise<void> {
       const rows = scanInstruments(snaps, strategies);
       lastScan = rows;
 
-      // 3) open position(s) → monitor those symbols; else evaluate best candidate
+      // 3) monitor every symbol holding an open position (SL/TP/AI-CLOSE)
       const openRows = getOpenTrades(store) as Array<Record<string, unknown>>;
-      if (openRows.length > 0) {
-        for (const sym of [...new Set(openRows.map((t) => String(t.instrument)))]) {
-          const snap = snaps.find((s) => s.instrument === sym);
-          const meta = instruments[sym];
-          if (snap && meta) { lastKill = (await runTick(deps, ctxFor(sym, snap.features, snap.regime, strategies), { instId: sym, meta })).kill; }
-        }
-      } else {
-        const cand = pickEntry(rows);
-        const target = cand ? snaps.find((s) => s.instrument === cand.instrument) : anchorSnap;
+      const openSyms = [...new Set(openRows.map((t) => String(t.instrument)))];
+      lastKill = null;
+      for (const sym of openSyms) {
+        const snap = snaps.find((s) => s.instrument === sym);
+        const meta = instruments[sym];
+        if (snap && meta) { lastKill = (await runTick(deps, ctxFor(sym, snap.features, snap.regime, strategies), { instId: sym, meta })).kill ?? lastKill; }
+      }
+      // 4) entry hunt continues while slots remain (§23 max_concurrent, 1/symbol)
+      const entryCandidate = pickEntry(rows.filter((rw) => !openSyms.includes(rw.instrument)));
+      if (openSyms.length < risk.hard_limits.max_concurrent_positions) {
+        const target = entryCandidate ? snaps.find((s) => s.instrument === entryCandidate.instrument) : (openSyms.length === 0 ? anchorSnap : null);
         if (target && instruments[target.instrument]) {
           const ctx = ctxFor(target.instrument, target.features, target.regime, strategies);
-          if (!cand) ctx.decideFn = async (): Promise<Decision> => holdBecause("scanner: no tradable setup on watchlist (LLM skipped to save budget)");
-          lastKill = (await runTick(deps, ctx, { instId: target.instrument, meta: instruments[target.instrument]! })).kill;
+          if (!entryCandidate && openSyms.length === 0) ctx.decideFn = async (): Promise<Decision> => holdBecause("scanner: no tradable setup on watchlist (LLM skipped to save budget)");
+          lastKill = (await runTick(deps, ctx, { instId: target.instrument, meta: instruments[target.instrument]! })).kill ?? lastKill;
         }
       }
       // after tick: any newly-closed trades get reviewed (M4)

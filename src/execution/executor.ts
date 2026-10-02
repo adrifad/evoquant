@@ -248,7 +248,9 @@ export async function runTick(d: ExecutorDeps, ctx: TickContext, symbol: TickSym
   await ctx.evolveFns.strategies();
   ctx.evolveFns.promote();
 
-  if (kill || getOpenTrades(store).length > 0) return { kill }; // NO NEW ENTRIES (§23) — global limit
+  // §23 NO NEW ENTRIES when: kill active, global cap reached (max_concurrent),
+  // or THIS symbol already holds a position (one position per symbol — V1 rule).
+  if (kill || possAll.length >= risk.hard_limits.max_concurrent_positions || localOpenSym.length > 0) return { kill };
   if (getBotState(store) !== "RUNNING") { log.info({ event: "tick:skipped", state: getBotState(store) }); return { kill }; }
 
   const f = ctx.features;
