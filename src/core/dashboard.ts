@@ -331,7 +331,7 @@ window.saveSettings=async function(){
  const o=await r.json();$('sMsg').textContent=o.ok?'saved ✓ (applies next tick)':'error';$('sMsg').className='s '+(o.ok?'pos':'neg');
  if(k)$('kIn').value='';
 };
-const API_BASE=(()=>location.pathname.replace(/\/+$/, ''))(); // '' at root, '/evo' when proxied under a prefix
+const API_BASE=(()=>{const p=location.pathname;return p.endsWith('/evo')?p:'';})();
 async function j(u){const r=await fetch(API_BASE+u);if(!r.ok)throw 0;return r.json();}
 async function refresh(){
  try{
