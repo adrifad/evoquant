@@ -99,6 +99,10 @@ test("regime classification baselines", () => {
 // ---- risk engine (§22/§23) --------------------------------------------------
 const state = { equity: 100, dayStartEquity: 101, peakEquity: 110, openPositions: 0, killSwitchActive: null };
 
+// pin policy values for engine tests — independent of live config edits
+const tradingStrict = { ...trading, decision: { ...trading.decision, minimum_confidence: 0.70 } };
+const riskStrict = { ...risk, hard_limits: { ...risk.hard_limits, allowed_symbols: ["BTC-USDT-SWAP"] } };
+
 test("entry approved when all checks pass", () => {
   const v = evaluateEntry(
     { action: "LONG", strategy: "TREND_FOLLOWING_V1", confidence: 0.8, regime: "TRENDING_BULLISH", instrument: "BTC-USDT-SWAP", stopDistancePct: 0.01 },
@@ -115,7 +119,7 @@ test("arbitrary strings rejected (§21/§19)", () => {
 });
 
 test("confidence floor + calibrated (§22/§33)", () => {
-  const v = evaluateEntry({ action: "LONG", confidence: 0.69, regime: "TRENDING_BULLISH", instrument: "BTC-USDT-SWAP", stopDistancePct: 0.01 }, state, trading, risk);
+  const v = evaluateEntry({ action: "LONG", confidence: 0.69, regime: "TRENDING_BULLISH", instrument: "BTC-USDT-SWAP", stopDistancePct: 0.01 }, state, tradingStrict, riskStrict);
   assert.equal(v.reason, "CONFIDENCE_BELOW_MIN");
 });
 
@@ -136,7 +140,7 @@ test("position conflict + disallowed symbol (§23)", () => {
     { ...state, openPositions: 1 }, trading, risk);
   assert.equal(v1.reason, "POSITION_ALREADY_OPEN");
   const v2 = evaluateEntry({ action: "LONG", confidence: 0.9, regime: "TRENDING_BULLISH", instrument: "DOGE-USDT-SWAP", stopDistancePct: 0.01 },
-    state, trading, risk);
+    state, tradingStrict, riskStrict);
   assert.equal(v2.reason, "INSTRUMENT_NOT_ALLOWED");
 });
 

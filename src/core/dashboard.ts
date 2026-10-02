@@ -36,6 +36,7 @@ export interface DashboardConfig {
   deps: () => ExecutorDeps;
   getLastTick: () => { features: unknown; regime: string; at: string } | null;
   getKillReason: () => string | null;
+  getScan: () => Array<{ instrument: string; regime: string; price: number; score: number; strategy: string | null; tradable: boolean }>;
   evolution: {
     reviewEvery: boolean; signalInterval: number; strategyInterval: number; minSample: number;
     maxWeightChangePct: number; maxParamChanges: number;
@@ -103,10 +104,14 @@ export function startDashboard(cfg: DashboardConfig): { close(): void } {
     }
     if (p === "/api/candles") {
       const limit = Math.min(Number(url.searchParams.get("limit") ?? 200), 400);
+      const inst = url.searchParams.get("instId") ?? cfg.trading.instrument.id;
       const rows = store.db.prepare(
-        "SELECT ts,o,h,l,c,vol FROM candles WHERE confirm='1' ORDER BY ts DESC LIMIT ?",
-      ).all(limit) as Array<Record<string, unknown>>;
+        "SELECT ts,o,h,l,c,vol FROM candles WHERE confirm='1' AND instId=? ORDER BY ts DESC LIMIT ?",
+      ).all(inst, limit) as Array<Record<string, unknown>>;
       return send(200, rows.reverse()); // chronological for the chart
+    }
+    if (p === "/api/scan") {
+      return send(200, cfg.getScan()); // multi-coin scanner rows (§67)
     }
     if (p === "/api/decisions") {
       const rows = store.db.prepare("SELECT * FROM decisions ORDER BY ts DESC LIMIT 60").all();
@@ -267,9 +272,11 @@ nav{display:flex;gap:4px;margin-left:auto}nav button.on{border-color:var(--blue)
 <main>
 <div id="tab-overview">
   <div class="grid k5" id="kpis"></div>
-  <div class="card" style="margin-top:14px"><h2>BTC-USDT-SWAP · 15m — last 120 candles (EMA20/50, SL/TP & entry markers when in position §64)</h2>
+  <div class="card" style="margin-top:14px"><h2><span id="symTitle">15m — last 120 candles (EMA20/50, SL/TP & entry markers when in position §64)</h2>
+    <select id="symSel" style="background:var(--card);color:var(--txt);border:1px solid var(--line);padding:4px 8px;font-size:12px"></select>
     <canvas id="chart" width="1180" height="300" style="width:100%;height:auto"></canvas>
     <div class="s dim" id="chartNote"></div></div>
+  <div class="card" style="margin-top:14px"><h2>Market Scanner — watchlist futures (deterministic pre-rank §37/§50)</h2><div id="scan"></div></div>
   <div class="grid two" style="margin-top:14px">
     <div class="card"><h2>Latest Decision (§66)</h2><div id="decision"></div></div>
     <div class="card"><h2>Position (§65) · Risk (§83)</h2><div id="posrisk"></div></div>
@@ -300,13 +307,19 @@ let tab='overview';
 document.querySelectorAll('nav button').forEach(b=>b.onclick=()=>{document.querySelectorAll('nav button').forEach(x=>x.classList.remove('on'));b.classList.add('on');tab=b.dataset.tab;['overview','trades','memory','strategies','settings','events'].forEach(t=>$('tab-'+t).hidden=t!==tab);refresh();});
 async function ctl(p){const r=await fetch(API_BASE+p,{method:'POST'});await r.json();refresh();}
 async function estop(){if(!confirm('EMERGENCY STOP: no new entries, pending entries cancelled, protection kept. Continue?'))return;await fetch(API_BASE+'/api/emergency-stop',{method:'POST'});refresh();}
+let chartSym=localStorage.getItem('evoChartSym')||null;
 async function drawChart(){
  const cv=$('chart'); if(!cv) return;
- let cs; try{cs=await j('/api/candles?limit=120');}catch(e){return;}
+ const sel=$('symSel');
+ const scan=await j('/api/scan').catch(()=>[]);
+ if(sel&&scan.length){const prev=sel.value;sel.innerHTML=scan.map(r=>'<option '+(r.instrument===(chartSym||prev)?'selected':'')+'>'+esc(r.instrument)+'</option>').join('');sel.onchange=()=>{chartSym=sel.value;localStorage.setItem('evoChartSym',sel.value);drawChart();};}
+ const sym=sel&&sel.value?sel.value:(chartSym||'');
+ let cs; try{cs=await j('/api/candles?limit=120&instId='+encodeURIComponent(sym));}catch(e){return;}
  if(!cs||cs.length<30){$('chartNote').textContent='Not enough candles yet (warm-up).';return;}
  const st=await j('/api/status').catch(()=>null);
  const W=cv.width,H=cv.height,pad=8, cw=W/(cs.length+6);
  const ctx=cv.getContext('2d'); ctx.clearRect(0,0,W,H);
+ const title=$('symTitle'); if(title&&sym)title.textContent=sym+' — 15m, last 120 candles';
  let lo=1e18,hi=-1e18; for(const c of cs){lo=Math.min(lo,c.l);hi=Math.max(hi,c.h);}
  const y=v=>H-pad-((v-lo)/(hi-lo))*(H-2*pad);
  const ema=(p)=>{const k=2/(p+1);let e=cs[0].c;return cs.map(c=>(e=c.c*k+e*(1-k)));};
@@ -369,7 +382,10 @@ async function refresh(){
    ['RSI14',f.rsi14],['ADX14',f.adx14],['ATR %',f.atrPct],['Volume ratio',f.volumeRatio]].map(r=>'<div class="row"><span class="dim">'+r[0]+'</span><b class="s">'+esc(typeof r[1]==='number'?r[1].toFixed(2):r[1])+'</b></div>').join('')+'</div>':'<div class="empty">Not evaluated yet.</div>';
   const ds=await j('/api/decisions');
   $('recent').innerHTML='<table><tr><th>time</th><th>act</th><th>conf</th><th>risk</th></tr>'+ds.slice(0,8).map(r=>'<tr><td>'+esc(r.ts.slice(11,19))+'</td><td class="'+(r.decision==='LONG'?'pos':r.decision==='SHORT'?'neg':'')+'">'+esc(r.decision)+'</td><td>'+((r.calibrated_confidence??0).toFixed(2))+'</td><td>'+esc((JSON.parse(r.risk_verdict||'{}').reason||'').slice(0,18))+'</td></tr>').join('')+'</table>';
-  if(tab==='overview') drawChart();
+  if(tab==='overview'){drawChart();
+   const sc=await j('/api/scan').catch(()=>[]);
+   $('scan').innerHTML=sc.length?'<table><tr><th>symbol</th><th>price</th><th>regime</th><th>score</th><th>strategy</th><th>tradable</th></tr>'+sc.map(r=>'<tr><td>'+esc(r.instrument)+'</td><td>'+Number(r.price).toFixed(r.price>100?2:4)+'</td><td>'+esc(r.regime)+'</td><td class="'+(r.score>0?'pos':r.score<0?'neg':'dim')+'">'+(r.score>0?'▲ ':'▼ ')+r.score.toFixed(2)+'</td><td>'+esc(r.strategy??'—')+'</td><td>'+(r.tradable?'<span class="pos">YES</span>':'<span class="dim">no</span>')+'</td></tr>').join('')+'</table>':'<div class="empty">Scanner idle — waiting for first tick.</div>';
+  }
   if(tab==='trades'){
    const tr=await j('/api/trades');
    $('tradesT').innerHTML='<table><tr><th>id</th><th>side</th><th>strategy</th><th>regime</th><th>entry</th><th>exit</th><th>R</th><th>PnL</th><th>reason</th><th>status</th></tr>'+tr.map(r=>'<tr><td>'+esc(r.trade_id.slice(-8))+'</td><td class="'+(r.side==='LONG'?'pos':'neg')+'">'+esc(r.side)+'</td><td>'+esc(r.strategy)+'_V'+r.strategy_version+'</td><td>'+esc(r.regime)+'</td><td>'+esc(r.entry_px)+'</td><td>'+esc(r.exit_px??'—')+'</td><td class="'+cls(r.result_r)+'">'+(r.result_r??0).toFixed(2)+'</td><td class="'+cls(r.pnl)+'">'+money(r.pnl)+'</td><td>'+esc(r.exit_reason??'')+'</td><td>'+esc(r.status)+'</td></tr>').join('')+'</table>';

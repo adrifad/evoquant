@@ -4,17 +4,19 @@ import { loadRepoEnv, REPO_ROOT } from "./env.ts";
 import { assertDemo, loadRiskConfig, loadTradingConfig } from "./config.ts";
 import { openStore, logSystemEvent } from "../memory/db.ts";
 import { createDemoExchange } from "../exchange/okx/index.ts";
-import { getCandles, latestClosedCandle } from "../exchange/okx/market.ts";
-import { buildFeatures } from "../market/features.ts";
-import { classifyRegime } from "../market/regime.ts";
-import { loadStrategies, saveStrategy } from "../strategy/library.ts";
+import { getCandles, latestClosedCandle, getTicker } from "../exchange/okx/market.ts";
+import type { Candle, InstrumentInfo } from "../exchange/okx/types.ts";
+import { buildFeatures, type FeatureSnapshot } from "../market/features.ts";
+import { classifyRegime, type Regime } from "../market/regime.ts";
+import { loadStrategies, saveStrategy, type StrategyDef } from "../strategy/library.ts";
+import { scanInstruments, pickEntry, type ScanRow } from "../strategy/scanner.ts";
 import { startupSafetySequence, runTick, emergencyStop, getLastKillReason, persistCandles, priceTrigger } from "../execution/executor.ts";
 import { closeTradeOnExchange } from "../execution/executor.ts";
 import { getPositions } from "../exchange/okx/account.ts";
 import { getOpenTrades } from "../memory/trades.ts";
 import { CandleCloseScheduler, msForBar } from "./scheduler.ts";
 import { getBotState, setBotState } from "./state.ts";
-import { decide, type Decision } from "../agents/decision-agent.ts";
+import { decide, holdBecause, type Decision } from "../agents/decision-agent.ts";
 import { reviewTrade } from "../agents/reviewer-agent.ts";
 import { maybeEvolveStrategies } from "../agents/evolution-agent.ts";
 import { maybeEvolveWeights } from "../learning/signal-weights.ts";
@@ -40,13 +42,27 @@ async function main(): Promise<void> {
 
   const store = openStore(REPO_ROOT);
   const { client } = createDemoExchange(env);
-  const meta = await import("../exchange/okx/market.ts").then((m) => m.getInstruments(client, "SWAP", trading.instrument.id));
-  const inst = meta[0];
-  if (!inst) throw new Error("instrument metadata missing (§43)");
-  const deps = { client, trading, risk, store, instrument: inst };
+  // multi-coin scan (§17): watchlist metadata cached at startup (§7.2/§43)
+  const watchlistReq = trading.instruments?.watchlist ?? [trading.instrument.id];
+  const allSwaps = await import("../exchange/okx/market.ts").then((m) => m.getInstruments(client, "SWAP"));
+  const instruments: Record<string, InstrumentInfo> = {};
+  for (const w of watchlistReq) {
+    const i = allSwaps.find((x) => x.instId === w);
+    if (i) instruments[w] = i;
+    else log.warn({ event: "watchlist_symbol_no_metadata", instId: w });
+  }
+  const watchlist = Object.keys(instruments);
+  if (watchlist.length === 0) throw new Error("no watchlist instruments have metadata (§43)");
+  const anchor = watchlist.includes(trading.instrument.id) ? trading.instrument.id : watchlist[0]!;
+  const deps = { client, trading, risk, store, instruments, watchlist };
 
-  // history backfill for features/backtests (persisted in memory/candles table? kept in-memory + re-fetch on start)
-  let history = (await getCandles(client, trading.instrument.id, trading.timeframe, 300)).filter((c) => c.confirm === "1").sort((a, b) => a.ts - b.ts);
+  // per-symbol history for features/backtests
+  const histories = new Map<string, Candle[]>();
+  for (const sym of watchlist) {
+    const cs = (await getCandles(client, sym, trading.timeframe, 300)).filter((c) => c.confirm === "1").sort((a, b) => a.ts - b.ts);
+    histories.set(sym, cs);
+    persistCandles(store, sym, trading.timeframe, cs);
+  }
 
   if (!(await startupSafetySequence(deps))) {
     setBotState(store, "ERROR");
@@ -78,6 +94,7 @@ async function main(): Promise<void> {
 
   let lastTick: { features: unknown; regime: string; at: string } | null = null;
   let lastKill: string | null = null;
+  let lastScan: ScanRow[] = [];
   const dash = startDashboard({
     port: Number(env.DASHBOARD_PORT ?? 8790),
     ...(env.DASHBOARD_BIND ? { bind: env.DASHBOARD_BIND } : {}),
@@ -93,35 +110,64 @@ async function main(): Promise<void> {
     },
     getLastTick: () => lastTick,
     getKillReason: () => getLastKillReason(),
+    getScan: () => lastScan,
+  });
+
+  const ctxFor = (instId2: string, features: FeatureSnapshot, regime: Regime, strategies: StrategyDef[]) => ({
+    features, regime, strategies,
+    decideFn: async (feat: FeatureSnapshot, reg: Regime, hasPos: boolean): Promise<Decision> =>
+      decide(REPO_ROOT, llm, instId2, trading.timeframe, feat, reg, strategies, hasPos, store),
+    reviewFn: async (id: string) => { await reviewTrade(REPO_ROOT, llmReview, store, id); },
+    evolveFns: {
+      weights: async () => { await maybeEvolveWeights(store, evolution.signal_evolution_interval_trades, evolution.constraints.max_weight_change_per_cycle_pct); },
+      calibration: () => { recomputeCalibration(store); },
+      strategies: async () => {
+        await maybeEvolveStrategies(REPO_ROOT, llmEvolve, store, evolution.strategy_evolution_interval_trades, evolution.constraints.max_param_changes_per_challenger, evolution.minimum_validation_sample);
+      },
+      promote: () => { compareAndMaybePromote(store, histories.get(anchor) ?? [], trading.timeframe); },
+    },
   });
 
   const tick = async (): Promise<void> => {
     try {
       refreshLlm();
-      const fresh = await getCandles(client, trading.instrument.id, trading.timeframe, 300);
-      history = fresh.filter((c) => c.confirm === "1").sort((a, b) => a.ts - b.ts);
-      const f = buildFeatures(trading.instrument.id, [...history].reverse());
-      const regime = classifyRegime(f);
-      lastTick = { features: f, regime, at: new Date().toISOString() };
-      persistCandles(store, trading.instrument.id, trading.timeframe, history);
       const strategies = loadStrategies(store);
-      const decideFn = async (feat: typeof f, reg: typeof regime, hasPos: boolean): Promise<Decision> => {
-        const d = await decide(REPO_ROOT, llm, trading.instrument.id, trading.timeframe, feat, reg, strategies, hasPos, store);
-        return d;
-      };
-      const kt = await runTick(deps, {
-        features: f, regime, strategies, decideFn,
-        reviewFn: async (id) => { await reviewTrade(REPO_ROOT, llmReview, store, id); },
-        evolveFns: {
-          weights: async () => { await maybeEvolveWeights(store, evolution.signal_evolution_interval_trades, evolution.constraints.max_weight_change_per_cycle_pct); },
-          calibration: () => { recomputeCalibration(store); },
-          strategies: async () => {
-            await maybeEvolveStrategies(REPO_ROOT, llmEvolve, store, evolution.strategy_evolution_interval_trades, evolution.constraints.max_param_changes_per_challenger, evolution.minimum_validation_sample);
-          },
-          promote: () => { compareAndMaybePromote(store, history, trading.timeframe); },
-        },
-      });
-      lastKill = kt.kill;
+      // 1) refresh all watchlist candles + snapshots (§17 pipeline)
+      const snaps: Array<{ instrument: string; features: FeatureSnapshot; regime: Regime }> = [];
+      for (const sym of watchlist) {
+        try {
+          const cs = (await getCandles(client, sym, trading.timeframe, 300)).filter((c) => c.confirm === "1").sort((a, b) => a.ts - b.ts);
+          histories.set(sym, cs);
+          persistCandles(store, sym, trading.timeframe, cs);
+          const feats = buildFeatures(sym, [...cs].reverse());
+          snaps.push({ instrument: sym, features: feats, regime: classifyRegime(feats) });
+        } catch (e) {
+          log.warn({ event: "symbol_fetch_failed", instId: sym, error: e instanceof Error ? e.message : String(e) });
+        }
+      }
+      const anchorSnap = snaps.find((s) => s.instrument === anchor) ?? snaps[0];
+      if (anchorSnap) lastTick = { features: anchorSnap.features, regime: anchorSnap.regime, at: new Date().toISOString() };
+      // 2) deterministic pre-rank (§37 opportunity agent as scanner)
+      const rows = scanInstruments(snaps, strategies);
+      lastScan = rows;
+
+      // 3) open position(s) → monitor those symbols; else evaluate best candidate
+      const openRows = getOpenTrades(store) as Array<Record<string, unknown>>;
+      if (openRows.length > 0) {
+        for (const sym of [...new Set(openRows.map((t) => String(t.instrument)))]) {
+          const snap = snaps.find((s) => s.instrument === sym);
+          const meta = instruments[sym];
+          if (snap && meta) { lastKill = (await runTick(deps, ctxFor(sym, snap.features, snap.regime, strategies), { instId: sym, meta })).kill; }
+        }
+      } else {
+        const cand = pickEntry(rows);
+        const target = cand ? snaps.find((s) => s.instrument === cand.instrument) : anchorSnap;
+        if (target && instruments[target.instrument]) {
+          const ctx = ctxFor(target.instrument, target.features, target.regime, strategies);
+          if (!cand) ctx.decideFn = async (): Promise<Decision> => holdBecause("scanner: no tradable setup on watchlist (LLM skipped to save budget)");
+          lastKill = (await runTick(deps, ctx, { instId: target.instrument, meta: instruments[target.instrument]! })).kill;
+        }
+      }
       // after tick: any newly-closed trades get reviewed (M4)
       const closed = store.db.prepare("SELECT trade_id FROM trades WHERE status='CLOSED' AND trade_id NOT IN (SELECT trade_id FROM trade_reviews) ORDER BY exit_ts DESC LIMIT 3").all() as Array<{ trade_id: string }>;
       for (const c of closed) await reviewTrade(REPO_ROOT, llmReview, store, c.trade_id).catch(() => undefined);
@@ -135,17 +181,17 @@ async function main(): Promise<void> {
   // (exchange-native algo = Layer A is primary; this is a fast Layer B).
   const intrabar = setInterval(async () => {
     try {
-      const { getTicker } = await import("../exchange/okx/market.ts");
-      const poss = (await getPositions(deps.client, trading.instrument.id)).filter((p) => p.pos !== "0");
+      const poss = (await getPositions(deps.client)).filter((p) => p.pos !== "0");
       const local = getOpenTrades(store) as Array<Record<string, unknown>>;
       if (poss.length === 0 || local.length === 0) return;
-      const t = local[0]!;
-      const trig = priceTrigger(t, Number(poss[0]!.markPx));
-      if (trig) {
-        const px = (await getTicker(deps.client, trading.instrument.id)).last;
-        const trig2 = priceTrigger(t, px) ?? "SL";
-        log.warn({ event: "intrabar_trigger", tradeId: String(t.trade_id), reason: trig2 });
-        await closeTradeOnExchange(deps, t, poss[0]!, trig2);
+      for (const pos of poss) {
+        const t = local.find((x) => String(x.instrument) === pos.instId && String(x.side).toLowerCase() === pos.posSide);
+        if (!t) continue;
+        const trig = priceTrigger(t, Number(pos.markPx));
+        if (trig) {
+          log.warn({ event: "intrabar_trigger", tradeId: String(t.trade_id), instId: pos.instId, reason: trig });
+          await closeTradeOnExchange(deps, t, pos, trig);
+        }
       }
     } catch (e) {
       log.warn({ event: "intrabar_error", error: e instanceof Error ? e.message : String(e) });

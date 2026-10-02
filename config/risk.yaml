@@ -7,8 +7,14 @@ hard_limits:
   max_drawdown_pct: 10.0
   max_leverage: 5
   max_concurrent_positions: 1
-  allowed_symbols:
+  allowed_symbols:   # human-editable only (§48) — must cover watchlist
     - BTC-USDT-SWAP
+    - ETH-USDT-SWAP
+    - SOL-USDT-SWAP
+    - XRP-USDT-SWAP
+    - BNB-USDT-SWAP
+    - DOGE-USDT-SWAP
+    - ADA-USDT-SWAP
 
 kill_switch:
   # any of these = NO NEW ENTRIES (spec §23)

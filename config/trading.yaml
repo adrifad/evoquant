@@ -3,8 +3,18 @@ exchange: okx
 environment: demo   # spec §44: anything else aborts startup
 
 instrument:
-  id: BTC-USDT-SWAP
+  id: BTC-USDT-SWAP      # primary/anchor instrument (dashboard default)
   type: SWAP
+
+instruments:
+  watchlist:             # bot scans ALL of these each 15m candle (futures SWAP)
+    - BTC-USDT-SWAP
+    - ETH-USDT-SWAP
+    - SOL-USDT-SWAP
+    - XRP-USDT-SWAP
+    - BNB-USDT-SWAP
+    - DOGE-USDT-SWAP
+    - ADA-USDT-SWAP
 
 timeframe: 15m
 

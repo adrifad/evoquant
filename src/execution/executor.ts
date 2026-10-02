@@ -1,7 +1,8 @@
 // M2+ (§42/§43/§45) — trading executor: startup safety sequence, candle tick,
-// approved-decision execution with exchange-native SL/TP (§16 Layer A via
-// position monitoring + deterministic close, V1 simple), reconciliation,
+// approved-decision execution with exchange-native SL/TP (§16), reconciliation,
 // closed-trade finalization, and review/evolution triggers.
+// Multi-symbol (V1.1): runTick targets one symbol per call; deps carry
+// instrument metadata for the whole watchlist (§17 "later" realized here).
 //
 // V1 note: OKX demo algo orders (order-algo) are used when available; if the
 // endpoint rejects, we fall back to the bot-side SL/TP monitor (Layer B is
@@ -45,7 +46,14 @@ export interface ExecutorDeps {
   trading: TradingConfig;
   risk: RiskConfig;
   store: Store;
-  instrument: InstrumentInfo;
+  instruments: Record<string, InstrumentInfo>;   // keyed by instId (watchlist)
+  watchlist: string[];
+}
+
+/** Symbol the current tick targets: instId + metadata. */
+export interface TickSymbol {
+  instId: string;
+  meta: InstrumentInfo;
 }
 
 let tradeSeq = 0;
@@ -57,7 +65,7 @@ function nextTradeId(): string {
 
 // §43 startup safety sequence (1–13) — returns false when trading stays off.
 export async function startupSafetySequence(d: ExecutorDeps): Promise<boolean> {
-  const { client, trading, risk, store } = d;
+  const { client, trading, risk, store, watchlist } = d;
   const steps: Array<[string, () => Promise<void>]> = [
     ["server-time", async () => {
       const t = await getServerTime(client);
@@ -66,7 +74,7 @@ export async function startupSafetySequence(d: ExecutorDeps): Promise<boolean> {
     }],
     ["balance", async () => { await getBalance(client); }],
     ["positions", async () => {
-      const poss = await getPositions(client, trading.instrument.id);
+      const poss = await getPositions(client);
       const open = poss.filter((p) => p.pos !== "0");
       await reconcileOpen(d, open);
     }],
@@ -74,7 +82,21 @@ export async function startupSafetySequence(d: ExecutorDeps): Promise<boolean> {
       await client.post("/api/v5/account/set-position-mode", { posMode: trading.account.position_mode }, true);
     }],
     ["leverage", async () => {
-      await setLeverage(client, trading.instrument.id, trading.leverage.default, risk.hard_limits.max_leverage);
+      // §7.10/§43: both posSides per symbol — paced + retried for OKX rate limits
+      for (const sym of watchlist) {
+        let attempt = 0;
+        for (;;) {
+          try {
+            await setLeverage(client, sym, trading.leverage.default, risk.hard_limits.max_leverage);
+            break;
+          } catch (e) {
+            attempt += 1;
+            if (attempt >= 4 || !String((e as Error).message).includes("50011")) throw e;
+            await new Promise((res) => setTimeout(res, 1_500 * attempt)); // backoff
+          }
+        }
+        await new Promise((res) => setTimeout(res, 350)); // ~20 req/2s safety
+      }
     }],
   ];
   for (const [name, fn] of steps) {
@@ -88,23 +110,25 @@ export async function startupSafetySequence(d: ExecutorDeps): Promise<boolean> {
   return true;
 }
 
-// §45 — reconcile local open trades against exchange positions.
+// §45 — reconcile local open trades against exchange positions (all symbols).
 async function reconcileOpen(d: ExecutorDeps, exPositions: Position[]): Promise<void> {
   const local = getOpenTrades(d.store) as Array<Record<string, unknown>>;
-  const exBySide = new Map(exPositions.map((p) => [p.posSide, p]));
+  const exByKey = new Map(exPositions.map((p) => [`${p.instId}:${p.posSide}`, p]));
   for (const t of local) {
-    const ex = exBySide.get(String(t.side).toLowerCase() === "long" ? "long" : "short");
+    const key = `${String(t.instrument)}:${String(t.side).toLowerCase()}`;
+    const ex = exByKey.get(key);
     if (!ex || ex.pos === "0") {
       // local says open, exchange says gone → trade closed outside; finalize via fills
       log.warn({ event: "reconcile:exit_detected", tradeId: String(t.trade_id) });
       await finalizeFromExchange(d, t, ex);
     }
+    exByKey.delete(key);
   }
-  for (const [side, p] of exBySide) {
-    const known = local.some((t) => String(t.side).toLowerCase() === side);
-    if (!known && p.pos !== "0") {
-      logSystemEvent(d.store, "STATE", { unexpected_position: `${p.instId}:${side}` });
-      log.warn({ event: "reconcile:unexpected_position", instId: p.instId, side });
+  // exchange positions not known locally = unexpected (§23 unexpected_position)
+  for (const [key, p] of exByKey) {
+    if (p.pos !== "0") {
+      logSystemEvent(d.store, "STATE", { unexpected_position: key });
+      log.warn({ event: "reconcile:unexpected_position", instId: p.instId, posSide: p.posSide });
     }
   }
 }
@@ -113,7 +137,8 @@ async function finalizeFromExchange(d: ExecutorDeps, t: Record<string, unknown>,
   const fills = await getFills(d.client, String(t.instrument), String(t.ord_close_id ?? "")).catch(() => []);
   const exitPx = ex?.markPx ? Number(ex.markPx) : (fills[0] ? Number(fills[0].fillPx) : Number(t.entry_px));
   const contracts = Number(t.contracts);
-  const ctVal = Number(d.instrument.ctVal);
+  const meta = d.instruments[String(t.instrument)] ?? Object.values(d.instruments)[0];
+  const ctVal = Number(meta?.ctVal ?? 0);
   const side = t.side === "LONG" ? "LONG" : "SHORT";
   const m = computeClosedMetrics({
     side, entryPx: Number(t.entry_px), stopPx: Number(t.stop_px), exitPx,
@@ -164,25 +189,26 @@ function usdtEquity(bal: Awaited<ReturnType<typeof getBalance>>): number {
   return usdt ? Number(usdt.availEq) || Number(usdt.availBal) || 0 : 0;
 }
 
-export async function runTick(d: ExecutorDeps, ctx: TickContext): Promise<{ kill: string | null }> {
+export async function runTick(d: ExecutorDeps, ctx: TickContext, symbol: TickSymbol): Promise<{ kill: string | null }> {
   const { trading, risk, store, client } = d;
-  const instId = trading.instrument.id;
-  // §40 persistence: instrument metadata + candles snapshot each tick
+  const instId = symbol.instId;
+  const meta = symbol.meta;
+  // §40 persistence: instrument metadata each tick (candles persisted in main)
   store.db.prepare(`INSERT INTO instruments(instId,instType,tickSz,lotSz,minSz,ctVal,ctValCcy,cached_ts)
     VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(instId) DO UPDATE SET cached_ts=excluded.cached_ts`)
-    .run(d.instrument.instId, "SWAP", d.instrument.tickSz, d.instrument.lotSz, d.instrument.minSz,
-         d.instrument.ctVal, d.instrument.ctValCcy, new Date().toISOString());
+    .run(meta.instId, "SWAP", meta.tickSz, meta.lotSz, meta.minSz, meta.ctVal, meta.ctValCcy, new Date().toISOString());
   const bal = await getBalance(client);
   const eq = usdtEquity(bal);
   const base = baseline(store, eq);
-  const poss = (await getPositions(client, instId)).filter((p) => p.pos !== "0");
-  const localOpenCount = getOpenTrades(store).length;
+  const possAll = (await getPositions(client)).filter((p) => p.pos !== "0");
+  const possSym = possAll.filter((p) => p.instId === instId);
+  const localOpenSym = (getOpenTrades(store) as Array<Record<string, unknown>>).filter((t) => String(t.instrument) === instId);
   const kill = evaluateKillSwitch(
     {
-      apiOk: true, positionMismatch: localOpenCount > 0 && poss.length === 0, orderFailuresRecent: consecutiveOrderFailures,
+      apiOk: true, positionMismatch: localOpenSym.length > 0 && possSym.length === 0, orderFailuresRecent: consecutiveOrderFailures,
       clockDriftMs: Date.now() - (await getServerTime(client)),
-      dbOk: true, instrumentMetaOk: Number(d.instrument.ctVal) > 0,
-      unexpectedPosition: poss.length > risk.hard_limits.max_concurrent_positions,
+      dbOk: true, instrumentMetaOk: Number(meta.ctVal) > 0,
+      unexpectedPosition: possAll.length > risk.hard_limits.max_concurrent_positions,
       dailyLossPct: base.dayStartEquity > 0 ? ((base.dayStartEquity - eq) / base.dayStartEquity) * 100 : 0,
       drawdownPct: base.peakEquity > 0 ? ((base.peakEquity - eq) / base.peakEquity) * 100 : 0,
     },
@@ -192,20 +218,18 @@ export async function runTick(d: ExecutorDeps, ctx: TickContext): Promise<{ kill
   else if (getBotState(store) === "RISK_HALTED") { setBotState(store, "RUNNING"); log.info({ event: "kill_switch_cleared" }); }
   lastKillReason = kill;
 
-  // monitor open positions first (deterministic SL/TP + AI CLOSE)
-  if (poss.length > 0) {
-    const t = getOpenTrades(store)[0] as Record<string, unknown> | undefined;
-    if (t) {
-      const pos = poss[0]!;
-      const mark = Number(pos.markPx);
-      let reason: "SL" | "TP" | "AI_CLOSE" | null = priceTrigger(t, mark);
-      if (!reason) {
-        const dec = await ctx.decideFn(ctx.features, ctx.regime, true);
-        if (dec.decision === "CLOSE") reason = "AI_CLOSE";
-      }
-      if (reason) await closeTradeOnExchange(d, t, pos, reason);
-      else log.info({ event: "monitor:hold", tradeId: String(t.trade_id), markPx: mark });
+  // monitor open positions on THIS symbol (deterministic SL/TP + AI CLOSE)
+  if (possSym.length > 0 && localOpenSym.length > 0) {
+    const t = localOpenSym[0]!;
+    const pos = possSym[0]!;
+    const mark = Number(pos.markPx);
+    let reason: "SL" | "TP" | "AI_CLOSE" | null = priceTrigger(t, mark);
+    if (!reason) {
+      const dec = await ctx.decideFn(ctx.features, ctx.regime, true);
+      if (dec.decision === "CLOSE") reason = "AI_CLOSE";
     }
+    if (reason) await closeTradeOnExchange(d, t, pos, reason);
+    else log.info({ event: "monitor:hold", tradeId: String(t.trade_id), instId, markPx: mark });
   }
 
   // evolution intervals on closed trades (§42 bottom half)
@@ -214,7 +238,7 @@ export async function runTick(d: ExecutorDeps, ctx: TickContext): Promise<{ kill
   await ctx.evolveFns.strategies();
   ctx.evolveFns.promote();
 
-  if (kill || getOpenTrades(store).length > 0) return { kill }; // NO NEW ENTRIES (§23)
+  if (kill || getOpenTrades(store).length > 0) return { kill }; // NO NEW ENTRIES (§23) — global limit
   if (getBotState(store) !== "RUNNING") { log.info({ event: "tick:skipped", state: getBotState(store) }); return { kill }; }
 
   const f = ctx.features;
@@ -222,7 +246,6 @@ export async function runTick(d: ExecutorDeps, ctx: TickContext): Promise<{ kill
   const decision = await ctx.decideFn(f, ctx.regime, hasPosition);
   const calConf = calibrate(store, decision.confidence, 30);
   const sid = decision.strategy ?? "";
-  const [sName, sVerStr] = [sid.split("_V")[0] ?? null, sid.match(/_V(\d+)$/)?.[1] ?? null];
   const verdict = evaluateEntry(
     {
       action: decision.decision, strategy: decision.strategy ?? undefined, confidence: calConf,
@@ -231,7 +254,7 @@ export async function runTick(d: ExecutorDeps, ctx: TickContext): Promise<{ kill
     },
     {
       equity: eq, dayStartEquity: base.dayStartEquity, peakEquity: base.peakEquity,
-      openPositions: poss.length, killSwitchActive: kill,
+      openPositions: possAll.length, killSwitchActive: kill,
     },
     trading, risk,
   );
@@ -241,30 +264,26 @@ export async function runTick(d: ExecutorDeps, ctx: TickContext): Promise<{ kill
     rawConfidence: decision.confidence, calibratedConfidence: calConf,
     thesis: decision.thesis, riskVerdict: verdict,
   });
-  log.info({ event: "decision", action: decision.decision, strategy: decision.strategy, raw: decision.confidence, calibrated: calConf, approved: verdict.approved, reason: verdict.reason });
+  log.info({ event: "decision", instId, action: decision.decision, strategy: decision.strategy, raw: decision.confidence, calibrated: calConf, approved: verdict.approved, reason: verdict.reason });
 
   if (!verdict.approved || decision.decision === "HOLD") return { kill };
 
   // §24 sizing from strategy params
   const strat = ctx.strategies.find((s) => `${s.name}_V${s.version}` === sid) ?? ctx.strategies[0]!;
-  const stopPct = decision.suggested_stop_atr * f.atr14 / f.price;
-  const stopPx = stopPriceFor(f.price, f.atr14, decision.suggested_stop_atr, decision.decision as "LONG" | "SHORT");
-  const tpPx = takeProfitPriceFor(f.price, f.atr14, decision.suggested_take_profit_atr, decision.decision as "LONG" | "SHORT");
+  const side = decision.decision as "LONG" | "SHORT";
+  const stopPx = stopPriceFor(f.price, f.atr14, decision.suggested_stop_atr, side);
   let sz;
   try {
     sz = sizePosition(
-      { equity: eq, entryPrice: f.price, stopPrice: stopPx, leverage: trading.leverage.default, instrument: d.instrument },
+      { equity: eq, entryPrice: f.price, stopPrice: stopPx, leverage: trading.leverage.default, instrument: meta },
       risk,
       trading.sizing,
     );
   } catch (szErr) {
-    logSystemEvent(store, "RISK_EVENT", { sizing_rejected: szErr instanceof Error ? szErr.message : String(szErr), mode: trading.sizing.mode });
+    logSystemEvent(store, "RISK_EVENT", { sizing_rejected: szErr instanceof Error ? szErr.message : String(szErr), instId, mode: trading.sizing.mode });
     return { kill };
   }
-  void stopPct;
-  if (!verdict.approved) return { kill };
-  const side = decision.decision as "LONG" | "SHORT";
-  const clOpen = clId(side, "OPEN");
+  const clOpen = clId(side, "OPEN", instId);
   try {
     const placed = await placeOrder(client, {
       instId, tdMode: "isolated", side: side === "LONG" ? "buy" : "sell",
@@ -292,7 +311,7 @@ export async function runTick(d: ExecutorDeps, ctx: TickContext): Promise<{ kill
       entryFeatures: f,
     });
     // §16 Layer A — exchange-native conditional (SL+TP) algo orders.
-    // Best-effort: on failure Layer B (monitor below) still holds; flag it.
+    // Best-effort: on failure Layer B (monitor) still holds; flag it.
     try {
       const algo = await placeConditionalProtection(client, {
         instId,
@@ -300,7 +319,7 @@ export async function runTick(d: ExecutorDeps, ctx: TickContext): Promise<{ kill
         contracts: sz.contracts,
         stopPrice: stopPriceFor(entryPx, f.atr14, decision.suggested_stop_atr, side),
         takeProfitPrice: takeProfitPriceFor(entryPx, f.atr14, decision.suggested_take_profit_atr, side),
-        clAlgoId: clId(side, "ALGO"),
+        clAlgoId: clId(side, "ALGO", instId),
       });
       store.db.prepare("UPDATE trades SET algo_id=? WHERE trade_id=?").run(algo.algoId, tradeId);
       log.info({ event: "protection:algo_placed", tradeId, algoId: algo.algoId });
@@ -313,8 +332,8 @@ export async function runTick(d: ExecutorDeps, ctx: TickContext): Promise<{ kill
     persistFills(store, entryFills.map((f2) => ({ tradeId: f2.tradeId, ordId: f2.ordId, clOrdId: f2.clOrdId,
       instId: f2.instId, fillPx: f2.fillPx, fillSz: f2.fillSz, fee: f2.fee, feeCcy: f2.feeCcy,
       side: f2.side, posSide: f2.posSide, ts: f2.ts })));
-    logSystemEvent(store, "TRADE_OPEN", { tradeId, side, contracts: sz.contracts, entryPx });
-    log.info({ event: "trade:opened", tradeId, entryPx, contracts: sz.contracts });
+    logSystemEvent(store, "TRADE_OPEN", { tradeId, instId, side, contracts: sz.contracts, entryPx });
+    log.info({ event: "trade:opened", tradeId, instId, entryPx, contracts: sz.contracts });
     void ctx.reviewFn;
   } catch (e) {
     consecutiveOrderFailures += 1;
@@ -336,20 +355,22 @@ export function priceTrigger(t: Record<string, unknown>, markPx: number): "SL" |
   return null;
 }
 
-// letters+digits only, ≤32 (§15 + OKX charset gotcha)
-function clId(side: string, kind: "OPEN" | "CLOSE" | "ALGO"): string {
+// letters+digits only, ≤32 (§15 + OKX charset gotcha). Ticker derived from instId.
+export function clId(side: string, kind: "OPEN" | "CLOSE" | "ALGO", instId: string): string {
+  const base = instId.split("-")[0] ?? "X";
   const day = new Date().toISOString().slice(0, 10).replaceAll("-", "");
   const rand = String(Date.now() % 1000000).padStart(6, "0");
-  return `EVQBTC${side === "LONG" ? "L" : "S"}${kind}${day}${rand}`.slice(0, 32);
+  return `EVQ${base}${side === "LONG" ? "L" : "S"}${kind}${day}${rand}`.slice(0, 32);
 }
 
 export async function closeTradeOnExchange(d: ExecutorDeps, t: Record<string, unknown>, pos: Position, reason: string): Promise<void> {
   const side = String(t.side) as "LONG" | "SHORT";
-  const clClose = clId(side, "CLOSE");
+  const meta = d.instruments[String(t.instrument)] ?? Object.values(d.instruments)[0]!;
+  const clClose = clId(side, "CLOSE", String(t.instrument));
   const placed = await closePosition(d.client, {
     instId: String(t.instrument), posSide: side === "LONG" ? "long" : "short",
     contracts: pos.pos, clOrdId: clClose,
-    lotSz: d.instrument.lotSz, minSz: d.instrument.minSz,
+    lotSz: meta.lotSz, minSz: meta.minSz,
   });
   const filled = await waitForOrderTerminal(d.client, String(t.instrument), placed.ordId, { timeoutMs: 30_000 });
   const exitPx = Number(filled.avgPx) || Number(pos.markPx);
@@ -368,7 +389,7 @@ export async function closeTradeOnExchange(d: ExecutorDeps, t: Record<string, un
     sz: pos.pos, state: filled.state, avgPx: filled.avgPx, uTime: filled.uTime,
     tradeId: String(t.trade_id), kind: "CLOSE" });
   const contracts = Number(t.contracts);
-  const ctVal = Number(d.instrument.ctVal);
+  const ctVal = Number(meta.ctVal);
   const candles = await getCandles(d.client, String(t.instrument), d.trading.timeframe, 200);
   const m = computeClosedMetrics({
     side, entryPx: Number(t.entry_px), stopPx: Number(t.stop_px), exitPx,
@@ -386,7 +407,7 @@ export async function closeTradeOnExchange(d: ExecutorDeps, t: Record<string, un
       log.warn({ event: "algo_cancel_failed", error: err instanceof Error ? err.message : String(err) }));
   }
   log.info({ event: "trade:closed", tradeId: String(t.trade_id), reason, resultR: m.resultR });
-  logSystemEvent(d.store, "TRADE_CLOSED", { tradeId: String(t.trade_id), reason, resultR: m.resultR });
+  logSystemEvent(d.store, "TRADE_CLOSED", { tradeId: String(t.trade_id), instId: String(t.instrument), reason, resultR: m.resultR });
 }
 
 // emergency stop (§89): halt, cancel pending ENTRIES, preserve protections
