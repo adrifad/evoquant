@@ -18,7 +18,7 @@ import { emergencyStop, type ExecutorDeps } from "../execution/executor.ts";
 import { setEnvKeys, maskKey } from "./settings.ts";
 import { loadRepoEnv } from "./env.ts";
 import path from "node:path";
-import { getBalance } from "../exchange/okx/account.ts";
+import { getBalance, getPositions } from "../exchange/okx/account.ts";
 import { createLogger } from "./logger.ts";
 
 const log = createLogger("dashboard");
@@ -46,6 +46,25 @@ export interface DashboardConfig {
 export function startDashboard(cfg: DashboardConfig): { close(): void } {
   const store = cfg.deps().store;
 
+  // §65/§69 — live unrealized PnL per open trade, sourced from the
+  // exchange positions endpoint (upl, markPx — source of truth §7.8).
+  async function livePnl(): Promise<Map<string, { mark: number; upl: number; pos: string; lever: string }>> {
+    const map = new Map<string, { mark: number; upl: number; pos: string; lever: string }>();
+    try {
+      const poss = await getPositions(cfg.deps().client).catch(() => [] as Awaited<ReturnType<typeof getPositions>>);
+      for (const p of poss) {
+        if (p.pos === "0") continue;
+        map.set(`${p.instId}:${p.posSide}`, { mark: Number(p.markPx), upl: Number(p.upl), pos: p.pos, lever: p.lever });
+      }
+    } catch { /* offline → no live data */ }
+    return map;
+  }
+  const rMultiple = (entry: number, stop: number, mark: number, side: string): number => {
+    const risk = Math.abs(entry - stop);
+    if (!(risk > 0)) return 0;
+    return Math.round((((mark - entry) * (side === "LONG" ? 1 : -1)) / risk) * 100) / 100;
+  };
+
   async function api(req: IncomingMessage, method: string, url: URL, res: ServerResponse): Promise<void> {
     const p = url.pathname;
     const send = (code: number, body: unknown): void => {
@@ -57,7 +76,8 @@ export function startDashboard(cfg: DashboardConfig): { close(): void } {
       const usdt = bal?.details.find((d) => d.ccy === "USDT");
       const eq = usdt ? Number(usdt.eq) || Number(usdt.availEq) || 0 : 0; // eq incl. locked margin
       const base = baseline(store, eq);
-      const open = store.db.prepare("SELECT * FROM trades WHERE status='OPEN'").all();
+      const open = store.db.prepare("SELECT * FROM trades WHERE status='OPEN'").all() as Array<Record<string, unknown>>;
+      const live = await livePnl();
       const closed = store.db.prepare("SELECT COUNT(*) c, COALESCE(SUM(pnl),0) p, COALESCE(AVG(result_r),0) e FROM trades WHERE status='CLOSED'").get() as { c: number; p: number; e: number };
       return send(200, {
         environment: "DEMO",                       // §96 always visible
@@ -71,7 +91,45 @@ export function startDashboard(cfg: DashboardConfig): { close(): void } {
         daily: { dayStart: base.dayStartEquity, lossPct: base.dayStartEquity ? Math.max(0, (base.dayStartEquity - eq) / base.dayStartEquity * 100) : 0 },
         drawdownPct: base.peakEquity ? Math.max(0, (base.peakEquity - eq) / base.peakEquity * 100) : 0,
         totals: { closed: closed.c, pnl: closed.p, expectancyR: closed.e },
-        openPosition: open[0] ?? null,             // §65
+        openPositions: ((): Array<Record<string, unknown>> => {
+          // §65 — every open trade with live mark, PnL (USDT + %), R, duration
+          const out: Array<Record<string, unknown>> = [];
+          for (const t of open) {
+            const key = `${String(t.instrument)}:${String(t.side).toLowerCase()}`;
+            const lp = live.get(key);
+            const entry = Number(t.entry_px);
+            const mark = lp?.mark ?? entry;
+            const side = String(t.side);
+            const upl = lp?.upl ?? 0;
+            const pnlPct = entry > 0 && lp ? Math.round(((mark - entry) * (side === "LONG" ? 1 : -1) / entry) * 10000) / 100 : 0;
+            out.push({
+              trade_id: t.trade_id, instrument: t.instrument, side, status: t.status,
+              strategy: `${String(t.strategy)}_V${t.strategy_version}`,
+              contracts: t.contracts, entry_px: entry, stop_px: t.stop_px, take_profit_px: t.take_profit_px,
+              mark_px: mark, upl, pnl_pct: pnlPct, r: rMultiple(entry, Number(t.stop_px), mark, side),
+              duration_s: Math.max(0, Math.round((Date.now() - Date.parse(String(t.entry_ts ?? ""))) / 1000)),
+              live: lp ? true : false,
+            });
+          }
+          return out;
+        })(),
+        openPosition: ((): Record<string, unknown> | null => {
+          if (open.length === 0) return null;
+          const t = open[0] as Record<string, unknown>;
+          const key = `${String(t.instrument)}:${String(t.side).toLowerCase()}`;
+          const liveP = live.get(key);
+          const entry = Number(t.entry_px);
+          const mark = liveP?.mark ?? entry;
+          const side = String(t.side);
+          return {
+            ...t,
+            mark_px: mark,
+            upl: liveP?.upl ?? 0,
+            pnl_pct: entry > 0 && liveP ? Math.round(((mark - entry) * (side === "LONG" ? 1 : -1) / entry) * 10000) / 100 : 0,
+            r: rMultiple(entry, Number(t.stop_px), mark, side),
+            duration_s: Math.max(0, Math.round((Date.now() - Date.parse(String(t.entry_ts))) / 1000)),
+          };
+        })(),             // §65
         latestDecision: store.db.prepare("SELECT * FROM decisions ORDER BY ts DESC LIMIT 1").get() ?? null, // §66
         regime: cfg.getLastTick()?.regime ?? "UNKNOWN",
         market: cfg.getLastTick()?.features ?? null,
@@ -80,8 +138,22 @@ export function startDashboard(cfg: DashboardConfig): { close(): void } {
       });
     }
     if (p === "/api/trades") {
-      const rows = store.db.prepare("SELECT trade_id,instrument,side,strategy,strategy_version,regime,entry_px,exit_px,result_r,pnl,duration_s,exit_reason,exit_ts,status,calibrated_confidence FROM trades ORDER BY COALESCE(exit_ts,entry_ts) DESC LIMIT 100").all();
-      return send(200, rows);
+      const rows = store.db.prepare("SELECT trade_id,instrument,side,strategy,strategy_version,regime,entry_px,stop_px,take_profit_px,exit_px,result_r,pnl,duration_s,exit_reason,exit_ts,status,calibrated_confidence,contracts,entry_ts FROM trades ORDER BY COALESCE(exit_ts,entry_ts) DESC LIMIT 100").all() as Array<Record<string, unknown>>;
+      const live = await livePnl();
+      return send(200, rows.map((x) => {
+        if (x.status !== "OPEN") return x;
+        const key = `${String(x.instrument)}:${String(x.side).toLowerCase()}`;
+        const lp = live.get(key);
+        const entry = Number(x.entry_px);
+        const mark = lp?.mark ?? entry;
+        return {
+          ...x,
+          mark_px: lp?.mark ?? null, upl: lp?.upl ?? null,
+          live_r: lp ? rMultiple(entry, Number(x.stop_px), mark, String(x.side)) : null,
+          live_pct: lp && entry > 0 ? Math.round(((mark - entry) * (String(x.side) === "LONG" ? 1 : -1) / entry) * 10000) / 100 : null,
+          live_dur_s: lp ? Math.max(0, Math.round((Date.now() - Date.parse(String(x.entry_ts ?? ""))) / 1000)) : null,
+        };
+      }));
     }
     if (p === "/api/reviews") {
       const rows = store.db.prepare("SELECT trade_id,outcome,result_r,observations,lesson_candidates,ts FROM trade_reviews ORDER BY ts DESC LIMIT 20").all();
@@ -353,8 +425,10 @@ async function refresh(){
   $('inst').textContent=s.instrument+' · '+s.timeframe+' · '+s.leverage?.default+'x · '+s.environment;
   $('botState').textContent='BOT: '+s.botState;$('botState').className='badge state '+s.botState;
   const kill=s.killReason||s.emergencyHalted;
+  const uplTot=(s.openPositions||[]).reduce((a,p)=>a+(Number(p.upl)||0),0);
   $('kpis').innerHTML=[
    ['USDT Equity',money(s.equity),''],
+   ['Unrealized PnL',money(uplTot)+(s.openPositions?.length?' ('+s.openPositions.length+')':''),uplTot>0?'pos':uplTot<0?'neg':''],
    ['Daily Loss',s.daily.lossPct.toFixed(2)+'%',s.daily.lossPct>2?'neg':''],
    ['Drawdown',s.drawdownPct.toFixed(2)+'%',s.drawdownPct>7?'neg':''],
    ['Expectancy / Trades',(s.totals.expectancyR||0).toFixed(2)+'R / '+s.totals.closed,s.totals.expectancyR>0?'pos':'neg'],
@@ -368,10 +442,12 @@ async function refresh(){
     +'<div class="row"><span>Risk Engine</span><b class="'+(JSON.parse(d.risk_verdict||'{}').approved?'pos':'neg')+'">'+esc(JSON.parse(d.risk_verdict||'{}').reason||'—')+'</b></div>'
     +'<div class="s dim" style="margin-top:6px">'+esc(d.thesis||'').slice(1,360)+'</div>'):'<div class="empty">No decisions yet — waiting for first confirmed candle…</div>';
   const p=s.openPosition;
-  $('posrisk').innerHTML=(p?('<div class="row"><span>'+(p.side==='LONG'?'LONG ▲':'SHORT ▼')+'</span><b>'+esc(p.contracts)+' ct</b></div>'
-    +'<div class="row"><span>Entry / Mark</span><b>'+Number(p.entry_px).toFixed(1)+'</b></div>'
+  $('posrisk').innerHTML=((s.openPositions&&s.openPositions.length)?s.openPositions.map(p=>('<div class="row"><span>'+esc(p.instrument)+' '+(p.side==='LONG'?'LONG ▲':'SHORT ▼')+'</span><b>'+esc(String(p.contracts))+' ct</b></div>'
+    +'<div class="row"><span>Entry / Mark</span><b>'+Number(p.entry_px).toFixed(1)+' / '+(p.mark_px!=null?Number(p.mark_px).toFixed(1):'—')+'</b></div>'
+    +'<div class="row"><span>PnL unrealized</span><b class="'+(Number(p.upl)>0?'pos':Number(p.upl)<0?'neg':'')+'">'+money(p.upl)+' USDT · '+(Number(p.pnl_pct)>0?'+':'')+Number(p.pnl_pct).toFixed(2)+'%</b></div>'
+    +'<div class="row"><span>Progress / R</span><b class="'+(Number(p.r)>0?'pos':Number(p.r)<0?'neg':'')+'">'+(Number(p.r)>0?'+':'')+Number(p.r).toFixed(2)+'R · '+Math.round((p.duration_s||0)/60)+' min</b></div>'
     +'<div class="row"><span>Stop / TP</span><b>'+Number(p.stop_px).toFixed(1)+' / '+Number(p.take_profit_px).toFixed(1)+'</b></div>'
-    +'<div class="row"><span>Strategy</span><b>'+esc(p.strategy)+'_V'+p.strategy_version+'</b></div>'):'<div class="empty">NO OPEN POSITION</div>')
+    +'<div class="row"><span>Strategy</span><b>'+esc(String(p.strategy))+'</b></div>'+(p.live?'':'<div class="s" style="color:var(--amber)">live price unavailable — showing entry</div>'))).join('')+(s.openPositions.length>1?'<hr style="border-color:var(--line)">':''):'<div class="empty">NO OPEN POSITION</div>')
     +'<hr style="border-color:var(--line)"><div class="row"><span>Risk/Trade</span><b>'+esc(s.limits.risk_per_trade_pct)+'%</b></div>'
     +'<div class="row"><span>Daily max</span><b>'+esc(s.limits.max_daily_loss_pct)+'%</b></div>'
     +'<div class="row"><span>Max DD / Leverage</span><b>'+esc(s.limits.max_drawdown_pct)+'% / '+esc(s.limits.max_leverage)+'x</b></div>'
@@ -388,7 +464,13 @@ async function refresh(){
   }
   if(tab==='trades'){
    const tr=await j('/api/trades');
-   $('tradesT').innerHTML='<table><tr><th>id</th><th>side</th><th>strategy</th><th>regime</th><th>entry</th><th>exit</th><th>R</th><th>PnL</th><th>reason</th><th>status</th></tr>'+tr.map(r=>'<tr><td>'+esc(r.trade_id.slice(-8))+'</td><td class="'+(r.side==='LONG'?'pos':'neg')+'">'+esc(r.side)+'</td><td>'+esc(r.strategy)+'_V'+r.strategy_version+'</td><td>'+esc(r.regime)+'</td><td>'+esc(r.entry_px)+'</td><td>'+esc(r.exit_px??'—')+'</td><td class="'+cls(r.result_r)+'">'+(r.result_r??0).toFixed(2)+'</td><td class="'+cls(r.pnl)+'">'+money(r.pnl)+'</td><td>'+esc(r.exit_reason??'')+'</td><td>'+esc(r.status)+'</td></tr>').join('')+'</table>';
+   $('tradesT').innerHTML='<table><tr><th>id</th><th>side</th><th>strategy</th><th>regime</th><th>entry</th><th>exit</th><th>R</th><th>PnL</th><th>reason</th><th>status</th></tr>'+tr.map(r=>{
+     const isOpen=r.status==='OPEN';
+     const rCell=isOpen?(r.live_r!=null?'<span class="'+cls(r.live_r)+'">'+(Number(r.live_r)>0?'+':'')+Number(r.live_r).toFixed(2)+'R live</span>':'<span class="dim">open</span>'):'<span class="'+cls(r.result_r)+'">'+(r.result_r??0).toFixed(2)+'</span>';
+     const pCell=isOpen?(r.upl!=null?'<span class="'+cls(r.upl)+'">'+money(r.upl)+' ('+(Number(r.live_pct)>0?'+':'')+Number(r.live_pct).toFixed(2)+'%)</span>':'<span class="dim">—</span>'):'<span class="'+cls(r.pnl)+'">'+money(r.pnl)+'</span>';
+     const eCell=isOpen?(r.mark_px!=null?'mark '+Number(r.mark_px).toFixed(4):'—'):esc(r.exit_px??'—');
+     return '<tr><td>'+esc(r.trade_id.slice(-8))+'</td><td class="'+(r.side==='LONG'?'pos':'neg')+'">'+esc(r.side)+'</td><td>'+esc(r.strategy)+'_V'+r.strategy_version+'</td><td>'+esc(r.regime)+'</td><td>'+esc(r.entry_px)+'</td><td>'+eCell+'</td><td>'+rCell+'</td><td>'+pCell+'</td><td>'+esc(r.exit_reason??(isOpen?(r.live_dur_s!=null?Math.round(r.live_dur_s/60)+' min':''):''))+'</td><td>'+(isOpen?'<span class="state RUNNING">OPEN</span>':esc(r.status))+'</td></tr>';
+   }).join('')+'</table>';
    const rv=await j('/api/reviews');
    $('reviews').innerHTML=rv.length?rv.map(r=>'<div style="margin-bottom:10px"><span class="tag">'+esc(r.trade_id.slice(-8))+'</span> <b class="'+cls(r.result_r)+'">'+esc(r.outcome)+' '+(r.result_r||0).toFixed(2)+'R</b><div class="s dim">'+r.observations.map(o=>'• '+esc(o.factor)+' ('+esc(o.effect)+'): '+esc(o.evidence)).join('<br>')+'</div>'+(r.lesson_candidates||[]).map(l=>'<div class="s" style="color:var(--amber)">→ lesson: '+esc(l.statement)+' ('+l.confidence+')</div>').join('')+'</div>').join(''):'<div class="empty">No reviews yet (needs closed trades + reviewer LLM).</div>';
   }
