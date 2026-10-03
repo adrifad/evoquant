@@ -8,7 +8,9 @@
 // questions are all answerable here; a Next.js port is a later milestone.
 
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
-import { timingSafeEqual } from "node:crypto";
+import { timingSafeEqual, createHash } from "node:crypto";
+import type { Duplex } from "node:stream";
+import type { AddressInfo } from "node:net";
 import type { Store } from "../memory/db.ts";
 import { getBotState, setBotState, isEmergencyHalted, setEmergencyHalted, baseline } from "../core/state.ts";
 import { getWeights } from "../learning/signal-weights.ts";
@@ -18,11 +20,13 @@ import { emergencyStop, type ExecutorDeps } from "../execution/executor.ts";
 import { setEnvKeys, maskKey } from "./settings.ts";
 import { loadRepoEnv } from "./env.ts";
 import path from "node:path";
+import { existsSync, readFileSync } from "node:fs";
 import { getBalance, getPositions } from "../exchange/okx/account.ts";
 import { createLogger } from "./logger.ts";
 
 const log = createLogger("dashboard");
 const REPO_ROOT = path.resolve(import.meta.dirname, "../..");
+const CONSOLE_DIST = path.join(REPO_ROOT, "apps", "console", "dist");
 function loadRepoEnvSafe(): Record<string, string> {
   try { return loadRepoEnv(REPO_ROOT) as Record<string, string>; } catch { return {}; }
 }
@@ -43,7 +47,12 @@ export interface DashboardConfig {
   };
 }
 
-export function startDashboard(cfg: DashboardConfig): { close(): void } {
+export interface DashboardServer {
+  close(): void;
+  address(): AddressInfo | null;
+}
+
+export function startDashboard(cfg: DashboardConfig): DashboardServer {
   const store = cfg.deps().store;
 
   // §65/§69 — live unrealized PnL per open trade, sourced from the
@@ -155,6 +164,23 @@ export function startDashboard(cfg: DashboardConfig): { close(): void } {
         };
       }));
     }
+    if (method === "GET" && p.startsWith("/api/trades/")) {
+      const tradeId = decodeURIComponent(p.slice("/api/trades/".length));
+      const trade = store.db.prepare("SELECT * FROM trades WHERE trade_id=?").get(tradeId) as Record<string, unknown> | undefined;
+      if (!trade) return send(404, { error: "trade not found" });
+      const decision = trade.decision_id
+        ? store.db.prepare("SELECT * FROM decisions WHERE decision_id=?").get(trade.decision_id)
+        : null;
+      const orders = store.db.prepare("SELECT * FROM orders WHERE trade_id=? ORDER BY COALESCE(cTime,uTime)").all(tradeId);
+      const fills = store.db.prepare(`SELECT f.* FROM fills f JOIN orders o ON o.ordId=f.ordId
+        WHERE o.trade_id=? ORDER BY CAST(f.ts AS INTEGER)`).all(tradeId);
+      const review = store.db.prepare("SELECT * FROM trade_reviews WHERE trade_id=?").get(tradeId) ?? null;
+      const start = Date.parse(String(trade.entry_ts ?? ""));
+      const end = Date.parse(String(trade.exit_ts ?? "")) || Date.now();
+      const candles = Number.isFinite(start) ? store.db.prepare(`SELECT ts,o,h,l,c,vol FROM candles
+        WHERE instId=? AND ts BETWEEN ? AND ? ORDER BY ts`).all(trade.instrument, start - 12 * 15 * 60_000, end) : [];
+      return send(200, { trade, decision, orders, fills, review, candles });
+    }
     if (p === "/api/reviews") {
       const rows = store.db.prepare("SELECT trade_id,outcome,result_r,observations,lesson_candidates,ts FROM trade_reviews ORDER BY ts DESC LIMIT 20").all();
       return send(200, rows.map((r) => {
@@ -184,6 +210,16 @@ export function startDashboard(cfg: DashboardConfig): { close(): void } {
     }
     if (p === "/api/scan") {
       return send(200, cfg.getScan()); // multi-coin scanner rows (§67)
+    }
+    if (p === "/api/market") {
+      const tick = cfg.getLastTick();
+      return send(200, { snapshot: tick?.features ?? null, regime: tick?.regime ?? "UNKNOWN", updatedAt: tick?.at ?? null, weights: getWeights(store), scan: cfg.getScan() });
+    }
+    if (p === "/api/evolution") {
+      const strategies = store.db.prepare("SELECT name,version,parent_version,params,status,hypothesis,created_ts FROM strategy_versions ORDER BY name,version").all();
+      const events = store.db.prepare("SELECT ts,kind,payload FROM system_events WHERE kind IN ('PROMOTION','PROMOTION_REJECTED','WEIGHTS') ORDER BY id DESC LIMIT 80").all();
+      const comparisons = store.db.prepare("SELECT ts,champion,challenger,promoted,reasons,champion_metrics,challenger_metrics FROM evolution_comparisons ORDER BY id DESC LIMIT 40").all();
+      return send(200, { strategies, events, comparisons });
     }
     if (p === "/api/decisions") {
       const rows = store.db.prepare("SELECT * FROM decisions ORDER BY ts DESC LIMIT 60").all();
@@ -281,6 +317,12 @@ export function startDashboard(cfg: DashboardConfig): { close(): void } {
     try {
       const url = new URL(req.url ?? "/", "http://localhost");
       if (url.pathname.startsWith("/api/")) return void (await api(req, req.method ?? "GET", url, res));
+      const asset = dashboardAsset(url.pathname);
+      if (asset) {
+        res.writeHead(200, { "content-type": asset.type, "cache-control": asset.cache, "x-content-type-options": "nosniff" });
+        res.end(readFileSync(asset.file));
+        return;
+      }
       res.writeHead(200, { "content-type": "text/html; charset=utf-8", "x-content-type-options": "nosniff" });
       res.end(PAGE);
     } catch (e) {
@@ -288,9 +330,44 @@ export function startDashboard(cfg: DashboardConfig): { close(): void } {
       res.writeHead(500).end("error");
     }
   });
+  const wsClients = new Set<Duplex>();
+  const refreshFrame = Buffer.from("{\"type\":\"refresh\"}");
+  const sendRefresh = (socket: Duplex): void => {
+    if (socket.destroyed) return;
+    socket.write(Buffer.concat([Buffer.from([0x81, refreshFrame.length]), refreshFrame]));
+  };
+  server.on("upgrade", (req, socket) => {
+    if (!authorized(req) || req.url?.split("?")[0] !== "/ws" || !req.headers["sec-websocket-key"]) {
+      socket.write("HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n");
+      socket.destroy();
+      return;
+    }
+    const accept = createHash("sha1").update(`${req.headers["sec-websocket-key"]}258EAFA5-E914-47DA-95CA-C5AB0DC85B11`).digest("base64");
+    socket.write(`HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ${accept}\r\n\r\n`);
+    wsClients.add(socket);
+    socket.on("close", () => wsClients.delete(socket));
+    socket.on("error", () => wsClients.delete(socket));
+    sendRefresh(socket);
+  });
+  const refreshTimer = setInterval(() => { for (const socket of wsClients) sendRefresh(socket); }, 3_000);
   const bind = cfg.bind ?? "127.0.0.1";
   server.listen(cfg.port, bind, () => log.info({ event: "dashboard_listen", port: cfg.port, bind }));
-  return { close: () => server.close() };
+  return {
+    close: () => { clearInterval(refreshTimer); for (const socket of wsClients) socket.destroy(); server.close(); },
+    address: () => server.address() as AddressInfo | null,
+  };
+}
+
+function dashboardAsset(pathname: string): { file: string; type: string; cache: string } | null {
+  if (!existsSync(CONSOLE_DIST)) return null;
+  const requested = pathname === "/" ? "index.html" : pathname.replace(/^\/+/, "");
+  const candidate = path.resolve(CONSOLE_DIST, requested);
+  const base = `${CONSOLE_DIST}${path.sep}`;
+  const file = existsSync(candidate) && candidate.startsWith(base) ? candidate : path.join(CONSOLE_DIST, "index.html");
+  if (!existsSync(file)) return null;
+  const extension = path.extname(file);
+  const type = extension === ".js" ? "text/javascript; charset=utf-8" : extension === ".css" ? "text/css; charset=utf-8" : "text/html; charset=utf-8";
+  return { file, type, cache: extension && extension !== ".html" ? "public, max-age=31536000, immutable" : "no-cache" };
 }
 
 // --------------------------------------------------------------------------

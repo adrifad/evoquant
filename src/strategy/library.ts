@@ -3,6 +3,7 @@
 import type { FeatureSnapshot } from "../market/features.ts";
 import type { Regime } from "../market/regime.ts";
 import type { Store } from "../memory/db.ts";
+import type { SignalWeights } from "../learning/signal-weights.ts";
 
 export interface StrategyParams {
   adx_min: number;
@@ -41,7 +42,7 @@ export const BASE_STRATEGIES: StrategyDef[] = [
 ];
 
 // deterministic signal score in [-1, +1]: positive → LONG bias (§50 baseline)
-export function scoreStrategy(s: StrategyDef, f: FeatureSnapshot): number {
+export function scoreStrategy(s: StrategyDef, f: FeatureSnapshot, weights?: SignalWeights): number {
   if (!f.sufficientData) return 0;
   const longSide = f.emaSpreadPct > 0;
   const bias = longSide ? 1 : -1;
@@ -52,12 +53,13 @@ export function scoreStrategy(s: StrategyDef, f: FeatureSnapshot): number {
     return 0;
   }
   let score = 0;
-  if (f.adx14 >= s.params.adx_min) score += 0.5;
-  if (f.volumeRatio >= s.params.volume_ratio_min) score += 0.3;
+  const w = weights ?? { trend: 1, momentum: 1, volume: 1, volatility: 1 };
+  if (f.adx14 >= s.params.adx_min) score += 0.5 * w.trend;
+  if (f.volumeRatio >= s.params.volume_ratio_min) score += 0.3 * w.volume;
   const inBand = longSide ? f.rsi14 >= s.params.rsi_min && f.rsi14 <= s.params.rsi_max
     : f.rsi14 <= 100 - s.params.rsi_min && f.rsi14 >= 100 - s.params.rsi_max;
-  if (inBand) score += 0.2;
-  return score * bias;
+  if (inBand) score += 0.2 * w.momentum;
+  return Math.max(-1, Math.min(1, score * bias));
 }
 
 export function loadStrategies(store: Store): StrategyDef[] {

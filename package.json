@@ -8,8 +8,10 @@
   "scripts": {
     "typecheck": "tsc --noEmit",
     "test": "node --test --experimental-strip-types tests/*.test.ts",
+    "console:build": "npm --prefix apps/console run build",
     "smoke:public": "node --experimental-strip-types src/scripts/smoke-public.ts",
     "smoke:demo": "node --experimental-strip-types src/scripts/smoke-demo.ts",
+    "prebot": "npm run console:build",
     "bot": "node --experimental-strip-types src/core/main.ts"
   },
   "dependencies": {

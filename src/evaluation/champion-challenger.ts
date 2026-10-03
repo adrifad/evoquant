@@ -49,8 +49,19 @@ export function compareAndMaybePromote(
     const liveC = summarize(champR);
     const liveX = summarize(chalR);
     const reasons: string[] = [];
+    // Insufficient evidence is not a rejection. Keep the challenger visible
+    // and inert until it can be evaluated without manufacturing certainty.
+    if (btX.trades.length < criteria.minSampleEachSide) {
+      reasons.push(`awaiting historical sample: ${btX.trades.length}/${criteria.minSampleEachSide}`);
+      results.push({
+        champion: `${champ.name}_V${champ.version}`, challenger: `${chal.name}_V${chal.version}`,
+        champ: { ...btC.summary, wfMean: wfC?.mean }, chal: { ...btX.summary, wfMean: wfX?.mean },
+        promoted: false, reasons,
+      });
+      persistComparison(store, results[results.length - 1]!);
+      continue;
+    }
     const promoted = (() => {
-      if (btX.trades.length < criteria.minSampleEachSide) { reasons.push(`challenger OOS trades ${btX.trades.length} < ${criteria.minSampleEachSide}`); return false; }
       if (btX.summary.expectancy_r <= btC.summary.expectancy_r) reasons.push(`OOS expectancy ${btX.summary.expectancy_r} <= champion ${btC.summary.expectancy_r}`);
       if (wfX && wfC && (wfX.mean <= wfC.mean || wfX.positiveFolds < criteria.wfMinPositiveFolds)) reasons.push(`walk-forward challenger mean ${wfX?.mean} positiveFolds ${wfX?.positiveFolds}`);
       if (reasons.length > 0) return false;
@@ -74,9 +85,18 @@ export function compareAndMaybePromote(
       champ: { ...btC.summary, wfMean: wfC?.mean }, chal: { ...btX.summary, wfMean: wfX?.mean },
       promoted, reasons,
     });
+    persistComparison(store, results[results.length - 1]!);
   }
   void saveStrategy;
   return results;
+}
+
+function persistComparison(store: Store, comparison: Comparison): void {
+  store.db.prepare(`INSERT INTO evolution_comparisons(ts,champion,challenger,promoted,reasons,champion_metrics,challenger_metrics)
+    VALUES(?,?,?,?,?,?,?)`).run(
+    new Date().toISOString(), comparison.champion, comparison.challenger, comparison.promoted ? 1 : 0,
+    JSON.stringify(comparison.reasons), JSON.stringify(comparison.champ), JSON.stringify(comparison.chal),
+  );
 }
 
 function tradeRs(store: Store, s: StrategyDef): number[] {

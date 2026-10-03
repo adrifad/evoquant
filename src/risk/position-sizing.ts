@@ -53,13 +53,15 @@ export function sizePosition(
   const ctVal = Number(instrument.ctVal);
   if (!(ctVal > 0)) throw new SizingUnavailableError("instrument ctVal missing");
 
+  const hardRiskBudget = equity * (risk.hard_limits.risk_per_trade_pct / 100);
   let targetNotional: number;
   let riskBudgetUsdt: number;
   if (sizing.mode === "percent_of_equity") {
     targetNotional = equity * (sizing.position_pct / 100);
-    riskBudgetUsdt = targetNotional * stopDistancePct; // implicit loss-if-stopped (info)
+    targetNotional = Math.min(targetNotional, hardRiskBudget / stopDistancePct);
+    riskBudgetUsdt = Math.min(targetNotional * stopDistancePct, hardRiskBudget);
   } else {
-    riskBudgetUsdt = equity * (risk.hard_limits.risk_per_trade_pct / 100);
+    riskBudgetUsdt = hardRiskBudget;
     targetNotional = riskBudgetUsdt / stopDistancePct;
   }
   // margin clamp: notional / leverage must fit 90% of equity

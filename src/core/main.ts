@@ -2,7 +2,7 @@
 // DEMO ONLY: refuses to run unless OKX_ENV=demo (§44, enforced in config+client).
 import { loadRepoEnv, REPO_ROOT } from "./env.ts";
 import { assertDemo, loadRiskConfig, loadTradingConfig } from "./config.ts";
-import { openStore, logSystemEvent } from "../memory/db.ts";
+import { openStore, logSystemEvent, persistMarketSnapshot } from "../memory/db.ts";
 import { createDemoExchange } from "../exchange/okx/index.ts";
 import { getCandles, latestClosedCandle, getTicker } from "../exchange/okx/market.ts";
 import type { Candle, InstrumentInfo } from "../exchange/okx/types.ts";
@@ -19,7 +19,7 @@ import { getBotState, setBotState } from "./state.ts";
 import { decide, holdBecause, type Decision } from "../agents/decision-agent.ts";
 import { reviewTrade } from "../agents/reviewer-agent.ts";
 import { maybeEvolveStrategies } from "../agents/evolution-agent.ts";
-import { maybeEvolveWeights } from "../learning/signal-weights.ts";
+import { getWeights, maybeEvolveWeights } from "../learning/signal-weights.ts";
 import { recomputeCalibration } from "../learning/confidence.ts";
 import { compareAndMaybePromote } from "../evaluation/champion-challenger.ts";
 import { createLogger } from "./logger.ts";
@@ -64,8 +64,9 @@ async function main(): Promise<void> {
     persistCandles(store, sym, trading.timeframe, cs);
   }
 
+  setBotState(store, "STARTING");
   if (!(await startupSafetySequence(deps))) {
-    setBotState(store, "ERROR");
+    setBotState(store, "RISK_HALTED");
     log.error({ event: "startup_failed", result: "trading disabled" });
     return;
   }
@@ -149,9 +150,11 @@ async function main(): Promise<void> {
         }
       }
       const anchorSnap = snaps.find((s) => s.instrument === anchor) ?? snaps[0];
-      if (anchorSnap) lastTick = { features: anchorSnap.features, regime: anchorSnap.regime, at: new Date().toISOString() };
+      const snapshotTs = new Date().toISOString();
+      for (const snap of snaps) persistMarketSnapshot(store, snapshotTs, snap.instrument, snap.features);
+      if (anchorSnap) lastTick = { features: anchorSnap.features, regime: anchorSnap.regime, at: snapshotTs };
       // 2) deterministic pre-rank (§37 opportunity agent as scanner)
-      const rows = scanInstruments(snaps, strategies);
+      const rows = scanInstruments(snaps, strategies, getWeights(store));
       lastScan = rows;
 
       // 3) monitor every symbol holding an open position (SL/TP/AI-CLOSE)

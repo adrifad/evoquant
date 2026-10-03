@@ -20,9 +20,10 @@ CREATE TABLE IF NOT EXISTS decisions (
   risk_verdict TEXT      -- JSON {approved,reason,checks}
 );
 CREATE TABLE IF NOT EXISTS market_snapshots (
-  ts TEXT PRIMARY KEY,
+  ts TEXT NOT NULL,
   instrument TEXT NOT NULL,
-  features TEXT NOT NULL  -- JSON FeatureSnapshot
+  features TEXT NOT NULL, -- JSON FeatureSnapshot
+  PRIMARY KEY (ts, instrument)
 );
 CREATE TABLE IF NOT EXISTS trades (
   trade_id TEXT PRIMARY KEY,
@@ -46,6 +47,7 @@ CREATE TABLE IF NOT EXISTS trades (
   raw_confidence REAL, calibrated_confidence REAL,
   planned_risk_pct REAL, leverage REAL,
   entry_features TEXT,             -- JSON snapshot at entry (§26)
+  decision_id TEXT REFERENCES decisions(decision_id),
   algo_id TEXT,                    -- §16 Layer A conditional order id
   fees_paid REAL DEFAULT 0         -- §27 accumulated fill fees
 );
@@ -109,12 +111,23 @@ CREATE TABLE IF NOT EXISTS orders (
   trade_id TEXT, kind TEXT  -- OPEN|CLOSE|ALGO (§15 mapping to internal ids)
 );
 CREATE TABLE IF NOT EXISTS fills (
-  tradeId TEXT PRIMARY KEY, ordId TEXT, clOrdId TEXT, instId TEXT,
-  fillPx TEXT, fillSz TEXT, fee TEXT, feeCcy TEXT, side TEXT, posSide TEXT, ts TEXT
+  tradeId TEXT NOT NULL, ordId TEXT NOT NULL, clOrdId TEXT, instId TEXT,
+  fillPx TEXT, fillSz TEXT, fee TEXT, feeCcy TEXT, side TEXT, posSide TEXT, ts TEXT,
+  PRIMARY KEY (tradeId, ordId, ts)
 );
 CREATE TABLE IF NOT EXISTS evolution_runs (
   id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, trades_at_run INTEGER,
   proposals INTEGER, created_challengers INTEGER, note TEXT
+);
+CREATE TABLE IF NOT EXISTS evolution_comparisons (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts TEXT NOT NULL,
+  champion TEXT NOT NULL,
+  challenger TEXT NOT NULL,
+  promoted INTEGER NOT NULL,
+  reasons TEXT NOT NULL,
+  champion_metrics TEXT NOT NULL,
+  challenger_metrics TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS kv (
   key TEXT PRIMARY KEY,
@@ -139,10 +152,57 @@ export function openStore(root: string): Store {
   const cols = new Set((db.prepare("PRAGMA table_info(trades)").all() as Array<{ name: string }>).map((c) => c.name));
   if (!cols.has("algo_id")) db.exec("ALTER TABLE trades ADD COLUMN algo_id TEXT");
   if (!cols.has("fees_paid")) db.exec("ALTER TABLE trades ADD COLUMN fees_paid REAL DEFAULT 0");
+  if (!cols.has("decision_id")) db.exec("ALTER TABLE trades ADD COLUMN decision_id TEXT");
+  migrateFills(db);
+  migrateMarketSnapshots(db);
   return {
     db,
     close: () => db.close(),
   };
+}
+
+function migrateFills(db: Database.Database): void {
+  const cols = db.prepare("PRAGMA table_info(fills)").all() as Array<{ name: string; pk: number }>;
+  const isCompositeKey = cols.some((c) => c.name === "tradeId" && c.pk === 1)
+    && cols.some((c) => c.name === "ordId" && c.pk === 2)
+    && cols.some((c) => c.name === "ts" && c.pk === 3);
+  if (isCompositeKey) return;
+  const isLegacyKey = cols.some((c) => c.name === "tradeId" && c.pk === 1)
+    && !cols.some((c) => c.pk > 1);
+  if (!isLegacyKey) throw new Error("unsupported fills schema; manual migration required");
+  db.exec(`BEGIN;
+    ALTER TABLE fills RENAME TO fills_legacy;
+    CREATE TABLE fills (
+      tradeId TEXT NOT NULL, ordId TEXT NOT NULL, clOrdId TEXT, instId TEXT,
+      fillPx TEXT, fillSz TEXT, fee TEXT, feeCcy TEXT, side TEXT, posSide TEXT, ts TEXT,
+      PRIMARY KEY (tradeId, ordId, ts)
+    );
+    INSERT OR IGNORE INTO fills SELECT tradeId,ordId,clOrdId,instId,fillPx,fillSz,fee,feeCcy,side,posSide,ts FROM fills_legacy;
+    DROP TABLE fills_legacy;
+    COMMIT;`);
+}
+
+function migrateMarketSnapshots(db: Database.Database): void {
+  const cols = db.prepare("PRAGMA table_info(market_snapshots)").all() as Array<{ name: string; pk: number }>;
+  const isCompositeKey = cols.some((c) => c.name === "ts" && c.pk === 1)
+    && cols.some((c) => c.name === "instrument" && c.pk === 2);
+  if (isCompositeKey) return;
+  const isLegacyKey = cols.some((c) => c.name === "ts" && c.pk === 1) && !cols.some((c) => c.pk > 1);
+  if (!isLegacyKey) throw new Error("unsupported market_snapshots schema; manual migration required");
+  db.exec(`BEGIN;
+    ALTER TABLE market_snapshots RENAME TO market_snapshots_legacy;
+    CREATE TABLE market_snapshots (
+      ts TEXT NOT NULL, instrument TEXT NOT NULL, features TEXT NOT NULL,
+      PRIMARY KEY (ts, instrument)
+    );
+    INSERT OR IGNORE INTO market_snapshots SELECT ts,instrument,features FROM market_snapshots_legacy;
+    DROP TABLE market_snapshots_legacy;
+    COMMIT;`);
+}
+
+export function persistMarketSnapshot(store: Store, ts: string, instrument: string, features: unknown): void {
+  store.db.prepare(`INSERT INTO market_snapshots(ts,instrument,features) VALUES(?,?,?)
+    ON CONFLICT(ts,instrument) DO UPDATE SET features=excluded.features`).run(ts, instrument, JSON.stringify(features));
 }
 
 export function kvGet(store: Store, key: string): string | null {

@@ -31,6 +31,9 @@ export function validateProposal(
   current: StrategyParams,
   maxChanges: number,
 ): { ok: boolean; reason?: string } {
+  if (p.candidate.name !== p.parent.name || p.candidate.version <= p.parent.version) {
+    return { ok: false, reason: "candidate must be the next immutable version of its parent" };
+  }
   const keys = Object.keys(p.changes);
   if (keys.length === 0 || keys.length > maxChanges) return { ok: false, reason: `changes count ${keys.length} > ${maxChanges}` };
   for (const k of keys) {

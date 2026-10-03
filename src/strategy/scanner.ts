@@ -4,6 +4,7 @@
 import type { FeatureSnapshot } from "../market/features.ts";
 import { classifyRegime, type Regime } from "../market/regime.ts";
 import { scoreStrategy, type StrategyDef } from "./library.ts";
+import type { SignalWeights } from "../learning/signal-weights.ts";
 
 export interface ScanRow {
   instrument: string;
@@ -19,13 +20,14 @@ const round2 = (n: number): number => (Number.isFinite(n) ? Math.round(n * 100) 
 export function scanInstruments(
   snapshots: Array<{ instrument: string; features: FeatureSnapshot }>,
   strategies: StrategyDef[],
+  weights?: SignalWeights,
 ): ScanRow[] {
   const rows = snapshots.map(({ instrument, features: f }) => {
     const regime = classifyRegime(f);
     let best = { score: 0, strategy: null as string | null };
     for (const s of strategies) {
       if (s.status !== "CHAMPION" || !s.allowed_regimes.includes(regime)) continue;
-      const sc = scoreStrategy(s, f);
+      const sc = scoreStrategy(s, f, weights);
       if (Math.abs(sc) > Math.abs(best.score)) best = { score: sc, strategy: `${s.name}_V${s.version}` };
     }
     const tradable =

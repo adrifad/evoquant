@@ -34,7 +34,7 @@ const TradingSchema = z.object({
   leverage: z.object({
     default: z.number().int().min(1).lte(ABSOLUTE_MAX.leverage),
     hard_max: z.number().int().min(1).lte(ABSOLUTE_MAX.leverage),
-  }),
+  }).refine((v) => v.default <= v.hard_max, { message: "leverage.default must not exceed leverage.hard_max" }),
   decision: z.object({ minimum_confidence: z.number().min(0).max(1) }),
   sizing: z.object({
     mode: z.enum(["risk_based", "percent_of_equity"]).default("risk_based"),

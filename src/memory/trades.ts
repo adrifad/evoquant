@@ -40,6 +40,7 @@ export function openTrade(
     strategy: string; strategyVersion: number; regime: string; contracts: string;
     entryPx: number; entryTs: string; stopPx: number; takeProfitPx: number;
     clOpenId: string; ordOpenId: string;
+    decisionId?: string;
     rawConfidence: number; calibratedConfidence: number; plannedRiskPct: number; leverage: number;
     entryFeatures: FeatureSnapshot;
   },
@@ -48,13 +49,13 @@ export function openTrade(
     .prepare(
       `INSERT INTO trades(trade_id,status,instrument,timeframe,side,strategy,strategy_version,regime,contracts,
         entry_px,entry_ts,stop_px,take_profit_px,cl_open_id,ord_open_id,
-        raw_confidence,calibrated_confidence,planned_risk_pct,leverage,entry_features)
-       VALUES(?, 'OPEN', ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+        raw_confidence,calibrated_confidence,planned_risk_pct,leverage,entry_features,decision_id)
+       VALUES(?, 'OPEN', ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
     )
     .run(
       t.tradeId, t.instrument, t.timeframe, t.side, t.strategy, t.strategyVersion, t.regime, t.contracts,
       t.entryPx, t.entryTs, t.stopPx, t.takeProfitPx, t.clOpenId, t.ordOpenId,
-      t.rawConfidence, t.calibratedConfidence, t.plannedRiskPct, t.leverage, JSON.stringify(t.entryFeatures),
+      t.rawConfidence, t.calibratedConfidence, t.plannedRiskPct, t.leverage, JSON.stringify(t.entryFeatures), t.decisionId ?? null,
     );
 }
 

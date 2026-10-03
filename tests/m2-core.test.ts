@@ -12,8 +12,9 @@ import { classifyRegime, DEFAULT_REGIME_PARAMS } from "../src/market/regime.ts";
 import { evaluateEntry } from "../src/risk/engine.ts";
 import { sizePosition, stopPriceFor, takeProfitPriceFor } from "../src/risk/position-sizing.ts";
 import { evaluateKillSwitch } from "../src/risk/limits.ts";
-import { openStore, kvSet, kvGet } from "../src/memory/db.ts";
+import { openStore, kvSet, kvGet, persistMarketSnapshot } from "../src/memory/db.ts";
 import { recordDecision, openTrade, computeClosedMetrics, closeTrade } from "../src/memory/trades.ts";
+import { persistFills } from "../src/execution/executor.ts";
 import { upsertLesson, addLessonEvidence, recomputeLesson, getActiveLessons } from "../src/memory/lessons.ts";
 import { getWeights, maybeEvolveWeights } from "../src/learning/signal-weights.ts";
 import { calibrate, recomputeCalibration } from "../src/learning/confidence.ts";
@@ -209,6 +210,15 @@ test("percent_of_equity within bounds never exceeds margin budget", () => {
   assert.ok(res.marginUsdt <= res.notionalUsdt / 3 + 0.01);
 });
 
+test("percent_of_equity remains capped by the hard risk budget at a wide stop", () => {
+  const inst = { instId: "BTC-USDT-SWAP", tickSz: "0.01", lotSz: "0.01", minSz: "0.01", ctVal: "0.01", ctValCcy: "BTC" };
+  // The requested $500 notional would lose $50 at a 10% stop. The configured
+  // 0.5% hard limit allows at most $5, therefore this is capped at $50.
+  const res = sizePosition({ equity: 1000, entryPrice: 100_000, stopPrice: 90_000, leverage: 3, instrument: inst }, risk, { mode: "percent_of_equity", position_pct: 50 });
+  assert.equal(res.notionalUsdt, 50);
+  assert.ok(res.riskBudgetUsdt <= 5);
+});
+
 // ---- closed metrics (§27) --------------------------------------------------
 test("MFE/MAE/R from synthetic path", () => {
   const path = [
@@ -237,15 +247,36 @@ test("decision+trade roundtrip incl. HOLD (§41)", () => {
     tradeId: "TRD-1", instrument: "BTC-USDT-SWAP", timeframe: "15m", side: "LONG",
     strategy: "TREND_FOLLOWING", strategyVersion: 1, regime: "TRENDING_BULLISH",
     contracts: "0.01", entryPx: 100, entryTs: "2026-10-01T00:00:00Z", stopPx: 98, takeProfitPx: 106,
-    clOpenId: "C1", ordOpenId: "O1", rawConfidence: 0.8, calibratedConfidence: 0.75,
+    clOpenId: "C1", ordOpenId: "O1", decisionId: "DEC-1", rawConfidence: 0.8, calibratedConfidence: 0.75,
     plannedRiskPct: 0.5, leverage: 3, entryFeatures: feat({}),
   });
   closeTrade(st, "TRD-1", {
     exitPx: 106, exitTs: "2026-10-01T02:00:00Z", exitReason: "TP", fees: 0, funding: 0,
     pnl: 0.06, pnlPct: 6, resultR: 3, mfe: 8, mae: 1, durationS: 7200,
   });
+  assert.equal((st.db.prepare("SELECT decision_id FROM trades WHERE trade_id='TRD-1'").get() as { decision_id: string }).decision_id, "DEC-1");
   const row = st.db.prepare("SELECT * FROM trades WHERE trade_id='TRD-1'").get() as Record<string, unknown>;
   assert.equal(row.status, "CLOSED"); assert.equal(row.result_r, 3);
+  st.close();
+});
+
+test("fills preserve partial executions and store reopening is idempotent", () => {
+  const root = tmpRoot();
+  const st = openStore(root);
+  const fill = { tradeId: "OKX-FILL-1", ordId: "ORD-1", instId: "BTC-USDT-SWAP", fillPx: "100", fillSz: "0.01", side: "buy", posSide: "long" };
+  persistFills(st, [{ ...fill, ts: "1" }, { ...fill, fillSz: "0.02", ts: "2" }, { ...fill, ts: "1" }]);
+  assert.equal((st.db.prepare("SELECT COUNT(*) c FROM fills").get() as { c: number }).c, 2);
+  st.close();
+  const reopened = openStore(root);
+  assert.equal((reopened.db.prepare("SELECT COUNT(*) c FROM fills").get() as { c: number }).c, 2);
+  reopened.close();
+});
+
+test("market snapshots retain the same timestamp for multiple instruments", () => {
+  const st = openStore(tmpRoot());
+  persistMarketSnapshot(st, "2026-10-03T00:00:00.000Z", "BTC-USDT-SWAP", { price: 100 });
+  persistMarketSnapshot(st, "2026-10-03T00:00:00.000Z", "ETH-USDT-SWAP", { price: 10 });
+  assert.equal((st.db.prepare("SELECT COUNT(*) c FROM market_snapshots").get() as { c: number }).c, 2);
   st.close();
 });
 
@@ -288,7 +319,7 @@ test("calibration identity until sample, then shrinks (§33)", () => {
   const st = openStore(tmpRoot());
   assert.equal(calibrate(st, 0.9), 0.9);
   for (let i = 0; i < 40; i++) {
-    st.db.prepare(`INSERT INTO trades(trade_id,status,instrument,timeframe,side,strategy,strategy_version,regime,contracts,calibrated_confidence,result_r,exit_ts)
+    st.db.prepare(`INSERT INTO trades(trade_id,status,instrument,timeframe,side,strategy,strategy_version,regime,contracts,raw_confidence,result_r,exit_ts)
       VALUES('C' || ${i},'CLOSED','BTC-USDT-SWAP','15m','LONG','TREND_FOLLOWING',1,'SIDEWAYS','0.01',0.95,${i % 3 === 0 ? 1 : -0.5},'2026-10-01T00:00:00Z')`).run();
   }
   const table = recomputeCalibration(st);
@@ -339,5 +370,6 @@ test("promotion only when challenger strictly better; else REJECTED (§35)", () 
   assert.equal(res.promoted, false);
   const rows = st.db.prepare("SELECT status FROM strategy_versions WHERE version=99").get() as { status: string };
   assert.equal(rows.status, "REJECTED");
+  assert.equal((st.db.prepare("SELECT COUNT(*) c FROM evolution_comparisons").get() as { c: number }).c, 1);
   st.close();
 });

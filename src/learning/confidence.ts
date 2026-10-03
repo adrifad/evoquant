@@ -15,7 +15,7 @@ export function calibrate(store: Store, rawConfidence: number, minSample = 30): 
   const table = JSON.parse(raw) as CalibrationTable;
   if (table.sample < minSample) return rawConfidence; // not enough evidence → identity map
   for (const b of table.buckets) {
-    if (rawConfidence >= b.lo && rawConfidence < b.hi) {
+    if (rawConfidence >= b.lo && (rawConfidence < b.hi || (b.hi === 1 && rawConfidence === 1))) {
       return b.n > 0 ? (rawConfidence + b.winRate) / 2 : rawConfidence; // shrink toward empirical
     }
   }
@@ -24,7 +24,7 @@ export function calibrate(store: Store, rawConfidence: number, minSample = 30): 
 
 export function recomputeCalibration(store: Store): CalibrationTable | null {
   const rows = store.db.prepare(
-    "SELECT calibrated_confidence AS c, result_r AS r FROM trades WHERE status='CLOSED' AND result_r IS NOT NULL AND calibrated_confidence IS NOT NULL",
+    "SELECT raw_confidence AS c, result_r AS r FROM trades WHERE status='CLOSED' AND result_r IS NOT NULL AND raw_confidence IS NOT NULL",
   ).all() as Array<{ c: number; r: number }>;
   if (rows.length < 10) return null;
   const edges = [0, 0.5, 0.6, 0.7, 0.8, 0.9, 1.01];

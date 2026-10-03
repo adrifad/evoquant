@@ -1,4 +1,7 @@
 node_modules/
+apps/console/node_modules/
+apps/console/dist/
+apps/console/tsconfig.tsbuildinfo
 data/*.db
 data/snapshots/
 .env

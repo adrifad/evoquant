@@ -12,7 +12,7 @@ import type { OkxClient } from "../exchange/okx/client.ts";
 import type { InstrumentInfo, Position } from "../exchange/okx/types.ts";
 import { getCandles, getTicker, latestClosedCandle } from "../exchange/okx/market.ts";
 import { getBalance, getPositions, setLeverage } from "../exchange/okx/account.ts";
-import { closePosition, getOrder, getFills, placeOrder, prepareOrderSize, waitForOrderTerminal } from "../exchange/okx/orders.ts";
+import { closePosition, getOrder, getFills, getPendingOrders, placeOrder, prepareOrderSize, waitForOrderTerminal } from "../exchange/okx/orders.ts";
 import { placeConditionalProtection, cancelAlgo } from "../exchange/okx/algo.ts";
 import { getServerTime } from "../exchange/okx/market.ts";
 import type { RiskConfig, TradingConfig } from "../core/config.ts";
@@ -76,7 +76,14 @@ export async function startupSafetySequence(d: ExecutorDeps): Promise<boolean> {
     ["positions", async () => {
       const poss = await getPositions(client);
       const open = poss.filter((p) => p.pos !== "0");
-      await reconcileOpen(d, open);
+      if (await reconcileOpen(d, open)) throw new Error("STATE_UNCERTAIN: unexpected exchange position");
+    }],
+    ["pending-orders", async () => {
+      const pending = await getPendingOrders(client);
+      if (pending.length > 0) {
+        logSystemEvent(store, "STATE", { recovery: "STATE_UNCERTAIN", pendingOrders: pending.map((p) => p.ordId) });
+        throw new Error(`STATE_UNCERTAIN: ${pending.length} pending order(s) require reconciliation`);
+      }
     }],
     ["position-mode", async () => {
       // only set when different — OKX rejects with 59000 while positions exist
@@ -118,7 +125,7 @@ export async function startupSafetySequence(d: ExecutorDeps): Promise<boolean> {
 }
 
 // §45 — reconcile local open trades against exchange positions (all symbols).
-async function reconcileOpen(d: ExecutorDeps, exPositions: Position[]): Promise<void> {
+async function reconcileOpen(d: ExecutorDeps, exPositions: Position[]): Promise<boolean> {
   const local = getOpenTrades(d.store) as Array<Record<string, unknown>>;
   const exByKey = new Map(exPositions.map((p) => [`${p.instId}:${p.posSide}`, p]));
   for (const t of local) {
@@ -132,12 +139,15 @@ async function reconcileOpen(d: ExecutorDeps, exPositions: Position[]): Promise<
     exByKey.delete(key);
   }
   // exchange positions not known locally = unexpected (§23 unexpected_position)
+  let unexpected = false;
   for (const [key, p] of exByKey) {
     if (p.pos !== "0") {
+      unexpected = true;
       logSystemEvent(d.store, "STATE", { unexpected_position: key });
       log.warn({ event: "reconcile:unexpected_position", instId: p.instId, posSide: p.posSide });
     }
   }
+  return unexpected;
 }
 
 async function finalizeFromExchange(d: ExecutorDeps, t: Record<string, unknown>, ex?: Position): Promise<void> {
@@ -192,7 +202,7 @@ export function persistOrder(store: Store, o: { ordId: string; clOrdId?: string 
 
 export function persistFills(store: Store, fills: Array<{ tradeId: string; ordId: string; clOrdId?: string | undefined; instId: string; fillPx: string; fillSz: string; fee?: string | undefined; feeCcy?: string | undefined; side: string; posSide: string; ts: string }>): void {
   const ins = store.db.prepare(`INSERT INTO fills(tradeId,ordId,clOrdId,instId,fillPx,fillSz,fee,feeCcy,side,posSide,ts)
-    VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(tradeId) DO NOTHING`);
+    VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(tradeId,ordId,ts) DO NOTHING`);
   for (const f of fills) ins.run(f.tradeId, f.ordId, f.clOrdId ?? null, f.instId, f.fillPx, f.fillSz, f.fee ?? null, f.feeCcy ?? null, f.side, f.posSide, f.ts);
 }
 
@@ -295,8 +305,9 @@ export async function runTick(d: ExecutorDeps, ctx: TickContext, symbol: TickSym
     },
     trading, risk,
   );
+  const decisionId = nextDecisionId();
   recordDecision(store, {
-    decisionId: nextDecisionId(), ts: new Date().toISOString(), instrument: instId,
+    decisionId, ts: new Date().toISOString(), instrument: instId,
     decision: decision.decision, strategy: decision.strategy ?? undefined, regime: ctx.regime,
     rawConfidence: decision.confidence, calibratedConfidence: calConf,
     thesis: decision.thesis, riskVerdict: verdict,
@@ -350,6 +361,7 @@ export async function runTick(d: ExecutorDeps, ctx: TickContext, symbol: TickSym
       stopPx: stopPriceFor(entryPx, f.atr14, decision.suggested_stop_atr, side),
       takeProfitPx: takeProfitPriceFor(entryPx, f.atr14, decision.suggested_take_profit_atr, side),
       clOpenId: clOpen, ordOpenId: placed.ordId,
+      decisionId,
       rawConfidence: decision.confidence, calibratedConfidence: calConf,
       plannedRiskPct: trading.sizing.mode === "percent_of_equity" ? trading.sizing.position_pct : risk.hard_limits.risk_per_trade_pct,
       leverage: trading.leverage.default,
