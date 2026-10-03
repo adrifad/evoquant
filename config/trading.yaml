@@ -35,7 +35,8 @@ decision:
 #                       (modal $100, position_pct 1 → posisi $1 per trade)
 sizing:
   mode: percent_of_equity
-  position_pct: 10.0
+  position_pct: 13.0   # target ≈ $13 on $100 equity — after OKX lot-floor the actual
+                       # notional lands ≥$10 on most watchlist coins (user: "$10 per open")
 
 strategies_enabled:
   - TREND_FOLLOWING_V1
