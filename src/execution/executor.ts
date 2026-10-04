@@ -307,11 +307,15 @@ export async function runTick(d: ExecutorDeps, ctx: TickContext, symbol: TickSym
   );
   const decisionId = nextDecisionId();
   recordDecision(store, {
-    decisionId, ts: new Date().toISOString(), instrument: instId,
+    decisionId: nextDecisionId(), ts: new Date().toISOString(), instrument: instId,
     decision: decision.decision, strategy: decision.strategy ?? undefined, regime: ctx.regime,
     rawConfidence: decision.confidence, calibratedConfidence: calConf,
     thesis: decision.thesis, riskVerdict: verdict,
   });
+  // heartbeat event so the console Logs tab shows the pipeline is alive
+  // even during long HOLD streaks (system_events otherwise only trade/risk)
+  logSystemEvent(store, "DECISION", { inst: instId, d: decision.decision, conf: calConf,
+    rej: verdict.approved ? "ok" : verdict.reason });
   log.info({ event: "decision", instId, action: decision.decision, strategy: decision.strategy, raw: decision.confidence, calibrated: calConf, approved: verdict.approved, reason: verdict.reason });
 
   if (!verdict.approved || decision.decision === "HOLD") return { kill };

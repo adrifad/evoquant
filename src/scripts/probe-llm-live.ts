@@ -17,7 +17,7 @@ const r = await fetch([env.LLM_BASE_URL, "/chat/completions"].join(""), {
   signal: AbortSignal.timeout(90_000),
 });
 console.log("chat ->", r.status, `${Date.now() - t0}ms`);
-const j = await r.json().catch(() => null);
+const j = await r.json().catch(() => null) as { choices?: Array<{ message?: { content?: string }; finish_reason?: string }> } | null;
 const c = j?.choices?.[0]?.message?.content ?? "";
 console.log("len:", c.length, "| finish:", j?.choices?.[0]?.finish_reason);
 console.log(c.slice(0, 400));
