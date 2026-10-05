@@ -48,13 +48,13 @@ export function openTrade(
   store.db
     .prepare(
       `INSERT INTO trades(trade_id,status,instrument,timeframe,side,strategy,strategy_version,regime,contracts,
-        entry_px,entry_ts,stop_px,take_profit_px,cl_open_id,ord_open_id,
+        entry_px,entry_ts,stop_px,initial_stop_px,take_profit_px,cl_open_id,ord_open_id,
         raw_confidence,calibrated_confidence,planned_risk_pct,leverage,entry_features,decision_id)
-       VALUES(?, 'OPEN', ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+       VALUES(?, 'OPEN', ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
     )
     .run(
       t.tradeId, t.instrument, t.timeframe, t.side, t.strategy, t.strategyVersion, t.regime, t.contracts,
-      t.entryPx, t.entryTs, t.stopPx, t.takeProfitPx, t.clOpenId, t.ordOpenId,
+      t.entryPx, t.entryTs, t.stopPx, t.stopPx, t.takeProfitPx, t.clOpenId, t.ordOpenId,
       t.rawConfidence, t.calibratedConfidence, t.plannedRiskPct, t.leverage, JSON.stringify(t.entryFeatures), t.decisionId ?? null,
     );
 }
@@ -70,6 +70,7 @@ export interface ClosedMetrics {
 export function computeClosedMetrics(args: {
   side: "LONG" | "SHORT";
   entryPx: number; stopPx: number; exitPx: number;
+  initialStopPx?: number | undefined;
   contracts: number; ctVal: number;
   exitReason: string;
   entryTs: string; exitTs: string;
@@ -89,7 +90,7 @@ export function computeClosedMetrics(args: {
   const grossPnl = (exitPx - entryPx) * dir * contracts * ctVal;
   const pnl = grossPnl - args.fees + args.funding;
   const pnlPct = entryPx > 0 ? ((exitPx - entryPx) * dir / entryPx) * 100 : 0;
-  const riskPerUnit = Math.abs(entryPx - stopPx);
+  const riskPerUnit = Math.abs(entryPx - (args.initialStopPx ?? stopPx));
   const resultR = riskPerUnit > 0 ? ((exitPx - entryPx) * dir) / riskPerUnit : 0;
   const durationS = Math.max(0, Math.round((Date.parse(args.exitTs) - Date.parse(args.entryTs)) / 1000));
   return {

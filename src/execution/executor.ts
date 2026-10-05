@@ -12,7 +12,7 @@ import type { OkxClient } from "../exchange/okx/client.ts";
 import type { InstrumentInfo, Position } from "../exchange/okx/types.ts";
 import { getCandles, getTicker, latestClosedCandle } from "../exchange/okx/market.ts";
 import { getBalance, getPositions, setLeverage } from "../exchange/okx/account.ts";
-import { closePosition, getOrder, getFills, getPendingOrders, placeOrder, prepareOrderSize, waitForOrderTerminal } from "../exchange/okx/orders.ts";
+import { closePosition, getOrder, getFills, getPendingOrders, placeOrder, prepareOrderSize, requireFilledOrder, waitForOrderTerminal } from "../exchange/okx/orders.ts";
 import { placeConditionalProtection, cancelAlgo } from "../exchange/okx/algo.ts";
 import { getServerTime } from "../exchange/okx/market.ts";
 import type { RiskConfig, TradingConfig } from "../core/config.ts";
@@ -33,6 +33,7 @@ import { maybeEvolveWeights } from "../learning/signal-weights.ts";
 import { recomputeCalibration } from "../learning/confidence.ts";
 import type { Decision } from "../agents/decision-agent.ts";
 import type { StrategyDef } from "../strategy/library.ts";
+import { serializeTradeMutation } from "./trade-mutation.ts";
 
 const log = createLogger("executor");
 
@@ -151,6 +152,16 @@ async function reconcileOpen(d: ExecutorDeps, exPositions: Position[]): Promise<
 }
 
 async function finalizeFromExchange(d: ExecutorDeps, t: Record<string, unknown>, ex?: Position): Promise<void> {
+  const tradeId = String(t.trade_id ?? "");
+  if (!tradeId) return;
+  await serializeTradeMutation(tradeId, async () => {
+    const current = d.store.db.prepare("SELECT * FROM trades WHERE trade_id=? AND status='OPEN'").get(tradeId) as Record<string, unknown> | undefined;
+    if (!current) return;
+    await finalizeOpenTradeFromExchange(d, current, ex);
+  });
+}
+
+async function finalizeOpenTradeFromExchange(d: ExecutorDeps, t: Record<string, unknown>, ex?: Position): Promise<void> {
   // Exit print resolution (algo/external closes have NO local close order id):
   // symbol history fills ≥ entry → latest OPPOSITE-side fill is the exit.
   const closeId = String(t.ord_close_id ?? "");
@@ -174,7 +185,8 @@ async function finalizeFromExchange(d: ExecutorDeps, t: Record<string, unknown>,
   const ctVal = Number(meta?.ctVal ?? 0);
   const side = t.side === "LONG" ? "LONG" : "SHORT";
   const m = computeClosedMetrics({
-    side, entryPx: Number(t.entry_px), stopPx: Number(t.stop_px), exitPx,
+    side, entryPx: Number(t.entry_px), stopPx: Number(t.stop_px),
+    initialStopPx: Number(t.initial_stop_px ?? t.stop_px), exitPx,
     contracts, ctVal, exitReason: fills.length ? "FILL_CONFIRM" : "RECONCILE",
     entryTs: String(t.entry_ts), exitTs: new Date().toISOString(),
     candlesWhileOpen: await getCandles(d.client, String(t.instrument), d.trading.timeframe, 200).then((cs) => cs.filter((c) => c.confirm === "1" && c.ts > Date.parse(String(t.entry_ts)))),
@@ -425,6 +437,16 @@ export function clId(side: string, kind: "OPEN" | "CLOSE" | "ALGO", instId: stri
 }
 
 export async function closeTradeOnExchange(d: ExecutorDeps, t: Record<string, unknown>, pos: Position, reason: string): Promise<void> {
+  const tradeId = String(t.trade_id ?? "");
+  if (!tradeId) throw new Error("cannot close trade without trade_id");
+  await serializeTradeMutation(tradeId, async () => {
+    const current = d.store.db.prepare("SELECT * FROM trades WHERE trade_id=? AND status='OPEN'").get(tradeId) as Record<string, unknown> | undefined;
+    if (!current) return; // another close already finalized it
+    await closeOpenTradeOnExchange(d, current, pos, reason);
+  });
+}
+
+async function closeOpenTradeOnExchange(d: ExecutorDeps, t: Record<string, unknown>, pos: Position, reason: string): Promise<void> {
   const side = String(t.side) as "LONG" | "SHORT";
   const meta = d.instruments[String(t.instrument)] ?? Object.values(d.instruments)[0]!;
   const clClose = clId(side, "CLOSE", String(t.instrument));
@@ -434,6 +456,16 @@ export async function closeTradeOnExchange(d: ExecutorDeps, t: Record<string, un
     lotSz: meta.lotSz, minSz: meta.minSz,
   });
   const filled = await waitForOrderTerminal(d.client, String(t.instrument), placed.ordId, { timeoutMs: 30_000 });
+  persistOrder(d.store, { ordId: placed.ordId, clOrdId: clClose, instId: String(t.instrument),
+    side: side === "LONG" ? "sell" : "buy", posSide: side.toLowerCase(), ordType: "market",
+    sz: pos.pos, state: filled.state, avgPx: filled.avgPx, uTime: filled.uTime,
+    tradeId: String(t.trade_id), kind: "CLOSE" });
+  try {
+    requireFilledOrder(filled);
+  } catch (error) {
+    logSystemEvent(d.store, "RISK_EVENT", { close_order_not_filled: filled.state, tradeId: String(t.trade_id), ordId: placed.ordId });
+    throw error; // keep the trade OPEN and its exchange-side protection intact
+  }
   const exitPx = Number(filled.avgPx) || Number(pos.markPx);
   // §27 fees: sum |fee| across this trade's fills (entry + close orders)
   let feesPaid = 0;
@@ -445,15 +477,12 @@ export async function closeTradeOnExchange(d: ExecutorDeps, t: Record<string, un
       side: fx.side, posSide: fx.posSide, ts: fx.ts })));
     for (const fx of fs) feesPaid += Math.abs(Number(fx.fee) || 0);
   }
-  persistOrder(d.store, { ordId: placed.ordId, clOrdId: clClose, instId: String(t.instrument),
-    side: side === "LONG" ? "sell" : "buy", posSide: side.toLowerCase(), ordType: "market",
-    sz: pos.pos, state: filled.state, avgPx: filled.avgPx, uTime: filled.uTime,
-    tradeId: String(t.trade_id), kind: "CLOSE" });
   const contracts = Number(t.contracts);
   const ctVal = Number(meta.ctVal);
   const candles = await getCandles(d.client, String(t.instrument), d.trading.timeframe, 200);
   const m = computeClosedMetrics({
-    side, entryPx: Number(t.entry_px), stopPx: Number(t.stop_px), exitPx,
+    side, entryPx: Number(t.entry_px), stopPx: Number(t.stop_px),
+    initialStopPx: Number(t.initial_stop_px ?? t.stop_px), exitPx,
     contracts, ctVal, exitReason: reason,
     entryTs: String(t.entry_ts), exitTs: new Date().toISOString(),
     candlesWhileOpen: candles.filter((c) => c.confirm === "1" && c.ts > Date.parse(String(t.entry_ts))),

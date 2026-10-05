@@ -184,3 +184,10 @@ export async function waitForOrderTerminal(
   }
   throw new OrderTimeoutError(ordId, last?.state);
 }
+
+/** A terminal order is not necessarily an executed order; callers that mutate
+ * local position state must require an actual fill. */
+export function requireFilledOrder<T extends { state: string }>(order: T): T {
+  if (order.state !== "filled") throw new Error(`order not filled: ${order.state}`);
+  return order;
+}

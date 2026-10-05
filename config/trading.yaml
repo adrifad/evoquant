@@ -38,6 +38,13 @@ sizing:
   position_pct: 55.0   # notional ≈ $55 / lev 5 = MARGIN ≥ $10 per position even on coarse
                        # lot floors like BTC (50% truncated to $43 notional → $8.66 margin)
 
+position_management:
+  sl_plus:
+    enabled: true
+    activation_r: 1.0
+    lock_in_r: 0.05
+    min_profit_buffer_pct: 0.12
+
 scalp:
   enabled: true            # 5m hybrid scalp engine (LLM supervisor+gate, fail-closed)
   base_tf: 1m

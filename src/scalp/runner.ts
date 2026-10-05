@@ -12,6 +12,7 @@ import { getCandles } from "../exchange/okx/market.ts";
 import { getPositions } from "../exchange/okx/account.ts";
 import { placeOrder, waitForOrderTerminal, getFills } from "../exchange/okx/orders.ts";
 import { placeConditionalProtection } from "../exchange/okx/algo.ts";
+import { updateTradeStopPlus } from "../execution/position-management.ts";
 import type { RiskConfig, TradingConfig } from "../core/config.ts";
 import type { Store } from "../memory/db.ts";
 import { kvGet, kvSet, logSystemEvent } from "../memory/db.ts";
@@ -250,7 +251,13 @@ export class ScalpRunner {
       for (const t of scalps) {
         const pos = poss.find((p) => p.instId === String(t.instrument) && p.posSide === String(t.side).toLowerCase());
         if (!pos) continue;
-        let reason: "SL" | "TP" | "TIME_STOP" | null = priceTrigger(t, Number(pos.markPx));
+        const meta = this.d.instruments[String(t.instrument)];
+        if (!meta) continue;
+        const slPlus = await updateTradeStopPlus(this.d.client, this.d.store, t, pos, meta, this.d.trading.position_management.sl_plus);
+        const freshTrade = this.d.store.db.prepare("SELECT * FROM trades WHERE trade_id=? AND status='OPEN'").get(String(t.trade_id)) as Record<string, unknown> | undefined;
+        if (!freshTrade) continue;
+        const activeTrade = { ...freshTrade, stop_px: slPlus.stopPx };
+        let reason: "SL" | "TP" | "TIME_STOP" | null = priceTrigger(activeTrade, Number(pos.markPx));
         if (!reason && (pos as Position)) {
           const ageS = nowS - Math.floor(Date.parse(String(t.entry_ts)) / 1000);
           if (ageS > this.d.cfg.max_hold_s) reason = "TIME_STOP";
@@ -273,5 +280,3 @@ export class ScalpRunner {
       instruments: this.d.instruments, watchlist: Object.keys(this.d.instruments) };
   }
 }
-
-

@@ -36,7 +36,7 @@ CREATE TABLE IF NOT EXISTS trades (
   regime TEXT NOT NULL,
   contracts TEXT NOT NULL,
   entry_px REAL, entry_ts TEXT,
-  stop_px REAL, take_profit_px REAL,
+  stop_px REAL, initial_stop_px REAL, take_profit_px REAL,
   exit_px REAL, exit_ts TEXT,
   exit_reason TEXT,                -- TP | SL | AI_CLOSE | RISK_CLOSE | MANUAL
   cl_open_id TEXT, cl_close_id TEXT,
@@ -153,6 +153,8 @@ export function openStore(root: string): Store {
   if (!cols.has("algo_id")) db.exec("ALTER TABLE trades ADD COLUMN algo_id TEXT");
   if (!cols.has("fees_paid")) db.exec("ALTER TABLE trades ADD COLUMN fees_paid REAL DEFAULT 0");
   if (!cols.has("decision_id")) db.exec("ALTER TABLE trades ADD COLUMN decision_id TEXT");
+  if (!cols.has("initial_stop_px")) db.exec("ALTER TABLE trades ADD COLUMN initial_stop_px REAL");
+  db.exec("UPDATE trades SET initial_stop_px=stop_px WHERE initial_stop_px IS NULL AND stop_px IS NOT NULL");
   migrateFills(db);
   migrateMarketSnapshots(db);
   return {

@@ -9,6 +9,7 @@ import { OkxClient, OkxApiError, OkxConfigError, resolveBaseUrl, DEMO_BASE_URL, 
 import { getCandles } from "../src/exchange/okx/market.ts";
 import { placeOrder, getOrder, closePosition, waitForOrderTerminal, OrderRejectedError, OrderTimeoutError, prepareOrderSize } from "../src/exchange/okx/orders.ts";
 import { createDemoExchange } from "../src/exchange/okx/index.ts";
+import { amendConditionalStop, getAlgoOrder } from "../src/exchange/okx/algo.ts";
 import { redact } from "../src/core/logger.ts";
 import { assertDemo, loadRiskConfig, loadTradingConfig, ABSOLUTE_MAX } from "../src/core/config.ts";
 
@@ -201,6 +202,32 @@ test("getOrder maps raw detail incl. state", async () => {
   });
   const d = await getOrder(client, "BTC-USDT-SWAP", "O5");
   assert.equal(d.state, "canceled");
+});
+
+test("conditional SL amendment preserves the algo and confirms its live trigger", async () => {
+  const requests: Array<{ url: string; init: RequestInit | undefined }> = [];
+  const client = new OkxClient({
+    environment: "demo",
+    credentials: { apiKey: "k", secret: "s", passphrase: "p" },
+    fetchImpl: (async (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
+      const url = String(input);
+      requests.push({ url, init });
+      const body = url.includes("amend-algos")
+        ? { code: "0", msg: "", data: [{ sCode: "0", algoId: "A1" }] }
+        : { code: "0", msg: "", data: [{ algoId: "A1", state: "live", slTriggerPx: "100.2" }] };
+      return new Response(JSON.stringify(body), { status: 200 });
+    }) as unknown as typeof fetch,
+  });
+  await amendConditionalStop(client, { instId: "BTC-USDT-SWAP", algoId: "A1", stopPrice: 100.2 });
+  const amended = JSON.parse(String(requests[0]!.init?.body)) as Record<string, unknown>;
+  assert.equal(amended.algoId, "A1");
+  assert.equal(amended.newSlTriggerPx, "100.2");
+  assert.equal(amended.newSlOrdPx, "-1");
+  assert.equal(amended.newSlTriggerPxType, "mark");
+  assert.equal(amended.cxlOnFail, false);
+  const confirmed = await getAlgoOrder(client, "BTC-USDT-SWAP", "A1");
+  assert.equal(confirmed.state, "live");
+  assert.equal(confirmed.slTriggerPx, "100.2");
 });
 
 // ---------- logger redaction (spec §51) ----------

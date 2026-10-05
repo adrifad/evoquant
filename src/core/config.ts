@@ -67,6 +67,14 @@ const TradingSchema = z.object({
     mode: z.enum(["risk_based", "percent_of_equity"]).default("risk_based"),
     position_pct: z.number().min(0.1).max(100).default(1),
   }).default({ mode: "risk_based", position_pct: 1 }),
+  position_management: z.object({
+    sl_plus: z.object({
+      enabled: z.boolean().default(true),
+      activation_r: z.number().min(0.25).max(5).default(1),
+      lock_in_r: z.number().min(0).max(1).default(0.05),
+      min_profit_buffer_pct: z.number().min(0).max(1).default(0.12),
+    }).default({ enabled: true, activation_r: 1, lock_in_r: 0.05, min_profit_buffer_pct: 0.12 }),
+  }).default({ sl_plus: { enabled: true, activation_r: 1, lock_in_r: 0.05, min_profit_buffer_pct: 0.12 } }),
   strategies_enabled: z.array(z.string()).min(1),
 });
 

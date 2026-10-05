@@ -17,6 +17,7 @@ import { getOpenTrades } from "../memory/trades.ts";
 import { CandleCloseScheduler, msForBar } from "./scheduler.ts";
 import { ScalpRunner } from "../scalp/runner.ts";
 import type { ScalpCfg } from "../scalp/signals.ts";
+import { updateTradeStopPlus } from "../execution/position-management.ts";
 import { getBotState, setBotState } from "./state.ts";
 import { decide, holdBecause, type Decision } from "../agents/decision-agent.ts";
 import { reviewTrade } from "../agents/reviewer-agent.ts";
@@ -197,10 +198,16 @@ async function main(): Promise<void> {
       for (const pos of poss) {
         const t = local.find((x) => String(x.instrument) === pos.instId && String(x.side).toLowerCase() === pos.posSide);
         if (!t) continue;
-        const trig = priceTrigger(t, Number(pos.markPx));
+        const meta = instruments[pos.instId];
+        if (!meta) continue;
+        const slPlus = await updateTradeStopPlus(client, store, t, pos, meta, trading.position_management.sl_plus);
+        const freshTrade = store.db.prepare("SELECT * FROM trades WHERE trade_id=? AND status='OPEN'").get(String(t.trade_id)) as Record<string, unknown> | undefined;
+        if (!freshTrade) continue;
+        const activeTrade = { ...freshTrade, stop_px: slPlus.stopPx };
+        const trig = priceTrigger(activeTrade, Number(pos.markPx));
         if (trig) {
           log.warn({ event: "intrabar_trigger", tradeId: String(t.trade_id), instId: pos.instId, reason: trig });
-          await closeTradeOnExchange(deps, t, pos, trig);
+          await closeTradeOnExchange(deps, activeTrade, pos, trig);
         }
       }
     } catch (e) {

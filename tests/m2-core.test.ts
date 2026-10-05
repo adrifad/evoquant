@@ -229,7 +229,7 @@ test("MFE/MAE/R from synthetic path", () => {
     { ts: 2, o: 102, h: 108, l: 100, c: 106, vol: 1, volCcy: 1, confirm: "1" as const },
   ];
   const m = computeClosedMetrics({
-    side: "LONG", entryPx: 100, stopPx: 98, exitPx: 106, contracts: 0.01, ctVal: 1,
+    side: "LONG", entryPx: 100, stopPx: 100, initialStopPx: 98, exitPx: 106, contracts: 0.01, ctVal: 1,
     exitReason: "TP", entryTs: "2026-10-01T00:00:00Z", exitTs: "2026-10-01T01:00:00Z",
     candlesWhileOpen: path, fees: 0, funding: 0,
   });
@@ -253,6 +253,8 @@ test("decision+trade roundtrip incl. HOLD (§41)", () => {
     clOpenId: "C1", ordOpenId: "O1", decisionId: "DEC-1", rawConfidence: 0.8, calibratedConfidence: 0.75,
     plannedRiskPct: 0.5, leverage: 3, entryFeatures: feat({}),
   });
+  const openRow = st.db.prepare("SELECT initial_stop_px FROM trades WHERE trade_id='TRD-1'").get() as { initial_stop_px: number };
+  assert.equal(openRow.initial_stop_px, 98);
   closeTrade(st, "TRD-1", {
     exitPx: 106, exitTs: "2026-10-01T02:00:00Z", exitReason: "TP", fees: 0, funding: 0,
     pnl: 0.06, pnlPct: 6, resultR: 3, mfe: 8, mae: 1, durationS: 7200,

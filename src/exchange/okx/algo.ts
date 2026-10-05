@@ -21,6 +21,12 @@ export interface AlgoResult {
   clAlgoId: string;
 }
 
+export interface AlgoOrderDetail {
+  algoId: string;
+  state: string;
+  slTriggerPx: string;
+}
+
 // close side is opposite of entry side for the same posSide (§4.2)
 export async function placeConditionalProtection(
   client: OkxClient,
@@ -38,8 +44,10 @@ export async function placeConditionalProtection(
     // -1 → market order when triggered
     slTriggerPx: p.stopPrice.toFixed(2),
     slOrdPx: "-1",
+    slTriggerPxType: "mark",
     tpTriggerPx: p.takeProfitPrice.toFixed(2),
     tpOrdPx: "-1",
+    tpTriggerPxType: "mark",
     // posSide pairing already implies reduce semantics; explicit reduceOnly
     // is rejected on conditional algo orders (51000 on OKX v5 demo probe)
   };
@@ -49,6 +57,34 @@ export async function placeConditionalProtection(
   const sCode = first.sCode ?? "";
   if (sCode !== "0") throw new Error(`algo rejected: sCode=${sCode} sMsg=${first.sMsg ?? ""}`);
   return { algoId: first.algoId ?? "", clAlgoId: first.clOrdId ?? p.clAlgoId ?? "" };
+}
+
+// Amend the SL on the existing conditional TP/SL algo. cxlOnFail=false keeps
+// the previous exchange protection in place if OKX rejects the amendment.
+export async function amendConditionalStop(
+  client: OkxClient,
+  args: { instId: string; algoId: string; stopPrice: number },
+): Promise<void> {
+  const data = await client.post<Array<Record<string, string>>>("/api/v5/trade/amend-algos", {
+    instId: args.instId,
+    algoId: args.algoId,
+    newSlTriggerPx: args.stopPrice.toFixed(8).replace(/0+$/, "").replace(/\.$/, ""),
+    newSlOrdPx: "-1",
+    newSlTriggerPxType: "mark",
+    cxlOnFail: false,
+  }, true);
+  const first = firstOf(data, "amend-algos response");
+  if (first.sCode !== "0") throw new Error(`algo amend rejected: sCode=${first.sCode ?? "missing"} sMsg=${first.sMsg ?? ""}`);
+}
+
+export async function getAlgoOrder(client: OkxClient, instId: string, algoId: string): Promise<AlgoOrderDetail> {
+  const data = await client.get<Array<Record<string, string>>>("/api/v5/trade/order-algo", { instId, algoId }, true);
+  const first = firstOf(data, "algo order detail");
+  return {
+    algoId: first.algoId ?? algoId,
+    state: first.state ?? "",
+    slTriggerPx: first.slTriggerPx ?? "",
+  };
 }
 
 // §16 — cancel a conditional algo (array body, endpoint `cancel-algos`).
