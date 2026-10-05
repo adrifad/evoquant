@@ -60,7 +60,9 @@ export class ScalpRunner {
   private ticking = false;
   private stopped = false;
 
-  constructor(private d: ScalpDeps) {
+  readonly d: ScalpDeps;
+  constructor(d: ScalpDeps) {
+    this.d = d;
     this.sched = new CandleCloseScheduler(msForBar(d.cfg.signal_tf), () => this.tick());
   }
 
