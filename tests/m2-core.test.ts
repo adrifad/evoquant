@@ -167,9 +167,11 @@ test("kill switch evaluator ordering + emergency store (§23)", () => {
 });
 
 // ---- sizing (§24) ----------------------------------------------------------
-test("risk budget → contracts honors 0.5% rule", () => {
+test("risk budget → contracts honors the configured risk cap", () => {
   const inst = { instId: "BTC-USDT-SWAP", tickSz: "0.01", lotSz: "0.01", minSz: "0.01", ctVal: "0.01", ctValCcy: "BTC" };
-  const res = sizePosition({ equity: 1000, entryPrice: 100_000, stopPrice: 98_500, leverage: 3, instrument: inst }, risk);
+  // pin to 0.5% so the clamp MATH is tested independently of live tuning (§48 max 2%)
+  const pinnedRisk = { ...risk, hard_limits: { ...risk.hard_limits, risk_per_trade_pct: 0.5 } };
+  const res = sizePosition({ equity: 1000, entryPrice: 100_000, stopPrice: 98_500, leverage: 3, instrument: inst }, pinnedRisk);
   // risk budget = $5; loss per contract = 0.01×1500 = $15 → 0 contracts after floor → minSz path or below-min throw?
   // 5/15 = 0.333 contracts → floored to lotSz 0.01 → 0.33; margin ok. Verify consistency:
   const perContractLoss = 0.01 * (100_000 - 98_500);
@@ -212,9 +214,10 @@ test("percent_of_equity within bounds never exceeds margin budget", () => {
 
 test("percent_of_equity remains capped by the hard risk budget at a wide stop", () => {
   const inst = { instId: "BTC-USDT-SWAP", tickSz: "0.01", lotSz: "0.01", minSz: "0.01", ctVal: "0.01", ctValCcy: "BTC" };
-  // The requested $500 notional would lose $50 at a 10% stop. The configured
-  // 0.5% hard limit allows at most $5, therefore this is capped at $50.
-  const res = sizePosition({ equity: 1000, entryPrice: 100_000, stopPrice: 90_000, leverage: 3, instrument: inst }, risk, { mode: "percent_of_equity", position_pct: 50 });
+  // The requested $500 notional would lose $50 at a 10% stop. A pinned 0.5%
+  // hard limit allows at most $5 risk, therefore capped at $50 notional.
+  const pinnedRisk = { ...risk, hard_limits: { ...risk.hard_limits, risk_per_trade_pct: 0.5 } };
+  const res = sizePosition({ equity: 1000, entryPrice: 100_000, stopPrice: 90_000, leverage: 3, instrument: inst }, pinnedRisk, { mode: "percent_of_equity", position_pct: 50 });
   assert.equal(res.notionalUsdt, 50);
   assert.ok(res.riskBudgetUsdt <= 5);
 });
