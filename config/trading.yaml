@@ -38,6 +38,15 @@ sizing:
   position_pct: 55.0   # notional ≈ $55 / lev 5 = MARGIN ≥ $10 per position even on coarse
                        # lot floors like BTC (50% truncated to $43 notional → $8.66 margin)
 
+scalp:
+  enabled: true            # 5m hybrid scalp engine (LLM supervisor+gate, fail-closed)
+  base_tf: 1m
+  signal_tf: 5m
+  position_pct: 20         # scalp notional ~$20/position (smaller than 15m swing $55)
+  max_daily_trades: 20
+  llm_gate: true
+  llm_max_per_hour: 6
+
 strategies_enabled:
   - TREND_FOLLOWING_V1
   - BREAKOUT_V1

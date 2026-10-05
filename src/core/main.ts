@@ -15,6 +15,8 @@ import { closeTradeOnExchange } from "../execution/executor.ts";
 import { getPositions } from "../exchange/okx/account.ts";
 import { getOpenTrades } from "../memory/trades.ts";
 import { CandleCloseScheduler, msForBar } from "./scheduler.ts";
+import { ScalpRunner } from "../scalp/runner.ts";
+import type { ScalpCfg } from "../scalp/signals.ts";
 import { getBotState, setBotState } from "./state.ts";
 import { decide, holdBecause, type Decision } from "../agents/decision-agent.ts";
 import { reviewTrade } from "../agents/reviewer-agent.ts";
@@ -210,9 +212,22 @@ async function main(): Promise<void> {
   sched.start();
   await tick(); // immediate first evaluation with warm-up data
 
+  // 5m hybrid scalp engine (user mode choice 2026-10-05): deterministic signals
+  // on 1m closes, LLM supervisor (stance) + LLM gate (per-setup veto), fail-closed.
+  let scalpRunner: ScalpRunner | undefined;
+  if (trading.scalp?.enabled) {
+    const sc = trading.scalp;
+    const scalpCfg: ScalpCfg = { ...sc, watchlist };
+    scalpRunner = new ScalpRunner({
+      client, trading, risk, store, instruments, cfg: scalpCfg,
+      llm: () => { refreshLlm(); return { ...llm, timeoutMs: 60_000 }; },
+    });
+    scalpRunner.start();
+  }
+
   process.on("SIGINT", () => {
     log.warn({ event: "sigint_emergency_stop" });
-    void emergencyStop(deps).finally(() => { sched.stop(); clearInterval(intrabar); store.close(); process.exit(0); });
+    void emergencyStop(deps).finally(() => { sched.stop(); clearInterval(intrabar); scalpRunner?.stop(); store.close(); process.exit(0); });
   });
 }
 

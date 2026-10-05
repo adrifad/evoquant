@@ -24,8 +24,35 @@ const TradingSchema = z.object({
   exchange: z.literal("okx"),
   environment: z.literal("demo"),
   instrument: z.object({ id: z.string(), type: z.literal("SWAP") }),
-  // multi-coin scan (§17 "later"): trade any watchlist member; instrument.id stays primary/anchor
+  // multi-coin scan (§17): trade any watchlist member; instrument.id stays primary/anchor
   instruments: z.object({ watchlist: z.array(z.string()).min(1).optional() }).optional(),
+  // 5m hybrid scalp engine (§46 fee guard) — deterministic signals + LLM gate/supervisor
+  scalp: z.object({
+    enabled: z.boolean().default(false),
+    base_tf: z.enum(["1m", "5m"]).default("1m"),
+    signal_tf: z.enum(["1m", "3m", "5m"]).default("5m"),
+    ema_fast: z.number().int().min(3).max(50).default(9),
+    ema_slow: z.number().int().min(6).max(120).default(21),
+    rsi_period: z.number().int().min(4).max(14).default(7),
+    rsi_long_min: z.number().min(40).max(60).default(50),
+    rsi_long_max: z.number().min(60).max(75).default(68),
+    rsi_short_min: z.number().min(25).max(40).default(32),
+    rsi_short_max: z.number().min(40).max(60).default(50),
+    vol_burst_min: z.number().min(1).max(3).default(1.25),
+    min_score: z.number().min(0.4).max(0.9).default(0.6),
+    stop_atr_mult: z.number().min(0.8).max(3).default(1.4),
+    tp_r: z.number().min(1.2).max(3).default(2.0),
+    min_tp_pct: z.number().min(0.1).max(1.5).default(0.35),
+    max_hold_s: z.number().int().min(120).max(1800).default(900),
+    cooldown_s: z.number().int().min(60).max(900).default(240),
+    max_daily_trades: z.number().int().min(1).max(40).default(20),
+    llm_gate: z.boolean().default(true),
+    llm_max_per_hour: z.number().int().min(2).max(20).default(6),
+    stance_refresh_s: z.number().int().min(300).max(1800).default(900),
+    fee_pct: z.number().min(0.02).max(0.1).default(0.05),
+    entry_order: z.enum(["market", "post_only"]).default("market"),
+    position_pct: z.number().min(1).max(100).default(8),
+  }).optional(),
   timeframe: z.enum(["1m", "3m", "5m", "15m", "30m", "1H", "2H", "4H", "6H", "12H", "1D", "1W"]),
   account: z.object({
     margin_mode: z.literal("isolated"),
@@ -38,7 +65,7 @@ const TradingSchema = z.object({
   decision: z.object({ minimum_confidence: z.number().min(0).max(1) }),
   sizing: z.object({
     mode: z.enum(["risk_based", "percent_of_equity"]).default("risk_based"),
-    position_pct: z.number().min(0.1).max(50).default(1),
+    position_pct: z.number().min(0.1).max(100).default(1),
   }).default({ mode: "risk_based", position_pct: 1 }),
   strategies_enabled: z.array(z.string()).min(1),
 });
