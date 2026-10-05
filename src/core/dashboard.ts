@@ -8,6 +8,7 @@
 // questions are all answerable here; a Next.js port is a later milestone.
 
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import { gzipSync } from "node:zlib";
 import { timingSafeEqual, createHash } from "node:crypto";
 import type { Duplex } from "node:stream";
 import type { AddressInfo } from "node:net";
@@ -77,8 +78,18 @@ export function startDashboard(cfg: DashboardConfig): DashboardServer {
   async function api(req: IncomingMessage, method: string, url: URL, res: ServerResponse): Promise<void> {
     const p = url.pathname;
     const send = (code: number, body: unknown): void => {
-      res.writeHead(code, { "content-type": "application/json", "x-content-type-options": "nosniff" });
-      res.end(JSON.stringify(body));
+      const data = JSON.stringify(body);
+      const headers: Record<string, string> = {
+        "content-type": "application/json", "x-content-type-options": "nosniff",
+        vary: "accept-encoding",
+      };
+      let out: string | Buffer = data;
+      if (data.length > 860 && /\bgzip\b/.test(req.headers["accept-encoding"] ?? "")) {
+        out = gzipSync(Buffer.from(data));
+        headers["content-encoding"] = "gzip";
+      }
+      res.writeHead(code, headers);
+      res.end(out);
     };
     if (p === "/api/status") {
       const bal = await getBalance(cfg.deps().client).catch(() => null);
@@ -319,8 +330,18 @@ export function startDashboard(cfg: DashboardConfig): DashboardServer {
       if (url.pathname.startsWith("/api/")) return void (await api(req, req.method ?? "GET", url, res));
       const asset = dashboardAsset(url.pathname);
       if (asset) {
-        res.writeHead(200, { "content-type": asset.type, "cache-control": asset.cache, "x-content-type-options": "nosniff" });
-        res.end(readFileSync(asset.file));
+        const headers: Record<string, string> = {
+          "content-type": asset.type, "cache-control": asset.cache,
+          "x-content-type-options": "nosniff", vary: "accept-encoding",
+        };
+        let body: Buffer = readFileSync(asset.file);
+        if (body.length > 860 && /\bgzip\b/.test(req.headers["accept-encoding"] ?? "")
+            && (asset.type.includes("javascript") || asset.type.includes("css") || asset.type.includes("html"))) {
+          body = gzipSync(body);
+          headers["content-encoding"] = "gzip";
+        }
+        res.writeHead(200, headers);
+        res.end(body);
         return;
       }
       res.writeHead(200, { "content-type": "text/html; charset=utf-8", "x-content-type-options": "nosniff" });
