@@ -29,6 +29,32 @@ Milestone brief: [`docs/TASK-M1.md`](docs/TASK-M1.md) · Agent rules: [`AGENTS.m
   may only tighten them (spec §48).
 - Secrets are redacted centrally by `src/core/logger.ts` (spec §51).
 
+## Strategy Core V2 research mode
+
+`config/trading.yaml` selects the strategy engine with `strategy_core.version`;
+the shipped setting is V2. `validation.baseline_mode` is a separate experiment
+overlay: it freezes evolution, disables scalp, and limits concurrent positions
+to one without switching back to V1. Outside baseline mode, V2 can run with
+evolution enabled and scalp controlled independently by `scalp.enabled`.
+
+V2 uses deterministic candidates and an LLM ALLOW/DENY context gate. Evolution
+creates immutable, one-parameter V2 Challengers after the configured sample
+interval. A Challenger must pass after-cost historical, trailing OOS, walk-
+forward, and cross-symbol validation before it enters shadow-forward. Shadow
+trades are simulated in a separate ledger and never reach OKX order APIs,
+account equity, live position limits, or real-trade learning. Promotion is
+deterministic and waits for both Challenger shadow and Champion forward samples.
+
+The defaults are tuned for a short research window, not for guaranteed
+significance: signal learning every 8 closed trades (20-trade evidence floor),
+V2 proposal reviews every 15 family/version trades, historical gate at 50,
+and at least 15 closed shadow trades plus 15 Champion forward trades before
+promotion can be considered. Fee, spread, slippage, OOS, symbol, fold, and
+drawdown assumptions are in `config/evaluation.yaml` and
+`config/evolution.yaml`. This configuration does not establish profitability.
+See [`docs/STRATEGY_CORE_V2_EVOLUTION.md`](docs/STRATEGY_CORE_V2_EVOLUTION.md)
+for lifecycle and limitations.
+
 ## Setup
 
 ```bash

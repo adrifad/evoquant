@@ -4,13 +4,14 @@ enabled: true
 signal_learning_enabled: true
 strategy_evolution_enabled: true
 automatic_promotion_enabled: true
-signal_evolution_interval_trades: 50
-strategy_evolution_interval_trades: 100
-minimum_validation_sample: 100
+signal_evolution_interval_trades: 8
+strategy_evolution_interval_trades: 15
+minimum_validation_sample: 20
 
 constraints:
-  max_weight_change_per_cycle_pct: 10      # §31
-  max_param_changes_per_challenger: 2      # §36
+  max_weight_change_per_cycle_pct: 5       # bounded learning step
+  max_param_changes_per_challenger: 1      # one-variable attribution
+  max_param_delta_pct_per_challenger: 10
   # promotion criteria are FIXED — evolution may not rewrite these (§48)
   champion_vs_challenger:
     requires_out_of_sample: true
@@ -18,3 +19,18 @@ constraints:
     min_sample_each_side: 100
     min_positive_symbols: 4
     min_positive_walk_forward_folds: 2
+
+promotion:
+  historical_min_trades: 50
+  out_of_sample_min_trades: 15
+  shadow_forward_min_trades: 15
+  champion_forward_min_trades: 15
+  require_out_of_sample: true
+  require_walk_forward: true
+  require_multi_symbol: true
+  min_positive_symbol_fraction: 0.5
+  min_positive_walk_forward_fraction: 0.5
+  minimum_walk_forward_folds: 3
+  minimum_symbols: 4
+  max_drawdown_degradation_pct: 0.5
+  out_of_sample_fraction: 0.3

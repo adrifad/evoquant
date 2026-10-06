@@ -24,6 +24,7 @@ import path from "node:path";
 import { existsSync, readFileSync } from "node:fs";
 import { getBalance, getPositions } from "../exchange/okx/account.ts";
 import { createLogger } from "./logger.ts";
+import { listV2Versions } from "../strategy/v2-registry.ts";
 
 const log = createLogger("dashboard");
 const REPO_ROOT = path.resolve(import.meta.dirname, "../..");
@@ -37,6 +38,8 @@ export interface DashboardConfig {
   bind?: string;
   auth?: { user: string; password: string };
   trading: { instrument: { id: string }; timeframe: string; leverage: { default: number } };
+  strategyCoreVersion?: 1 | 2;
+  baselineMode?: boolean;
   risk: { hard_limits: Record<string, unknown> };
   deps: () => ExecutorDeps;
   getLastTick: () => { features: unknown; regime: string; at: string } | null;
@@ -201,7 +204,13 @@ export function startDashboard(cfg: DashboardConfig): DashboardServer {
     }
     if (p === "/api/strategies") {
       const rows = store.db.prepare("SELECT name,version,parent_version,params,status,hypothesis,created_ts FROM strategy_versions ORDER BY name,version").all();
-      return send(200, { strategies: rows, regimeMatrix: regimeStats(store, "SWING_15M"), performance: scopedPerformance(store), weights: getWeights(store, "SWING_15M"), calibration: JSON.parse(kvGet(store, "calibration:SWING_15M:*:*:*:*:*") ?? kvGet(store, "calibration:SWING_15M") ?? kvGet(store, "calibration") ?? "null") }); // §73–§82
+      const shadow = store.db.prepare(`SELECT strategy,strategy_version,instrument,status,COUNT(*) trades,
+        COALESCE(AVG(net_r),0) expectancy_r,COALESCE(AVG(mfe_r),0) mfe_r,COALESCE(AVG(mae_r),0) mae_r
+        FROM shadow_trades GROUP BY strategy,strategy_version,instrument,status ORDER BY strategy,strategy_version,instrument,status`).all();
+      return send(200, { strategies: rows, strategyCore: { version: cfg.strategyCoreVersion ?? 1, baselineMode: cfg.baselineMode ?? false },
+        v2Strategies: listV2Versions(store), shadowTrades: shadow,
+        regimeMatrix: regimeStats(store, "SWING_15M"), performance: scopedPerformance(store), weights: getWeights(store, "SWING_15M"),
+        calibration: JSON.parse(kvGet(store, "calibration:SWING_15M:*:*:*:*:*") ?? kvGet(store, "calibration:SWING_15M") ?? kvGet(store, "calibration") ?? "null") }); // §73–§82
     }
     if (p === "/api/lessons") {
       const rows = store.db.prepare("SELECT lesson_id,statement,status,scope_engine,scope_strategy,scope_strategy_version,scope_instrument,scope_regime,scope_regime_axes,scope_direction,confidence,observations,wins,losses,expectancy_r,updated_ts FROM lessons ORDER BY CASE status WHEN 'VERIFIED' THEN 0 WHEN 'REINFORCED' THEN 1 ELSE 2 END, confidence DESC LIMIT 50").all();
@@ -228,9 +237,18 @@ export function startDashboard(cfg: DashboardConfig): DashboardServer {
     }
     if (p === "/api/evolution") {
       const strategies = store.db.prepare("SELECT name,version,parent_version,params,status,hypothesis,created_ts FROM strategy_versions ORDER BY name,version").all();
-      const events = store.db.prepare("SELECT ts,kind,payload FROM system_events WHERE kind IN ('PROMOTION','PROMOTION_REJECTED','WEIGHTS') ORDER BY id DESC LIMIT 80").all();
+      const events = store.db.prepare(`SELECT ts,kind,payload FROM system_events WHERE kind IN
+        ('EVOLUTION_TRIGGERED','EVOLUTION_NO_CHANGE','EVOLUTION_PROPOSAL_REJECTED','CHALLENGER_CREATED',
+         'CHALLENGER_HISTORICAL_PASS','CHALLENGER_HISTORICAL_FAIL','CHALLENGER_SHADOW_STARTED',
+         'CHALLENGER_SHADOW_PROGRESS','PROMOTION','PROMOTION_REJECTED','WEIGHTS','EVOLUTION_FROZEN','EVOLUTION_RESUMED')
+        ORDER BY id DESC LIMIT 120`).all();
       const comparisons = store.db.prepare("SELECT ts,champion,challenger,promoted,reasons,champion_metrics,challenger_metrics FROM evolution_comparisons ORDER BY id DESC LIMIT 40").all();
-      return send(200, { strategies, events, comparisons });
+      const v2Evaluations = store.db.prepare(`SELECT ts,strategy,champion_version,challenger_version,stage,metrics
+        FROM strategy_v2_evaluations ORDER BY id DESC LIMIT 60`).all();
+      const v2Strategies = listV2Versions(store);
+      const shadowTrades = store.db.prepare("SELECT * FROM shadow_trades ORDER BY signal_ts DESC LIMIT 500").all();
+      return send(200, { strategyCore: { version: cfg.strategyCoreVersion ?? 1, baselineMode: cfg.baselineMode ?? false },
+        strategies, v2Strategies, shadowTrades, events, comparisons, v2Evaluations });
     }
     if (p === "/api/decisions") {
       const rows = store.db.prepare("SELECT * FROM decisions ORDER BY ts DESC LIMIT 60").all();

@@ -59,6 +59,9 @@ strategies_enabled:
   - BREAKOUT_V1
   - MEAN_REVERSION_V1
 
-# Opt-in controlled experiment overlay. Normal demo settings above remain intact.
+# Strategy selection is independent of the baseline safety overlay.
+strategy_core:
+  version: 2
+
 validation:
   baseline_mode: false

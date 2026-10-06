@@ -230,8 +230,6 @@ export interface TickContext {
   decideFn: (f: FeatureSnapshot, regime: Regime, hasPosition: boolean) => Promise<Decision>;
   candidate?: TradeCandidate;
   gateCandidateFn?: (candidate: TradeCandidate) => Promise<CandidateGate | null>;
-  reviewFn: (tradeId: string) => Promise<void>;
-  evolveFns: { weights: () => Promise<void> | void; calibration: () => void; strategies: () => Promise<void> | void; promote: () => void };
 }
 
 // USDT collateral equity — the $100-scale demo runs on actual USDT balance,
@@ -302,12 +300,6 @@ export async function runTick(d: ExecutorDeps, ctx: TickContext, symbol: TickSym
     else log.info({ event: "monitor:hold", tradeId: String(t.trade_id), instId, markPx: mark });
   }
 
-  // evolution intervals on closed trades (§42 bottom half)
-  await ctx.evolveFns.weights();
-  ctx.evolveFns.calibration();
-  await ctx.evolveFns.strategies();
-  ctx.evolveFns.promote();
-
   // §23 NO NEW ENTRIES when: kill active, global cap reached (max_concurrent),
   // or THIS symbol already holds a position (one position per symbol — V1 rule).
   const globalGate = evaluateGlobalEntryGate({
@@ -371,7 +363,7 @@ export async function runTick(d: ExecutorDeps, ctx: TickContext, symbol: TickSym
 
   // §24 sizing from strategy params
   const strat = ctx.candidate
-    ? { name: ctx.candidate.strategy.replace(/_V2$/, ""), version: 2 }
+    ? { name: ctx.candidate.strategy.replace(/_V2$/, ""), version: ctx.candidate.strategyVersion }
     : ctx.strategies.find((s) => `${s.name}_V${s.version}` === sid) ?? ctx.strategies[0]!;
   const side = decision.decision as "LONG" | "SHORT";
   const stopPx = ctx.candidate ? ctx.candidate.stopPrice : stopPriceFor(f.price, f.atr14, decision.suggested_stop_atr, side);
@@ -489,7 +481,6 @@ export async function runTick(d: ExecutorDeps, ctx: TickContext, symbol: TickSym
       side: f2.side, posSide: f2.posSide, ts: f2.ts })));
     logSystemEvent(store, "TRADE_OPEN", { tradeId, instId, side, contracts: sz.contracts, entryPx });
     log.info({ event: "trade:opened", tradeId, instId, entryPx, contracts: sz.contracts });
-    void ctx.reviewFn;
   } catch (e) {
     consecutiveOrderFailures += 1;
     logSystemEvent(store, "ERROR", { place_entry_fail: e instanceof Error ? e.message : String(e), consecutive: consecutiveOrderFailures });

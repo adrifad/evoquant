@@ -90,6 +90,76 @@ CREATE TABLE IF NOT EXISTS strategy_versions (
   hypothesis TEXT, evidence TEXT,
   PRIMARY KEY (name, version)
 );
+CREATE TABLE IF NOT EXISTS strategy_v2_versions (
+  strategy TEXT NOT NULL,
+  version INTEGER NOT NULL,
+  parent_version INTEGER,
+  params TEXT NOT NULL,
+  status TEXT NOT NULL,             -- CHAMPION | CHALLENGER | SHADOW | PROMOTED | REJECTED | SUPERSEDED
+  changed_parameter TEXT,
+  old_value REAL,
+  new_value REAL,
+  hypothesis TEXT,
+  evidence TEXT,
+  created_ts TEXT NOT NULL,
+  updated_ts TEXT NOT NULL,
+  status_reason TEXT,
+  PRIMARY KEY(strategy,version)
+);
+CREATE INDEX IF NOT EXISTS idx_strategy_v2_lifecycle ON strategy_v2_versions(status,strategy,version);
+CREATE TRIGGER IF NOT EXISTS strategy_v2_definition_immutable
+BEFORE UPDATE OF strategy,version,parent_version,params,changed_parameter,old_value,new_value,hypothesis,created_ts
+ON strategy_v2_versions
+BEGIN
+  SELECT RAISE(ABORT, 'V2 strategy definitions are immutable');
+END;
+CREATE TABLE IF NOT EXISTS shadow_trades (
+  shadow_trade_id TEXT PRIMARY KEY,
+  engine TEXT NOT NULL,
+  strategy TEXT NOT NULL,
+  strategy_version INTEGER NOT NULL,
+  instrument TEXT NOT NULL,
+  side TEXT NOT NULL,
+  status TEXT NOT NULL,             -- PENDING | OPEN | CLOSED
+  signal_ts INTEGER NOT NULL,
+  last_processed_ts INTEGER NOT NULL,
+  entry_ts INTEGER,
+  exit_ts INTEGER,
+  signal_price REAL NOT NULL,
+  entry_price REAL,
+  exit_price REAL,
+  stop_price REAL,
+  initial_stop_price REAL,
+  take_profit_price REAL,
+  stop_atr REAL NOT NULL,
+  target_r REAL NOT NULL,
+  max_hold_bars INTEGER NOT NULL,
+  bars_held INTEGER NOT NULL DEFAULT 0,
+  risk_distance REAL,
+  active_stop REAL,
+  regime TEXT,
+  regime_axes TEXT NOT NULL,
+  entry_conditions TEXT NOT NULL,
+  exit_reason TEXT,
+  gross_r REAL,
+  net_r REAL,
+  fees_r REAL,
+  mfe_r REAL NOT NULL DEFAULT 0,
+  mae_r REAL NOT NULL DEFAULT 0,
+  costs_json TEXT NOT NULL,
+  UNIQUE(strategy,strategy_version,instrument,signal_ts)
+);
+CREATE INDEX IF NOT EXISTS idx_shadow_trades_evidence ON shadow_trades(strategy,strategy_version,status,instrument,exit_ts);
+CREATE TABLE IF NOT EXISTS strategy_v2_evaluations (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts TEXT NOT NULL,
+  strategy TEXT NOT NULL,
+  champion_version INTEGER NOT NULL,
+  challenger_version INTEGER NOT NULL,
+  stage TEXT NOT NULL,
+  metrics TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_strategy_v2_evaluations ON strategy_v2_evaluations(strategy,id DESC);
 CREATE TABLE IF NOT EXISTS signal_weights (
   updated_ts TEXT PRIMARY KEY,
   weights TEXT NOT NULL,           -- JSON {trend,momentum,volume,volatility}

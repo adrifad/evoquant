@@ -63,8 +63,7 @@ export function backtest(def: StrategyDef, candlesChrono: Candle[], timeframe: s
     }
     if (!resolved) exitPrice = candles[exitIndex]!.c;
     const grossR = ((exitPrice - entry) * sign) / riskDistance;
-    const feesR = ((costs.entryFeePct + costs.exitFeePct) / 100 + 2 * (costs.slippageBps + costs.spreadBps) / 10_000)
-      * (entry + exitPrice) / riskDistance;
+    const feesR = calculateExecutionCostR(entry, exitPrice, riskDistance, costs);
     const resultR = Math.round((grossR - feesR) * 1000) / 1000;
     rs.push(resultR);
     trades.push({ entryTs: entryBar.ts, side, resultR, grossR, feesR, exitReason });
@@ -92,12 +91,22 @@ export interface V2CostModel {
   slippageBps: number; spreadBps: number; // each side
   slPlus: { enabled: boolean; activationR: number; lockInR: number; minProfitBufferPct: number };
 }
+
+/** Costs are charged once per side against that side's notional, then normalized to initial risk. */
+export function calculateExecutionCostR(entryPrice: number, exitPrice: number, riskDistance: number, costs: V2CostModel): number {
+  if (!(entryPrice > 0 && exitPrice > 0 && riskDistance > 0)) return 0;
+  const entryFee = entryPrice * costs.entryFeePct / 100;
+  const exitFee = exitPrice * costs.exitFeePct / 100;
+  const frictionPerSide = (costs.slippageBps + costs.spreadBps) / 10_000;
+  const execution = entryPrice * frictionPerSide + exitPrice * frictionPerSide;
+  return (entryFee + exitFee + execution) / riskDistance;
+}
 export const DEFAULT_V2_COSTS: V2CostModel = {
   entryFeePct: 0.05, exitFeePct: 0.05, slippageBps: 1.5, spreadBps: 1.5,
   slPlus: { enabled: true, activationR: 1, lockInR: 0.05, minProfitBufferPct: 0.12 },
 };
 export interface V2BacktestTrade {
-  engine: "SWING_15M"; instrument: string; strategy: StrategyV2Id; strategyVersion: 2; regime: RegimeAxes;
+  engine: "SWING_15M"; instrument: string; strategy: StrategyV2Id; strategyVersion: number; regime: RegimeAxes;
   entryTs: number; exitTs: number; side: "LONG" | "SHORT"; entryPrice: number; exitPrice: number;
   grossR: number; netR: number; feesR: number; exitReason: "SL" | "TP" | "SL_PLUS" | "TIME_STOP" | "DATA_END";
   mfeR: number; maeR: number;
@@ -113,6 +122,7 @@ export function backtestV2(
   params: StrategyV2Params = DEFAULT_V2_PARAMS,
   costs: V2CostModel = DEFAULT_V2_COSTS,
   instrument = "BACKTEST",
+  strategyVersion = 2,
 ): V2BacktestResult {
   void timeframe;
   const candles = candlesChrono.filter((c) => c.confirm === "1").slice().sort((a, b) => a.ts - b.ts);
@@ -121,7 +131,7 @@ export function backtestV2(
   while (i < candles.length - 1) {
     const prefix = candles.slice(0, i + 1);
     const features = buildFeatures(instrument, prefix.slice().reverse());
-    const evaluated = evaluateV2Setup(strategy, features, prefix, params);
+    const evaluated = evaluateV2Setup(strategy, features, prefix, params, strategyVersion);
     const candidate = evaluated.candidate;
     if (!candidate) { i++; continue; }
     const entryBar = candles[i + 1]!;
@@ -171,11 +181,9 @@ export function backtestV2(
     }
     if (!resolved) { const c = candles[lastBar]!; exitPrice = c.c; exitTs = c.ts; }
     const grossR = ((exitPrice - entryPrice) * sign) / riskDistance;
-    const costFraction = (costs.entryFeePct + costs.exitFeePct) / 100 +
-      2 * (costs.slippageBps + costs.spreadBps) / 10_000;
-    const feesR = costFraction * (entryPrice + exitPrice) / riskDistance;
+    const feesR = calculateExecutionCostR(entryPrice, exitPrice, riskDistance, costs);
     const netR = grossR - feesR;
-    trades.push({ engine: "SWING_15M", instrument, strategy, strategyVersion: 2, regime: candidate.regime,
+    trades.push({ engine: "SWING_15M", instrument, strategy, strategyVersion, regime: candidate.regime,
       entryTs: entryBar.ts, exitTs, side: candidate.side, entryPrice, exitPrice,
       grossR, netR, feesR, exitReason, mfeR: mfe / riskDistance, maeR: mae / riskDistance });
     i = Math.max(i + 1, candles.findIndex((c) => c.ts === exitTs) + 1);
@@ -192,17 +200,20 @@ export function backtestV2(
 }
 
 export function walkForwardV2(strategy: StrategyV2Id, candles: Candle[], timeframe: string, folds = 5,
-  params: StrategyV2Params = DEFAULT_V2_PARAMS, costs: V2CostModel = DEFAULT_V2_COSTS): {
-    foldExpectancies: number[]; positiveFolds: number; mean: number; worstFold: number; dispersion: number;
-  } {
+  params: StrategyV2Params = DEFAULT_V2_PARAMS, costs: V2CostModel = DEFAULT_V2_COSTS, strategyVersion = 2): {
+  foldExpectancies: number[]; foldTrades: number[]; positiveFolds: number; mean: number; worstFold: number; dispersion: number;
+} {
   const size = Math.floor(candles.length / folds);
   const foldExpectancies: number[] = [];
+  const foldTrades: number[] = [];
   for (let k = 1; k < folds; k++) {
     const fold = candles.slice(k * size, (k + 1) * size);
-    foldExpectancies.push(backtestV2(strategy, fold, timeframe, params, costs).netExpectancyR);
+    const result = backtestV2(strategy, fold, timeframe, params, costs, "BACKTEST", strategyVersion);
+    foldExpectancies.push(result.netExpectancyR); foldTrades.push(result.trades.length);
   }
-  const mean = foldExpectancies.length ? foldExpectancies.reduce((a, b) => a + b, 0) / foldExpectancies.length : 0;
-  const variance = foldExpectancies.length ? foldExpectancies.reduce((a, b) => a + (b - mean) ** 2, 0) / foldExpectancies.length : 0;
-  return { foldExpectancies, positiveFolds: foldExpectancies.filter((x) => x > 0).length,
-    mean, worstFold: foldExpectancies.length ? Math.min(...foldExpectancies) : 0, dispersion: Math.sqrt(variance) };
+  const valid = foldExpectancies.filter((_, i) => foldTrades[i]! > 0);
+  const mean = valid.length ? valid.reduce((a, b) => a + b, 0) / valid.length : 0;
+  const variance = valid.length ? valid.reduce((a, x) => a + (x - mean) ** 2, 0) / valid.length : 0;
+  return { foldExpectancies, foldTrades, positiveFolds: valid.filter((x) => x > 0).length,
+    mean, worstFold: valid.length ? Math.min(...valid) : 0, dispersion: Math.sqrt(variance) };
 }

@@ -8,9 +8,10 @@ import { getCandles, getHistoryCandlesPaged, latestClosedCandle, getTicker } fro
 import type { Candle, InstrumentInfo } from "../exchange/okx/types.ts";
 import { buildFeatures, type FeatureSnapshot } from "../market/features.ts";
 import { classifyRegime, type Regime } from "../market/regime.ts";
-import { loadStrategies, saveStrategy, type StrategyDef } from "../strategy/library.ts";
+import { loadStrategies, type StrategyDef } from "../strategy/library.ts";
 import { scanInstruments, scanCoreV2, pickEntry, type ScanRow } from "../strategy/scanner.ts";
-import { type TradeCandidate, persistV2Definitions, parseStrategyV2Params } from "../strategy/core-v2.ts";
+import { type TradeCandidate, parseStrategyV2Params, type StrategyV2Id, type StrategyV2Params } from "../strategy/core-v2.ts";
+import { ensureV2Registry, getV2ChampionParams, getV2ChampionVersions, getV2Champions } from "../strategy/v2-registry.ts";
 import { startupSafetySequence, runTick, emergencyStop, getLastKillReason, persistCandles, priceTrigger } from "../execution/executor.ts";
 import { closeTradeOnExchange } from "../execution/executor.ts";
 import { getPositions } from "../exchange/okx/account.ts";
@@ -24,10 +25,16 @@ import { getBotState, setBotState } from "./state.ts";
 import { decide, gateCandidate, holdBecause, type Decision } from "../agents/decision-agent.ts";
 import { reviewTrade } from "../agents/reviewer-agent.ts";
 import { maybeEvolveStrategies } from "../agents/evolution-agent.ts";
-import { getWeights, maybeEvolveWeights } from "../learning/signal-weights.ts";
+import { maybeEvolveV2Strategies } from "../agents/v2-evolution.ts";
+import { getWeights, maybeEvolveWeights, type SignalWeights } from "../learning/signal-weights.ts";
 import { recomputeCalibration } from "../learning/confidence.ts";
 import { compareAndMaybePromote } from "../evaluation/champion-challenger.ts";
 import { DEFAULT_V2_COSTS } from "../evaluation/backtest.ts";
+import { processShadowCycle } from "../evaluation/shadow-challenger.ts";
+import { evaluateV2Lifecycle } from "../evaluation/v2-promotion.ts";
+import { parseEvolutionConfig } from "./evolution-config.ts";
+import { resolveRuntimePolicy } from "./runtime-policy.ts";
+import { runOncePerGlobalCycle } from "./global-cycle.ts";
 import { createLogger } from "./logger.ts";
 import { startDashboard } from "./dashboard.ts";
 import YAML from "yaml";
@@ -42,16 +49,14 @@ async function main(): Promise<void> {
   const trading = loadTradingConfig();
   const baselineMode = trading.validation.baseline_mode;
   const configuredRisk = loadRiskConfig();
-  const risk = baselineMode ? { ...configuredRisk, hard_limits: { ...configuredRisk.hard_limits, max_concurrent_positions: 1 } } : configuredRisk;
-  const evolution = YAML.parse(readFileSync(path.join(REPO_ROOT, "config/evolution.yaml"), "utf8")) as {
-    enabled?: boolean; signal_learning_enabled?: boolean; strategy_evolution_enabled?: boolean; automatic_promotion_enabled?: boolean;
-    signal_evolution_interval_trades: number; strategy_evolution_interval_trades: number;
-    minimum_validation_sample: number; constraints: {
-      max_weight_change_per_cycle_pct: number; max_param_changes_per_challenger: number;
-      champion_vs_challenger: { requires_out_of_sample: boolean; requires_walk_forward: boolean; min_sample_each_side: number; min_positive_symbols: number; min_positive_walk_forward_folds: number };
-    };
-  };
-  const v2Params = parseStrategyV2Params(YAML.parse(readFileSync(path.join(REPO_ROOT, "config/strategy-v2.yaml"), "utf8")));
+  const evolution = parseEvolutionConfig(YAML.parse(readFileSync(path.join(REPO_ROOT, "config/evolution.yaml"), "utf8")));
+  const runtimePolicy = resolveRuntimePolicy({ strategyCoreVersion: trading.strategy_core.version, baselineMode,
+    evolutionConfiguredEnabled: evolution.enabled, scalpConfiguredEnabled: trading.scalp?.enabled ?? false,
+    configuredMaxPositions: configuredRisk.hard_limits.max_concurrent_positions });
+  const strategyCoreVersion = runtimePolicy.strategyCoreVersion;
+  const risk = { ...configuredRisk, hard_limits: { ...configuredRisk.hard_limits,
+    max_concurrent_positions: runtimePolicy.maxConcurrentPositions } };
+  const configuredV2Params = parseStrategyV2Params(YAML.parse(readFileSync(path.join(REPO_ROOT, "config/strategy-v2.yaml"), "utf8")));
   const evaluationConfig = YAML.parse(readFileSync(path.join(REPO_ROOT, "config/evaluation.yaml"), "utf8")) as {
     history_days: number; history_page_size: number; history_max_pages: number;
     costs: { entry_fee_pct: number; exit_fee_pct: number; slippage_bps_per_side: number; spread_bps_per_side: number };
@@ -66,7 +71,7 @@ async function main(): Promise<void> {
   };
 
   const store = openStore(REPO_ROOT);
-  if (baselineMode) persistV2Definitions(store, v2Params);
+  if (strategyCoreVersion === 2) ensureV2Registry(store, configuredV2Params);
   const { client } = createDemoExchange(env);
   // multi-coin scan (§17): watchlist metadata cached at startup (§7.2/§43)
   const watchlistReq = trading.instruments?.watchlist ?? [trading.instrument.id];
@@ -81,7 +86,7 @@ async function main(): Promise<void> {
   if (watchlist.length === 0) throw new Error("no watchlist instruments have metadata (§43)");
   const anchor = watchlist.includes(trading.instrument.id) ? trading.instrument.id : watchlist[0]!;
   const deps = { client, trading, risk, store, instruments, watchlist };
-  if (baselineMode || evolution.enabled === false) {
+  if (!runtimePolicy.evolutionEnabled) {
     logSystemEvent(store, "EVOLUTION_FROZEN", { reason: baselineMode ? "baseline_validation_mode" : "configuration_disabled",
       scalp: baselineMode ? "disabled" : "unchanged", maxConcurrentPositions: risk.hard_limits.max_concurrent_positions });
     log.info({ event: "evolution_frozen", reason: baselineMode ? "baseline_validation_mode" : "configuration_disabled" });
@@ -150,9 +155,9 @@ async function main(): Promise<void> {
     port: Number(env.DASHBOARD_PORT ?? 8790),
     ...(env.DASHBOARD_BIND ? { bind: env.DASHBOARD_BIND } : {}),
     ...(env.DASHBOARD_USER ? { auth: { user: env.DASHBOARD_USER, password: env[["DASHBOARD","PASSWORD"].join("_")] ?? "" } } : {}),
-    trading, risk, deps: () => deps,
+    trading, risk, strategyCoreVersion, baselineMode, deps: () => deps,
     evolution: {
-      reviewEvery: true,
+      reviewEvery: evolution.review_every_closed_trade,
       signalInterval: evolution.signal_evolution_interval_trades,
       strategyInterval: evolution.strategy_evolution_interval_trades,
       minSample: evolution.minimum_validation_sample,
@@ -168,24 +173,8 @@ async function main(): Promise<void> {
     features, regime, strategies,
     ...(candidate ? { candidate, gateCandidateFn: (c: TradeCandidate) => gateCandidate(REPO_ROOT, llm, c) } : {}),
     decideFn: async (feat: FeatureSnapshot, reg: Regime, hasPos: boolean): Promise<Decision> =>
-      baselineMode ? holdBecause("baseline mode: deterministic exits only; AI CLOSE disabled")
+      strategyCoreVersion === 2 ? holdBecause("Strategy Core V2: deterministic exit policy; AI CLOSE disabled")
         : decide(REPO_ROOT, llm, instId2, trading.timeframe, feat, reg, strategies, hasPos, store),
-    reviewFn: async (id: string) => { await reviewTrade(REPO_ROOT, llmReview, store, id); },
-    evolveFns: {
-      weights: async () => { if (!baselineMode && evolution.enabled !== false && evolution.signal_learning_enabled !== false) await maybeEvolveWeights(store, evolution.signal_evolution_interval_trades, evolution.constraints.max_weight_change_per_cycle_pct, "SWING_15M", evolution.minimum_validation_sample); },
-      calibration: () => { recomputeCalibration(store, "SWING_15M"); },
-      strategies: async () => {
-        if (!baselineMode && evolution.enabled !== false && evolution.strategy_evolution_enabled !== false) await maybeEvolveStrategies(REPO_ROOT, llmEvolve, store, evolution.strategy_evolution_interval_trades, evolution.constraints.max_param_changes_per_challenger, evolution.minimum_validation_sample);
-      },
-      promote: () => { if (!baselineMode && evolution.enabled !== false && evolution.automatic_promotion_enabled !== false) compareAndMaybePromote(store, histories, trading.timeframe, {
-        minSampleEachSide: Math.max(evolution.minimum_validation_sample, evolution.constraints.champion_vs_challenger.min_sample_each_side),
-        requireOutOfSample: evolution.constraints.champion_vs_challenger.requires_out_of_sample,
-        requireWalkForward: evolution.constraints.champion_vs_challenger.requires_walk_forward,
-        wfMinPositiveFolds: evolution.constraints.champion_vs_challenger.min_positive_walk_forward_folds,
-        minPositiveSymbols: evolution.constraints.champion_vs_challenger.min_positive_symbols,
-        requireDrawdownNonWorse: true,
-      }, backtestCosts); },
-    },
   });
 
   let ticking = false;
@@ -195,6 +184,10 @@ async function main(): Promise<void> {
     try {
       refreshLlm();
       const strategies = loadStrategies(store);
+      const activeV2Params = strategyCoreVersion === 2 ? getV2ChampionParams(store) : configuredV2Params;
+      const activeV2Versions = strategyCoreVersion === 2 ? getV2ChampionVersions(store) : {
+        TREND_FOLLOWING_V2: 2, BREAKOUT_V2: 2, MEAN_REVERSION_V2: 2,
+      };
       // 1) refresh all watchlist candles + snapshots (§17 pipeline)
       const snaps: Array<{ instrument: string; features: FeatureSnapshot; regime: Regime }> = [];
       for (const sym of watchlist) {
@@ -220,8 +213,8 @@ async function main(): Promise<void> {
       for (const snap of snaps) persistMarketSnapshot(store, snapshotTs, snap.instrument, snap.features);
       if (anchorSnap) lastTick = { features: anchorSnap.features, regime: anchorSnap.regime, at: snapshotTs };
       // 2) deterministic pre-rank (§37 opportunity agent as scanner)
-      const rows = baselineMode
-        ? scanCoreV2(snaps, histories, v2Params)
+      const rows = strategyCoreVersion === 2
+        ? scanCoreV2(snaps, histories, activeV2Params, activeV2Versions, v2Weights(store, activeV2Versions))
         : scanInstruments(snaps, strategies, getWeights(store, "SWING_15M"));
       lastScan = rows;
       for (const row of rows) {
@@ -261,7 +254,72 @@ async function main(): Promise<void> {
       }
       // after tick: any newly-closed trades get reviewed (M4)
       const closed = store.db.prepare("SELECT trade_id FROM trades WHERE status='CLOSED' AND trade_id NOT IN (SELECT trade_id FROM trade_reviews) ORDER BY exit_ts DESC LIMIT 3").all() as Array<{ trade_id: string }>;
-      for (const c of closed) await reviewTrade(REPO_ROOT, llmReview, store, c.trade_id).catch(() => undefined);
+      if (evolution.review_every_closed_trade) {
+        for (const c of closed) await reviewTrade(REPO_ROOT, llmReview, store, c.trade_id).catch(() => undefined);
+      }
+
+      // One system-wide learning/evolution lifecycle per completed global market cycle.
+      if (runtimePolicy.evolutionEnabled && snaps.length > 0) {
+        const globalCycleTs = Math.min(...snaps.map((snap) => snap.features.ts));
+        await runOncePerGlobalCycle(store, trading.timeframe, globalCycleTs, async () => {
+        if (evolution.signal_learning_enabled) {
+          if (strategyCoreVersion === 2) {
+            const book = getV2Champions(store);
+            for (const id of Object.keys(book) as StrategyV2Id[]) {
+              maybeEvolveWeights(store, evolution.signal_evolution_interval_trades,
+                evolution.constraints.max_weight_change_per_cycle_pct, "SWING_15M", evolution.minimum_validation_sample,
+                { strategy: id, strategyVersion: book[id].version });
+            }
+          } else {
+            maybeEvolveWeights(store, evolution.signal_evolution_interval_trades,
+              evolution.constraints.max_weight_change_per_cycle_pct, "SWING_15M", evolution.minimum_validation_sample);
+          }
+        }
+        recomputeCalibration(store, "SWING_15M");
+        if (evolution.strategy_evolution_enabled) {
+          if (strategyCoreVersion === 2) {
+            await maybeEvolveV2Strategies(REPO_ROOT, llmEvolve, store, {
+              intervalTrades: evolution.strategy_evolution_interval_trades,
+              minimumSample: Math.min(evolution.strategy_evolution_interval_trades, evolution.minimum_validation_sample),
+              maxParamChanges: evolution.constraints.max_param_changes_per_challenger,
+              maxParamDeltaPct: evolution.constraints.max_param_delta_pct_per_challenger,
+            });
+          } else {
+            await maybeEvolveStrategies(REPO_ROOT, llmEvolve, store,
+              evolution.strategy_evolution_interval_trades, evolution.constraints.max_param_changes_per_challenger,
+              evolution.minimum_validation_sample, "SWING_15M");
+          }
+        }
+        if (strategyCoreVersion === 2) {
+          processShadowCycle(store, snaps, histories, trading.timeframe, backtestCosts);
+          evaluateV2Lifecycle(store, histories, trading.timeframe, backtestCosts, {
+            historicalMinTrades: evolution.promotion.historical_min_trades,
+            outOfSampleMinTrades: evolution.promotion.out_of_sample_min_trades,
+            shadowForwardMinTrades: evolution.promotion.shadow_forward_min_trades,
+            championForwardMinTrades: evolution.promotion.champion_forward_min_trades,
+            outOfSampleFraction: evolution.promotion.out_of_sample_fraction,
+            minimumSymbols: evolution.promotion.minimum_symbols,
+            minPositiveSymbolFraction: evolution.promotion.min_positive_symbol_fraction,
+            minPositiveWalkForwardFraction: evolution.promotion.min_positive_walk_forward_fraction,
+            minimumWalkForwardFolds: evolution.promotion.minimum_walk_forward_folds,
+            maxDrawdownDegradationPct: evolution.promotion.max_drawdown_degradation_pct,
+            requireOutOfSample: evolution.promotion.require_out_of_sample,
+            requireWalkForward: evolution.promotion.require_walk_forward,
+            requireMultiSymbol: evolution.promotion.require_multi_symbol,
+            automaticPromotionEnabled: evolution.automatic_promotion_enabled,
+          });
+        } else if (evolution.automatic_promotion_enabled) {
+          compareAndMaybePromote(store, histories, trading.timeframe, {
+            minSampleEachSide: Math.max(evolution.minimum_validation_sample, evolution.constraints.champion_vs_challenger.min_sample_each_side),
+            requireOutOfSample: evolution.constraints.champion_vs_challenger.requires_out_of_sample,
+            requireWalkForward: evolution.constraints.champion_vs_challenger.requires_walk_forward,
+            wfMinPositiveFolds: evolution.constraints.champion_vs_challenger.min_positive_walk_forward_folds,
+            minPositiveSymbols: evolution.constraints.champion_vs_challenger.min_positive_symbols,
+            requireDrawdownNonWorse: true,
+          }, backtestCosts);
+        }
+        });
+      }
     } catch (e) {
       log.error({ event: "tick_error", error: e instanceof Error ? e.message : String(e) });
       logSystemEvent(store, "ERROR", { tick: e instanceof Error ? e.message : String(e) });
@@ -303,7 +361,7 @@ async function main(): Promise<void> {
   // 5m hybrid scalp engine (user mode choice 2026-10-05): deterministic signals
   // on 1m closes, LLM supervisor (stance) + LLM gate (per-setup veto), fail-closed.
   let scalpRunner: ScalpRunner | undefined;
-  if (trading.scalp?.enabled && !baselineMode) {
+  if (runtimePolicy.scalpEnabled && trading.scalp?.enabled) {
     const sc = trading.scalp;
     const scalpCfg: ScalpCfg = { ...sc, watchlist };
     scalpRunner = new ScalpRunner({
@@ -317,6 +375,14 @@ async function main(): Promise<void> {
     log.warn({ event: "sigint_emergency_stop" });
     void emergencyStop(deps).finally(() => { sched.stop(); clearInterval(intrabar); scalpRunner?.stop(); store.close(); process.exit(0); });
   });
+}
+
+function v2Weights(store: import("../memory/db.ts").Store, versions: Record<StrategyV2Id, number>): Partial<Record<StrategyV2Id, SignalWeights>> {
+  return {
+    TREND_FOLLOWING_V2: getWeights(store, "SWING_15M", { strategy: "TREND_FOLLOWING_V2", strategyVersion: versions.TREND_FOLLOWING_V2 }),
+    BREAKOUT_V2: getWeights(store, "SWING_15M", { strategy: "BREAKOUT_V2", strategyVersion: versions.BREAKOUT_V2 }),
+    MEAN_REVERSION_V2: getWeights(store, "SWING_15M", { strategy: "MEAN_REVERSION_V2", strategyVersion: versions.MEAN_REVERSION_V2 }),
+  };
 }
 
 if (import.meta.url === `file://${process.argv[1] ?? ""}` || process.argv[1]?.endsWith("main.ts")) {

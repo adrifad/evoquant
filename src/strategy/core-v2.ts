@@ -75,7 +75,7 @@ export interface TradeCandidate {
   instrument: string;
   engine: "SWING_15M" | "SCALP_5M";
   strategy: StrategyV2Id;
-  strategyVersion: 2;
+  strategyVersion: number;
   side: "LONG" | "SHORT";
   setupScore: number;
   entryPrice: number;
@@ -107,14 +107,14 @@ function condition(name: string, passed: boolean, value?: number, threshold?: nu
 }
 
 function buildCandidate(
-  strategy: StrategyV2Id, side: "LONG" | "SHORT", f: FeatureSnapshot,
+  strategy: StrategyV2Id, strategyVersion: number, side: "LONG" | "SHORT", f: FeatureSnapshot,
   axes: RegimeAxes, params: { stop_atr: number; target_r: number; max_hold_bars: number },
   conditions: StrategyCondition[], setupScore: number,
 ): TradeCandidate {
   const sign = side === "LONG" ? 1 : -1;
   const stopDistance = params.stop_atr * f.atr14;
   return {
-    instrument: f.instrument, engine: "SWING_15M", strategy, strategyVersion: 2, side,
+    instrument: f.instrument, engine: "SWING_15M", strategy, strategyVersion, side,
     setupScore: Math.round(setupScore * 1000) / 1000, entryPrice: f.price,
     stopPrice: f.price - sign * stopDistance,
     takeProfitPrice: f.price + sign * stopDistance * params.target_r,
@@ -125,18 +125,18 @@ function buildCandidate(
 }
 
 function result(strategy: StrategyV2Id, side: "LONG" | "SHORT", f: FeatureSnapshot, axes: RegimeAxes,
-  params: { stop_atr: number; target_r: number; max_hold_bars: number }, conditions: StrategyCondition[], tradable: boolean, quality?: number): SetupEvaluation {
+  params: { stop_atr: number; target_r: number; max_hold_bars: number }, conditions: StrategyCondition[], tradable: boolean, quality?: number, strategyVersion = 2): SetupEvaluation {
   const setupScore = quality ?? (conditions.length ? conditions.filter((x) => x.passed).length / conditions.length : 0);
   return { strategy, side: tradable ? side : null, tradable, setupScore,
-    conditions, candidate: tradable ? buildCandidate(strategy, side, f, axes, params, conditions, setupScore) : null };
+    conditions, candidate: tradable ? buildCandidate(strategy, strategyVersion, side, f, axes, params, conditions, setupScore) : null };
 }
 
 function unit(n: number): number { return Number.isFinite(n) ? Math.max(0, Math.min(1, n)) : 0; }
 
-export function evaluateTrendFollowingSetup(f: FeatureSnapshot, p = DEFAULT_V2_PARAMS.TREND_FOLLOWING_V2): SetupEvaluation {
+export function evaluateTrendFollowingSetup(f: FeatureSnapshot, p = DEFAULT_V2_PARAMS.TREND_FOLLOWING_V2, strategyVersion = 2): SetupEvaluation {
   const axes = classifyRegimeAxes(f);
   const side = axes.trend === "BULL_TREND" ? "LONG" : axes.trend === "BEAR_TREND" ? "SHORT" : null;
-  if (!side) return result("TREND_FOLLOWING_V2", "LONG", f, axes, p, [condition("directional_trend", false)], false);
+  if (!side) return result("TREND_FOLLOWING_V2", "LONG", f, axes, p, [condition("directional_trend", false)], false, undefined, strategyVersion);
   const sign = side === "LONG" ? 1 : -1;
   const extensionAtr = Math.abs(f.price - f.ema20) / f.atr14;
   const rsiOk = side === "LONG" ? f.rsi14 >= p.rsi_min && f.rsi14 <= p.rsi_max
@@ -158,21 +158,21 @@ export function evaluateTrendFollowingSetup(f: FeatureSnapshot, p = DEFAULT_V2_P
     + 0.2 * unit(1 - Math.abs(f.rsi14 - rsiCenter) / 20)
     + 0.2 * unit(Math.abs(f.emaSpreadPct) / 1)
     + 0.15 * unit(1 - extensionAtr / p.max_extension_atr);
-  return result("TREND_FOLLOWING_V2", side, f, axes, p, cs, tradable, quality);
+  return result("TREND_FOLLOWING_V2", side, f, axes, p, cs, tradable, quality, strategyVersion);
 }
 
-export function evaluateBreakoutSetup(f: FeatureSnapshot, candles: Candle[], p = DEFAULT_V2_PARAMS.BREAKOUT_V2): SetupEvaluation {
+export function evaluateBreakoutSetup(f: FeatureSnapshot, candles: Candle[], p = DEFAULT_V2_PARAMS.BREAKOUT_V2, strategyVersion = 2): SetupEvaluation {
   const xs = candles.filter((c) => c.confirm === "1").slice().sort((a, b) => a.ts - b.ts);
   const current = xs.at(-1);
   const prior = xs.slice(-(p.lookback_bars + 1), -1);
   const axes = classifyRegimeAxes(f);
   if (!current || prior.length < p.lookback_bars || !f.sufficientData || !(f.atr14 > 0)) {
-    return result("BREAKOUT_V2", "LONG", f, axes, p, [condition("breakout_history_ready", false, prior.length, p.lookback_bars)], false);
+    return result("BREAKOUT_V2", "LONG", f, axes, p, [condition("breakout_history_ready", false, prior.length, p.lookback_bars)], false, undefined, strategyVersion);
   }
   const priorHigh = Math.max(...prior.map((c) => c.h));
   const priorLow = Math.min(...prior.map((c) => c.l));
   const side = current.c > priorHigh ? "LONG" : current.c < priorLow ? "SHORT" : null;
-  if (!side) return result("BREAKOUT_V2", "LONG", f, axes, p, [condition("close_outside_prior_range", false)], false);
+  if (!side) return result("BREAKOUT_V2", "LONG", f, axes, p, [condition("close_outside_prior_range", false)], false, undefined, strategyVersion);
   const sign = side === "LONG" ? 1 : -1;
   const level = side === "LONG" ? priorHigh : priorLow;
   const breakoutAtr = Math.abs(current.c - level) / f.atr14;
@@ -194,19 +194,19 @@ export function evaluateBreakoutSetup(f: FeatureSnapshot, candles: Candle[], p =
     + 0.2 * unit((f.adx14 - p.adx_min) / 25)
     + 0.15 * unit(1 - bodyAtr / p.max_candle_body_atr)
     + 0.15 * unit(1 - extensionAtr / (p.max_breakout_extension_atr * 1.5));
-  return result("BREAKOUT_V2", side, f, axes, p, cs, cs.every((c) => c.passed), quality);
+  return result("BREAKOUT_V2", side, f, axes, p, cs, cs.every((c) => c.passed), quality, strategyVersion);
 }
 
-export function evaluateMeanReversionSetup(f: FeatureSnapshot, candles: Candle[], p = DEFAULT_V2_PARAMS.MEAN_REVERSION_V2): SetupEvaluation {
+export function evaluateMeanReversionSetup(f: FeatureSnapshot, candles: Candle[], p = DEFAULT_V2_PARAMS.MEAN_REVERSION_V2, strategyVersion = 2): SetupEvaluation {
   const xs = candles.filter((c) => c.confirm === "1").slice().sort((a, b) => a.ts - b.ts);
   const current = xs.at(-1), previous = xs.at(-2);
   const axes = classifyRegimeAxes(f);
   if (!current || !previous || !f.sufficientData || !(f.atr14 > 0)) {
-    return result("MEAN_REVERSION_V2", "LONG", f, axes, p, [condition("confirmation_history_ready", false)], false);
+    return result("MEAN_REVERSION_V2", "LONG", f, axes, p, [condition("confirmation_history_ready", false)], false, undefined, strategyVersion);
   }
   const deviationAtr = (f.price - f.ema20) / f.atr14;
   const side = Math.abs(deviationAtr) >= p.deviation_atr ? (deviationAtr < 0 ? "LONG" : "SHORT") : null;
-  if (!side) return result("MEAN_REVERSION_V2", "LONG", f, axes, p, [condition("mean_deviation", false, Math.abs(deviationAtr), p.deviation_atr)], false);
+  if (!side) return result("MEAN_REVERSION_V2", "LONG", f, axes, p, [condition("mean_deviation", false, Math.abs(deviationAtr), p.deviation_atr)], false, undefined, strategyVersion);
   const sign = side === "LONG" ? 1 : -1;
   const priorOutside = side === "LONG"
     ? previous.c <= f.ema20 - p.deviation_atr * f.atr14
@@ -226,20 +226,26 @@ export function evaluateMeanReversionSetup(f: FeatureSnapshot, candles: Candle[]
   const quality = 0.45 * unit(1 - (Math.abs(deviationAtr) - p.deviation_atr) / p.deviation_atr)
     + 0.3 * unit((side === "LONG" ? p.rsi_low - f.rsi14 : f.rsi14 - p.rsi_high) / 15)
     + 0.25 * unit(reclaimAtr / 0.5);
-  return result("MEAN_REVERSION_V2", side, f, axes, p, cs, cs.every((c) => c.passed), quality);
+  return result("MEAN_REVERSION_V2", side, f, axes, p, cs, cs.every((c) => c.passed), quality, strategyVersion);
 }
 
-export function evaluateAllV2Setups(f: FeatureSnapshot, candles: Candle[], params = DEFAULT_V2_PARAMS): SetupEvaluation[] {
-  return [evaluateTrendFollowingSetup(f, params.TREND_FOLLOWING_V2),
-    evaluateBreakoutSetup(f, candles, params.BREAKOUT_V2),
-    evaluateMeanReversionSetup(f, candles, params.MEAN_REVERSION_V2)];
+export type StrategyV2Versions = Record<StrategyV2Id, number>;
+export const DEFAULT_V2_VERSIONS: StrategyV2Versions = {
+  TREND_FOLLOWING_V2: 2, BREAKOUT_V2: 2, MEAN_REVERSION_V2: 2,
+};
+
+export function evaluateAllV2Setups(f: FeatureSnapshot, candles: Candle[], params = DEFAULT_V2_PARAMS,
+  versions: StrategyV2Versions = DEFAULT_V2_VERSIONS): SetupEvaluation[] {
+  return [evaluateTrendFollowingSetup(f, params.TREND_FOLLOWING_V2, versions.TREND_FOLLOWING_V2),
+    evaluateBreakoutSetup(f, candles, params.BREAKOUT_V2, versions.BREAKOUT_V2),
+    evaluateMeanReversionSetup(f, candles, params.MEAN_REVERSION_V2, versions.MEAN_REVERSION_V2)];
 }
 
-export function evaluateV2Setup(strategy: StrategyV2Id, f: FeatureSnapshot, candles: Candle[], params = DEFAULT_V2_PARAMS): SetupEvaluation {
+export function evaluateV2Setup(strategy: StrategyV2Id, f: FeatureSnapshot, candles: Candle[], params = DEFAULT_V2_PARAMS, strategyVersion = 2): SetupEvaluation {
   switch (strategy) {
-    case "TREND_FOLLOWING_V2": return evaluateTrendFollowingSetup(f, params.TREND_FOLLOWING_V2);
-    case "BREAKOUT_V2": return evaluateBreakoutSetup(f, candles, params.BREAKOUT_V2);
-    case "MEAN_REVERSION_V2": return evaluateMeanReversionSetup(f, candles, params.MEAN_REVERSION_V2);
+    case "TREND_FOLLOWING_V2": return evaluateTrendFollowingSetup(f, params.TREND_FOLLOWING_V2, strategyVersion);
+    case "BREAKOUT_V2": return evaluateBreakoutSetup(f, candles, params.BREAKOUT_V2, strategyVersion);
+    case "MEAN_REVERSION_V2": return evaluateMeanReversionSetup(f, candles, params.MEAN_REVERSION_V2, strategyVersion);
   }
 }
 
