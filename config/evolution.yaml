@@ -1,7 +1,7 @@
 # Learning & evolution schedule — spec §3, §31, §34, §36, §48
 review_every_closed_trade: true
-signal_evolution_interval_trades: 20
-strategy_evolution_interval_trades: 50
+signal_evolution_interval_trades: 10
+strategy_evolution_interval_trades: 15
 minimum_validation_sample: 30
 
 constraints:
