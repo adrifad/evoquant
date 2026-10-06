@@ -3,6 +3,9 @@
 import type { Store } from "./db.ts";
 import type { Candle } from "../exchange/okx/types.ts";
 import type { FeatureSnapshot } from "../market/features.ts";
+import { inferTradingEngine, type TradingEngine } from "./engines.ts";
+import type { RegimeAxes } from "../market/regime.ts";
+import type { StrategyCondition } from "../strategy/core-v2.ts";
 
 let decisionSeq = 0;
 export function nextDecisionId(): string {
@@ -36,26 +39,29 @@ export function recordDecision(
 export function openTrade(
   store: Store,
   t: {
-    tradeId: string; instrument: string; timeframe: string; side: "LONG" | "SHORT";
-    strategy: string; strategyVersion: number; regime: string; contracts: string;
+    tradeId: string; engine?: TradingEngine; instrument: string; timeframe: string; side: "LONG" | "SHORT";
+    strategy: string; strategyVersion: number; regime: string; regimeAxes?: RegimeAxes; entryConditions?: StrategyCondition[]; contracts: string;
     entryPx: number; entryTs: string; stopPx: number; takeProfitPx: number;
     clOpenId: string; ordOpenId: string;
     decisionId?: string;
     rawConfidence: number; calibratedConfidence: number; plannedRiskPct: number; leverage: number;
+    maxHoldBars?: number;
     entryFeatures: FeatureSnapshot;
   },
 ): void {
   store.db
     .prepare(
-      `INSERT INTO trades(trade_id,status,instrument,timeframe,side,strategy,strategy_version,regime,contracts,
+      `INSERT INTO trades(trade_id,engine,status,instrument,timeframe,side,strategy,strategy_version,regime,regime_axes,contracts,
         entry_px,entry_ts,stop_px,initial_stop_px,take_profit_px,cl_open_id,ord_open_id,
-        raw_confidence,calibrated_confidence,planned_risk_pct,leverage,entry_features,decision_id)
-       VALUES(?, 'OPEN', ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+        raw_confidence,calibrated_confidence,planned_risk_pct,leverage,max_hold_bars,entry_features,entry_conditions,decision_id)
+       VALUES(?,?, 'OPEN', ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
     )
     .run(
-      t.tradeId, t.instrument, t.timeframe, t.side, t.strategy, t.strategyVersion, t.regime, t.contracts,
+      t.tradeId, t.engine ?? inferTradingEngine(t.timeframe), t.instrument, t.timeframe, t.side, t.strategy, t.strategyVersion, t.regime,
+      t.regimeAxes ? JSON.stringify(t.regimeAxes) : null, t.contracts,
       t.entryPx, t.entryTs, t.stopPx, t.stopPx, t.takeProfitPx, t.clOpenId, t.ordOpenId,
-      t.rawConfidence, t.calibratedConfidence, t.plannedRiskPct, t.leverage, JSON.stringify(t.entryFeatures), t.decisionId ?? null,
+      t.rawConfidence, t.calibratedConfidence, t.plannedRiskPct, t.leverage, t.maxHoldBars ?? null, JSON.stringify(t.entryFeatures),
+      t.entryConditions ? JSON.stringify(t.entryConditions) : null, t.decisionId ?? null,
     );
 }
 
@@ -91,7 +97,9 @@ export function computeClosedMetrics(args: {
   const pnl = grossPnl - args.fees + args.funding;
   const pnlPct = entryPx > 0 ? ((exitPx - entryPx) * dir / entryPx) * 100 : 0;
   const riskPerUnit = Math.abs(entryPx - (args.initialStopPx ?? stopPx));
-  const resultR = riskPerUnit > 0 ? ((exitPx - entryPx) * dir) / riskPerUnit : 0;
+  const riskCapital = riskPerUnit * contracts * ctVal;
+  // Net R: realized cash PnL after fees/funding divided by initial cash risk.
+  const resultR = riskCapital > 0 ? pnl / riskCapital : 0;
   const durationS = Math.max(0, Math.round((Date.parse(args.exitTs) - Date.parse(args.entryTs)) / 1000));
   return {
     exitPx, exitTs: args.exitTs, exitReason: args.exitReason,
@@ -103,7 +111,7 @@ export function computeClosedMetrics(args: {
 export function closeTrade(store: Store, tradeId: string, m: ClosedMetrics): void {
   store.db
     .prepare(
-      `UPDATE trades SET status='CLOSED', exit_px=@exitPx, exit_ts=@exitTs, exit_reason=@exitReason,
+      `UPDATE trades SET status='CLOSED', result_r_basis='NET', exit_px=@exitPx, exit_ts=@exitTs, exit_reason=@exitReason,
         fees=@fees, funding=@funding, pnl=@pnl, pnl_pct=@pnlPct, result_r=@resultR,
         mfe=@mfe, mae=@mae, duration_s=@durationS
        WHERE trade_id=@tradeId AND status='OPEN'`,

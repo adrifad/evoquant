@@ -4,7 +4,7 @@ import { readFileSync } from "node:fs";
 import path from "node:path";
 import { z } from "zod";
 import { llmJson, type LlmConfig } from "../core/llm.ts";
-import { upsertLesson, addLessonEvidence, tradesMatchingScope } from "../memory/lessons.ts";
+import { upsertLesson } from "../memory/lessons.ts";
 import { logSystemEvent } from "../memory/db.ts";
 import type { Store } from "../memory/db.ts";
 
@@ -37,13 +37,19 @@ export async function reviewTrade(
   const t = store.db.prepare("SELECT * FROM trades WHERE trade_id=?").get(tradeId) as Record<string, unknown> | undefined;
   if (!t || t.status !== "CLOSED") return null;
   const prompt = readFileSync(path.join(root, "prompts/review.md"), "utf8");
+  const initialRisk = Math.abs(Number(t.entry_px) - Number(t.initial_stop_px ?? t.stop_px));
   const input = {
     trade_id: t.trade_id,
+    engine: t.engine ?? (t.timeframe === "scalp" ? "SCALP_5M" : "SWING_15M"),
     side: t.side, regime: t.regime,
     strategy: `${t.strategy}_V${t.strategy_version}`,
     entry: { px: t.entry_px, ts: t.entry_ts, features: JSON.parse(String(t.entry_features ?? "{}")) },
+    entry_conditions: (() => { try { return JSON.parse(String(t.entry_conditions ?? "[]")) as unknown[]; } catch { return []; } })(),
     exit: { px: t.exit_px, ts: t.exit_ts, reason: t.exit_reason },
-    result: { pnl: t.pnl, pnl_pct: t.pnl_pct, result_r: t.result_r, mfe: t.mfe, mae: t.mae, fees: t.fees },
+    result: { pnl: t.pnl, pnl_pct: t.pnl_pct, result_r: t.result_r, net_r: t.result_r, mfe: t.mfe, mae: t.mae,
+      mfe_r: initialRisk > 0 ? Number(t.mfe) / initialRisk : null, mae_r: initialRisk > 0 ? Number(t.mae) / initialRisk : null,
+      fees: t.fees, exit_reason: t.exit_reason },
+    execution: { initial_stop_px: t.initial_stop_px, stop_px: t.stop_px, take_profit_px: t.take_profit_px },
     duration_s: t.duration_s,
     decision: { raw_confidence: t.raw_confidence, calibrated_confidence: t.calibrated_confidence },
   };
@@ -56,20 +62,21 @@ export async function reviewTrade(
     "INSERT OR REPLACE INTO trade_reviews(trade_id,ts,outcome,result_r,observations,lesson_candidates) VALUES(?,?,?,?,?,?)",
   ).run(tradeId, new Date().toISOString(), review.outcome, review.result_r,
     JSON.stringify(review.observations), JSON.stringify(review.lesson_candidates));
-  // lesson candidates → PROVISIONAL; evidence attached from matching scope
+  // Lesson candidates stay provisional: natural-language claims cannot yet
+  // be validated reliably against arbitrary trades without semantic leakage.
   for (const c of review.lesson_candidates) {
     const stmt = `${c.statement} (side=${t.side})`.slice(0, 400);
     const lessonId = upsertLesson(store, {
       statement: stmt,
-      scope: { strategy: c.scope.strategy ?? String(t.strategy), instrument: String(t.instrument), regime: c.scope.regime ?? String(t.regime) },
+      scope: {
+        engine: String(t.engine ?? "SWING_15M") as "SWING_15M" | "SCALP_5M",
+        strategy: String(t.strategy), strategyVersion: Number(t.strategy_version),
+        instrument: String(t.instrument), regime: String(t.regime), direction: String(t.side),
+        ...(typeof t.regime_axes === "string" ? { regimeAxes: t.regime_axes } : {}),
+      },
       confidence: Math.min(c.confidence, 0.5), // §28 rule 3: single trade ≤0.5
     });
-    const trades = tradesMatchingScope(store, { strategy: String(t.strategy), regime: String(t.regime) });
-    // Evidence rule (§30): a lesson says "pattern X underperforms" → a trade in
-    // scope is ALIGNED when it lost, CONTRADICTED when it won.
-    for (const tr of trades) {
-      addLessonEvidence(store, lessonId, String(tr.trade_id), Number(tr.result_r) < 0);
-    }
+    logSystemEvent(store, "LESSON_CANDIDATE", { lessonId, engine: input.engine, strategy: t.strategy, version: t.strategy_version, state: "PROVISIONAL_NO_SEMANTIC_VALIDATION" });
   }
   logSystemEvent(store, "REVIEW", { tradeId, outcome: review.outcome, lessonCandidates: review.lesson_candidates.length });
   return review;

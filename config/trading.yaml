@@ -58,3 +58,7 @@ strategies_enabled:
   - TREND_FOLLOWING_V1
   - BREAKOUT_V1
   - MEAN_REVERSION_V1
+
+# Opt-in controlled experiment overlay. Normal demo settings above remain intact.
+validation:
+  baseline_mode: false

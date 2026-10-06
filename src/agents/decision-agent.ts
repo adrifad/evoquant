@@ -10,6 +10,7 @@ import type { StrategyDef } from "../strategy/library.ts";
 import type { Store } from "../memory/db.ts";
 import { getRegimeStatsBrief } from "../memory/regimes.ts";
 import { getActiveLessons } from "../memory/lessons.ts";
+import type { TradeCandidate } from "../strategy/core-v2.ts";
 
 export const DecisionSchema = z.object({
   decision: z.enum(["LONG", "SHORT", "HOLD", "CLOSE"]),
@@ -21,6 +22,25 @@ export const DecisionSchema = z.object({
   suggested_take_profit_atr: z.number().min(0).max(10).default(3.0),
 });
 export type Decision = z.infer<typeof DecisionSchema>;
+
+export const CandidateGateSchema = z.object({
+  verdict: z.enum(["ALLOW", "DENY"]),
+  confidence: z.number().min(0).max(1),
+  reasoning: z.array(z.string().max(280)).max(5).default([]),
+  risk_flags: z.array(z.string().max(120)).max(5).default([]),
+});
+export type CandidateGate = z.infer<typeof CandidateGateSchema>;
+
+/** LLM may veto or allow only; candidate side, strategy and geometry are immutable. */
+export async function gateCandidate(root: string, cfg: LlmConfig, candidate: TradeCandidate): Promise<CandidateGate | null> {
+  const prompt = readFileSync(path.join(root, "prompts/candidate-gate.md"), "utf8");
+  return llmJson(cfg, prompt, JSON.stringify({
+    instrument: candidate.instrument, engine: candidate.engine, strategy: candidate.strategy,
+    version: candidate.strategyVersion, side: candidate.side, setup_score: candidate.setupScore,
+    entry: candidate.entryPrice, stop: candidate.stopPrice, take_profit: candidate.takeProfitPrice,
+    regime: candidate.regime, conditions: candidate.conditions, reasoning: candidate.reasoning,
+  }), CandidateGateSchema);
+}
 
 export const HOLD: Decision = {
   decision: "HOLD", strategy: null, confidence: 0,

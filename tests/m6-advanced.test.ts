@@ -12,6 +12,9 @@ import { getWeights, measureContributions, maybeEvolveWeights } from "../src/lea
 import { compareAndMaybePromote } from "../src/evaluation/champion-challenger.ts";
 import { loadStrategies, saveStrategy } from "../src/strategy/library.ts";
 import { backtest } from "../src/evaluation/backtest.ts";
+import { recomputeCalibration } from "../src/learning/confidence.ts";
+import { regimeStats } from "../src/memory/regimes.ts";
+import { scopedPerformance } from "../src/memory/regimes.ts";
 import { BASE_STRATEGIES, type StrategyDef } from "../src/strategy/library.ts";
 import type { Candle } from "../src/exchange/okx/types.ts";
 
@@ -62,6 +65,34 @@ test("weights actually update with measurable signal contributions (§31)", () =
   assert.ok(Math.abs(after!.trend - before.trend) <= 0.1001);
   // second run without new trades → no further movement
   assert.equal(maybeEvolveWeights(st, 20, 10), null);
+  st.close();
+});
+
+test("signal learning aligns profitable and losing bearish SHORT evidence and isolates engines", () => {
+  const st = openStore(tmpRoot());
+  const insert = st.db.prepare(`INSERT INTO trades(trade_id,engine,status,instrument,timeframe,side,strategy,strategy_version,regime,contracts,result_r,entry_features,raw_confidence,exit_ts)
+    VALUES(?,?,'CLOSED','BTC-USDT-SWAP',?,'SHORT','TREND_FOLLOWING',2,'TRENDING_BEARISH','1',?,?,0.9,'2026-10-01T00:00:00Z')`);
+  for (let i = 0; i < 35; i++) insert.run(`SH${i}`, "SWING_15M", "15m", 2.5, feat({ emaSpreadPct: -0.8, rsi14: 38 }));
+  for (let i = 0; i < 35; i++) insert.run(`SC${i}`, "SCALP_5M", "scalp", -0.5, feat({ emaSpreadPct: -0.8, rsi14: 38 }));
+  assert.ok(measureContributions(st, "SWING_15M").trend > 0.5, "profitable bearish SHORT should reinforce aligned trend evidence");
+  assert.ok(measureContributions(st, "SCALP_5M").trend < -0.3, "losing bearish SHORT should penalize aligned trend evidence");
+  assert.equal(regimeStats(st, "SWING_15M").TRENDING_BEARISH?.TREND_FOLLOWING_V2?.SHORT?.trades, 35);
+  assert.equal(regimeStats(st, "SCALP_5M").TRENDING_BEARISH?.TREND_FOLLOWING_V2?.SHORT?.trades, 35);
+  assert.equal(scopedPerformance(st, { engine: "SCALP_5M", strategy: "TREND_FOLLOWING", strategyVersion: 2, side: "SHORT" }).length, 1);
+  assert.equal(scopedPerformance(st, { engine: "SWING_15M", instrument: "ETH-USDT-SWAP" }).length, 0);
+  assert.equal(recomputeCalibration(st, "SWING_15M")?.sample, 35);
+  assert.equal(recomputeCalibration(st, "SCALP_5M")?.sample, 35);
+  st.close();
+});
+
+test("strategy version rows are insert-only; reusing a version never mutates its params", () => {
+  const st = openStore(tmpRoot());
+  const original: StrategyDef = { ...BASE_STRATEGIES[0]!, version: 99, status: "TESTING", params: { ...BASE_STRATEGIES[0]!.params } };
+  saveStrategy(st, original);
+  saveStrategy(st, { ...original, params: { ...original.params, adx_min: original.params.adx_min + 1 }, status: "CHALLENGER" });
+  const row = st.db.prepare("SELECT params,status FROM strategy_versions WHERE name=? AND version=99").get(original.name) as { params: string; status: string };
+  assert.deepEqual(JSON.parse(row.params), original.params);
+  assert.equal(row.status, "TESTING");
   st.close();
 });
 

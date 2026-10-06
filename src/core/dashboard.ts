@@ -15,7 +15,7 @@ import type { AddressInfo } from "node:net";
 import type { Store } from "../memory/db.ts";
 import { getBotState, setBotState, isEmergencyHalted, setEmergencyHalted, baseline } from "../core/state.ts";
 import { getWeights } from "../learning/signal-weights.ts";
-import { regimeStats } from "../memory/regimes.ts";
+import { regimeStats, scopedPerformance } from "../memory/regimes.ts";
 import { kvGet } from "../memory/db.ts";
 import { emergencyStop, type ExecutorDeps } from "../execution/executor.ts";
 import { setEnvKeys, maskKey } from "./settings.ts";
@@ -201,10 +201,10 @@ export function startDashboard(cfg: DashboardConfig): DashboardServer {
     }
     if (p === "/api/strategies") {
       const rows = store.db.prepare("SELECT name,version,parent_version,params,status,hypothesis,created_ts FROM strategy_versions ORDER BY name,version").all();
-      return send(200, { strategies: rows, regimeMatrix: regimeStats(store), weights: getWeights(store), calibration: JSON.parse(kvGet(store, "calibration") ?? "null") }); // §73–§82
+      return send(200, { strategies: rows, regimeMatrix: regimeStats(store, "SWING_15M"), performance: scopedPerformance(store), weights: getWeights(store, "SWING_15M"), calibration: JSON.parse(kvGet(store, "calibration:SWING_15M:*:*:*:*:*") ?? kvGet(store, "calibration:SWING_15M") ?? kvGet(store, "calibration") ?? "null") }); // §73–§82
     }
     if (p === "/api/lessons") {
-      const rows = store.db.prepare("SELECT lesson_id,statement,status,scope_strategy,scope_instrument,scope_regime,confidence,observations,wins,losses,expectancy_r,updated_ts FROM lessons ORDER BY CASE status WHEN 'VERIFIED' THEN 0 WHEN 'REINFORCED' THEN 1 ELSE 2 END, confidence DESC LIMIT 50").all();
+      const rows = store.db.prepare("SELECT lesson_id,statement,status,scope_engine,scope_strategy,scope_strategy_version,scope_instrument,scope_regime,scope_regime_axes,scope_direction,confidence,observations,wins,losses,expectancy_r,updated_ts FROM lessons ORDER BY CASE status WHEN 'VERIFIED' THEN 0 WHEN 'REINFORCED' THEN 1 ELSE 2 END, confidence DESC LIMIT 50").all();
       return send(200, rows); // §79
     }
     if (p === "/api/events") {

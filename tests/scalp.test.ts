@@ -6,6 +6,7 @@ import { evaluateSignal, stanceAllows, budgetAllows, dailyAllows, SCALP_DEFAULTS
 import type { ScalpCfg } from "../src/scalp/signals.ts";
 import type { Candle } from "../src/exchange/okx/types.ts";
 import type { FeatureSnapshot } from "../src/market/features.ts";
+import { backtestScalp } from "../src/scalp/backtest.ts";
 
 const cfg: ScalpCfg = { ...SCALP_DEFAULTS, watchlist: ["BTC-USDT-SWAP"] };
 
@@ -67,6 +68,23 @@ test("fee guard kills sub-economic TP (override min_tp_pct high)", () => {
   const ok = evaluateSignal({ instrument: "X", closes1m: cs, last5m: null, regime: "TRENDING_BULLISH", features: feats() }, cfg, 1e9, {});
   if (ok.signal) assert.ok(Math.abs(ok.signal.tpPx - ok.signal.price) / ok.signal.price * 100 >= cfg.min_tp_pct);
   else assert.fail("baseline signal expected");
+});
+
+test("scalp replay reuses live signal fee guard and reports after-cost net R", () => {
+  const cs = [...candles(120, 100, 0.5, -0.28, 2.0)];
+  let px = cs.at(-1)!.c;
+  for (let i = 0; i < 21; i++) {
+    const o = px; px += 0.03;
+    cs.push({ ts: cs.at(-1)!.ts + 60_000, o, h: px + 0.05, l: o - 0.05, c: px, vol: i === 0 ? 200 : 100, volCcy: 1, confirm: "1" });
+  }
+  const trades = backtestScalp(cs, cfg, () => ({ regime: "TRENDING_BULLISH", features: feats(), last5m: null }));
+  assert.equal(trades.length, 1);
+  assert.ok(trades[0]!.netR < trades[0]!.grossR);
+  const noFees = backtestScalp(cs, cfg, () => ({ regime: "TRENDING_BULLISH", features: feats(), last5m: null }), {
+    feePctPerSide: 0, slippageBpsPerSide: 0, spreadBpsPerSide: 0,
+    slPlus: { enabled: true, activationR: 1, lockInR: 0.05, minProfitBufferPct: 0.12 },
+  });
+  assert.equal(noFees[0]?.netR, noFees[0]?.grossR);
 });
 
 test("downtrend + burst fires SHORT", () => {

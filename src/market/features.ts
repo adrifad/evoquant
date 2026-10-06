@@ -9,6 +9,8 @@ export interface FeatureSnapshot {
   ema20: number;
   ema50: number;
   emaSpreadPct: number; // (ema20-ema50)/ema50*100
+  ema20SlopePct?: number; // deterministic short-horizon slope in percent
+  distanceFromEma20Pct?: number; // (price-ema20)/ema20*100
   rsi14: number;
   adx14: number;
   atr14: number;
@@ -36,6 +38,7 @@ export function buildFeatures(
   const i = closes.length - 1;
   const last = ch[i];
   const ema20v = e20[i] ?? NaN;
+  const priorEma20 = e20[Math.max(0, i - 3)] ?? NaN;
   const ema50v = e50[i] ?? NaN;
   const atr14v = at[i] ?? NaN;
   const volSma = vs20[i] ?? NaN;
@@ -47,6 +50,8 @@ export function buildFeatures(
     ema20: ema20v,
     ema50: ema50v,
     emaSpreadPct: ok ? ((ema20v - ema50v) / ema50v) * 100 : NaN,
+    ema20SlopePct: ok && Number.isFinite(priorEma20) && priorEma20 !== 0 ? ((ema20v - priorEma20) / priorEma20) * 100 : NaN,
+    distanceFromEma20Pct: ok && ema20v !== 0 && last ? ((last.c - ema20v) / ema20v) * 100 : NaN,
     rsi14: r[i] ?? NaN,
     adx14: a.adx[i] ?? NaN,
     atr14: atr14v,

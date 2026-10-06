@@ -3,8 +3,10 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { mkdtempSync } from "node:fs";
+import { mkdirSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import Database from "better-sqlite3";
 
 import { ema, rsi, atr, adx } from "../src/market/indicators.ts";
 import { buildFeatures, type FeatureSnapshot } from "../src/market/features.ts";
@@ -247,14 +249,27 @@ test("decision+trade roundtrip incl. HOLD (§41)", () => {
     decision: "HOLD", regime: "SIDEWAYS", riskVerdict: { approved: true, reason: "APPROVED" },
   });
   openTrade(st, {
-    tradeId: "TRD-1", instrument: "BTC-USDT-SWAP", timeframe: "15m", side: "LONG",
+    tradeId: "TRD-1", engine: "SWING_15M", instrument: "BTC-USDT-SWAP", timeframe: "15m", side: "LONG",
     strategy: "TREND_FOLLOWING", strategyVersion: 1, regime: "TRENDING_BULLISH",
+    regimeAxes: { trend: "BULL_TREND", volatility: "HIGH" },
     contracts: "0.01", entryPx: 100, entryTs: "2026-10-01T00:00:00Z", stopPx: 98, takeProfitPx: 106,
     clOpenId: "C1", ordOpenId: "O1", decisionId: "DEC-1", rawConfidence: 0.8, calibratedConfidence: 0.75,
     plannedRiskPct: 0.5, leverage: 3, entryFeatures: feat({}),
   });
   const openRow = st.db.prepare("SELECT initial_stop_px FROM trades WHERE trade_id='TRD-1'").get() as { initial_stop_px: number };
   assert.equal(openRow.initial_stop_px, 98);
+  const linked = st.db.prepare(`SELECT t.engine,t.decision_id,d.decision_id AS linked_id FROM trades t LEFT JOIN decisions d USING(decision_id) WHERE t.trade_id='TRD-1'`).get() as { engine: string; decision_id: string; linked_id: string };
+  assert.deepEqual(linked, { engine: "SWING_15M", decision_id: "DEC-1", linked_id: "DEC-1" });
+  assert.deepEqual(JSON.parse((st.db.prepare("SELECT regime_axes FROM trades WHERE trade_id='TRD-1'").get() as { regime_axes: string }).regime_axes),
+    { trend: "BULL_TREND", volatility: "HIGH" });
+  recordDecision(st, { decisionId: "DEC-S", ts: "2026-10-01T00:00:00Z", instrument: "ETH-USDT-SWAP", decision: "SHORT",
+    strategy: "SCALP_V1", regime: "TRENDING_BEARISH", rawConfidence: 0.7, calibratedConfidence: 0.7, riskVerdict: { approved: true } });
+  openTrade(st, { tradeId: "TRD-S", engine: "SCALP_5M", instrument: "ETH-USDT-SWAP", timeframe: "scalp", side: "SHORT",
+    strategy: "SCALP", strategyVersion: 1, regime: "TRENDING_BEARISH", contracts: "1", entryPx: 100,
+    entryTs: "2026-10-01T00:00:00Z", stopPx: 101, takeProfitPx: 98, clOpenId: "CS", ordOpenId: "OS",
+    decisionId: "DEC-S", rawConfidence: 0.7, calibratedConfidence: 0.7, plannedRiskPct: 0.5, leverage: 2, entryFeatures: feat({}) });
+  const scalpLink = st.db.prepare(`SELECT t.engine,t.decision_id,d.decision_id AS linked_id FROM trades t LEFT JOIN decisions d USING(decision_id) WHERE t.trade_id='TRD-S'`).get() as { engine: string; decision_id: string; linked_id: string };
+  assert.deepEqual(scalpLink, { engine: "SCALP_5M", decision_id: "DEC-S", linked_id: "DEC-S" });
   closeTrade(st, "TRD-1", {
     exitPx: 106, exitTs: "2026-10-01T02:00:00Z", exitReason: "TP", fees: 0, funding: 0,
     pnl: 0.06, pnlPct: 6, resultR: 3, mfe: 8, mae: 1, durationS: 7200,
@@ -263,6 +278,31 @@ test("decision+trade roundtrip incl. HOLD (§41)", () => {
   const row = st.db.prepare("SELECT * FROM trades WHERE trade_id='TRD-1'").get() as Record<string, unknown>;
   assert.equal(row.status, "CLOSED"); assert.equal(row.result_r, 3);
   st.close();
+});
+
+test("engine migration preserves legacy trades and is idempotent", () => {
+  const root = tmpRoot();
+  mkdirSync(path.join(root, "data"), { recursive: true });
+  const legacy = new Database(path.join(root, "data", "trader.db"));
+  legacy.exec(`CREATE TABLE trades(
+    trade_id TEXT PRIMARY KEY,status TEXT NOT NULL,instrument TEXT NOT NULL,timeframe TEXT NOT NULL,
+    side TEXT NOT NULL,strategy TEXT NOT NULL,strategy_version INTEGER NOT NULL,regime TEXT NOT NULL,contracts TEXT NOT NULL,stop_px REAL
+  );
+  INSERT INTO trades VALUES('legacy-swing','CLOSED','BTC-USDT-SWAP','15m','LONG','TREND_FOLLOWING',1,'TRENDING_BULLISH','1',98);
+  INSERT INTO trades VALUES('legacy-scalp','CLOSED','ETH-USDT-SWAP','scalp','SHORT','SCALP',1,'TRENDING_BEARISH','1',9);`);
+  legacy.close();
+
+  const store = openStore(root);
+  const migrated = store.db.prepare("SELECT trade_id,engine,result_r_basis FROM trades ORDER BY trade_id").all();
+  assert.deepEqual(migrated, [
+    { trade_id: "legacy-scalp", engine: "SCALP_5M", result_r_basis: "LEGACY_GROSS" },
+    { trade_id: "legacy-swing", engine: "SWING_15M", result_r_basis: "LEGACY_GROSS" },
+  ]);
+  store.close();
+  const reopened = openStore(root);
+  assert.equal((reopened.db.prepare("SELECT COUNT(*) c FROM trades").get() as { c: number }).c, 2);
+  assert.equal((reopened.db.prepare("SELECT engine FROM trades WHERE trade_id='legacy-scalp'").get() as { engine: string }).engine, "SCALP_5M");
+  reopened.close();
 });
 
 test("fills preserve partial executions and store reopening is idempotent", () => {
@@ -307,7 +347,7 @@ test("weights evolve bounded (±10%) after interval (§31)", () => {
   const st = openStore(tmpRoot());
   const insert = st.db.prepare(`INSERT INTO trades(trade_id,status,instrument,timeframe,side,strategy,strategy_version,regime,contracts,result_r,entry_features,exit_ts)
     VALUES(?, 'CLOSED','BTC-USDT-SWAP','15m','LONG','TREND_FOLLOWING',1,'TRENDING_BULLISH','0.01', ?, ?, '2026-10-01T00:00:00Z')`);
-  for (let i = 0; i < 21; i++) {
+  for (let i = 0; i < 31; i++) {
     insert.run(`T${i}`, i % 2, JSON.stringify(feat({ emaSpreadPct: 0.6, volumeRatio: 1.4 })));
   }
   const before = getWeights(st);

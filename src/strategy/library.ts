@@ -81,7 +81,7 @@ export function saveStrategy(store: Store, s: StrategyDef, parent?: number, hypo
     .prepare(
       `INSERT INTO strategy_versions(name,version,parent_version,params,status,created_ts,hypothesis)
        VALUES(?,?,?,?,?,?,?)
-       ON CONFLICT(name,version) DO UPDATE SET params=excluded.params, status=excluded.status`,
+       ON CONFLICT(name,version) DO NOTHING`,
     )
     .run(s.name, s.version, parent ?? null, JSON.stringify(s.params), s.status, new Date().toISOString(), hypothesis ?? null);
 }

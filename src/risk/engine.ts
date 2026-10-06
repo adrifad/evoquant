@@ -45,6 +45,8 @@ export type RiskRejectCode =
   | "MAX_DAILY_LOSS_REACHED"
   | "MAX_DRAWDOWN_REACHED"
   | "INVALID_STOP_DISTANCE"
+  | "BOT_NOT_RUNNING"
+  | "INSTRUMENT_ALREADY_OCCUPIED"
   | "APPROVED";
 
 export function evaluateEntry(

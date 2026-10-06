@@ -9,7 +9,8 @@
 import type { OkxClient } from "../exchange/okx/client.ts";
 import type { InstrumentInfo } from "../exchange/okx/types.ts";
 import { getCandles } from "../exchange/okx/market.ts";
-import { getPositions } from "../exchange/okx/account.ts";
+import { getBalance, getPositions } from "../exchange/okx/account.ts";
+import { getServerTime } from "../exchange/okx/market.ts";
 import { placeOrder, waitForOrderTerminal, getFills } from "../exchange/okx/orders.ts";
 import { placeConditionalProtection } from "../exchange/okx/algo.ts";
 import { updateTradeStopPlus } from "../execution/position-management.ts";
@@ -31,8 +32,11 @@ import {
 } from "./signals.ts";
 import { sizePosition } from "../risk/position-sizing.ts";
 import type { Regime } from "../market/regime.ts";
-import { isEmergencyHalted } from "../core/state.ts";
+import { baseline, getBotState, isEmergencyHalted } from "../core/state.ts";
+import { evaluateKillSwitch } from "../risk/limits.ts";
+import { evaluateGlobalEntryGate } from "../risk/global-entry-gate.ts";
 import type { Position } from "../exchange/okx/types.ts";
+import { isTradeOwnedBy } from "../memory/engines.ts";
 
 const log = createLogger("scalp");
 const TF_TAG = "scalp";
@@ -60,6 +64,7 @@ export class ScalpRunner {
   private lastExit: Record<string, number> = {};
   private ticking = false;
   private stopped = false;
+  private consecutiveOrderFailures = 0;
 
   readonly d: ScalpDeps;
   constructor(d: ScalpDeps) {
@@ -182,14 +187,41 @@ export class ScalpRunner {
   private async openScalp(sig: ScalpSignal, features: FeatureSnapshot): Promise<void> {
     const { client, store, cfg, risk, instruments } = this.d;
     const meta = instruments[sig.instrument]!;
-    this.inFlight.add(sig.instrument);
     try {
-      const usdt = (await getPositions(client)); // refresh equity via balance
-      const { getBalance } = await import("../exchange/okx/account.ts");
+      const usdt = (await getPositions(client)).filter((p) => p.pos !== "0");
       const bal = await getBalance(client);
       const u = bal.details.find((x) => x.ccy === "USDT");
       const equity = u ? Number(u.eq) || Number(u.availEq) || 0 : 0;
-      if (usdt.length >= risk.hard_limits.max_concurrent_positions) return;
+      const localOpen = getOpenTrades(store) as Array<Record<string, unknown>>;
+      const base = baseline(store, equity);
+      const localKeys = new Set(localOpen.map((t) => `${String(t.instrument)}:${String(t.side).toLowerCase()}`));
+      const exchangeKeys = new Set(usdt.map((p) => `${p.instId}:${p.posSide}`));
+      const positionMismatch = [...localKeys].some((key) => !exchangeKeys.has(key)) ||
+        [...exchangeKeys].some((key) => !localKeys.has(key));
+      const kill = evaluateKillSwitch({
+        apiOk: true,
+        positionMismatch,
+        orderFailuresRecent: this.consecutiveOrderFailures,
+        clockDriftMs: Date.now() - await getServerTime(client),
+        dbOk: true,
+        instrumentMetaOk: Number(meta.ctVal) > 0,
+        unexpectedPosition: usdt.length > risk.hard_limits.max_concurrent_positions,
+        dailyLossPct: base.dayStartEquity > 0 ? ((base.dayStartEquity - equity) / base.dayStartEquity) * 100 : 0,
+        drawdownPct: base.peakEquity > 0 ? ((base.peakEquity - equity) / base.peakEquity) * 100 : 0,
+      }, risk, store);
+      const gate = evaluateGlobalEntryGate({
+        killSwitchActive: kill,
+        botState: getBotState(store),
+        openPositions: usdt.length,
+        instrument: sig.instrument,
+        instrumentOccupied: usdt.some((p) => p.instId === sig.instrument) ||
+          localOpen.some((t) => String(t.instrument) === sig.instrument),
+      }, risk);
+      if (!gate.allowed) {
+        log.info({ event: "scalp_global_risk_reject", inst: sig.instrument, reason: gate.reason });
+        return;
+      }
+      this.inFlight.add(sig.instrument);
       const side = sig.direction === 1 ? "LONG" : "SHORT";
       let sz;
       try {
@@ -199,27 +231,69 @@ export class ScalpRunner {
       } catch (e) {
         log.info({ event: "scalp_sizing_reject", inst: sig.instrument, error: e instanceof Error ? e.message.slice(0, 80) : "" }); return;
       }
+      // Re-read global risk immediately before the exchange write; bot pause,
+      // emergency stop, loss limits, or an external position may have changed.
+      const finalPositions = (await getPositions(client)).filter((p) => p.pos !== "0");
+      const finalBal = await getBalance(client);
+      const finalEquityRow = finalBal.details.find((x) => x.ccy === "USDT");
+      const finalEquity = finalEquityRow ? Number(finalEquityRow.eq) || Number(finalEquityRow.availEq) || 0 : 0;
+      const finalBase = baseline(store, finalEquity);
+      const finalLocal = getOpenTrades(store) as Array<Record<string, unknown>>;
+      const finalLocalKeys = new Set(finalLocal.map((t) => `${String(t.instrument)}:${String(t.side).toLowerCase()}`));
+      const finalExchangeKeys = new Set(finalPositions.map((p) => `${p.instId}:${p.posSide}`));
+      const finalKill = evaluateKillSwitch({
+        apiOk: true,
+        positionMismatch: [...finalLocalKeys].some((k) => !finalExchangeKeys.has(k)) || [...finalExchangeKeys].some((k) => !finalLocalKeys.has(k)),
+        orderFailuresRecent: this.consecutiveOrderFailures,
+        clockDriftMs: Date.now() - await getServerTime(client), dbOk: true, instrumentMetaOk: Number(meta.ctVal) > 0,
+        unexpectedPosition: finalPositions.length > risk.hard_limits.max_concurrent_positions,
+        dailyLossPct: finalBase.dayStartEquity > 0 ? ((finalBase.dayStartEquity - finalEquity) / finalBase.dayStartEquity) * 100 : 0,
+        drawdownPct: finalBase.peakEquity > 0 ? ((finalBase.peakEquity - finalEquity) / finalBase.peakEquity) * 100 : 0,
+      }, risk, store);
+      const finalGate = evaluateGlobalEntryGate({
+        killSwitchActive: finalKill, botState: getBotState(store), openPositions: finalPositions.length,
+        instrument: sig.instrument, instrumentOccupied: finalPositions.some((p) => p.instId === sig.instrument) ||
+          finalLocal.some((t) => String(t.instrument) === sig.instrument),
+      }, risk);
+      if (!finalGate.allowed) {
+        log.info({ event: "scalp_global_risk_reject", inst: sig.instrument, reason: finalGate.reason, stage: "pre_order" });
+        return;
+      }
+      try {
+        sz = sizePosition({ equity: finalEquity, entryPrice: sig.price, stopPrice: sig.stopPx,
+          leverage: this.d.trading.leverage.default, instrument: meta }, risk,
+        { mode: "percent_of_equity", position_pct: cfg.position_pct });
+      } catch (e) {
+        log.info({ event: "scalp_sizing_reject", inst: sig.instrument, stage: "pre_order", error: e instanceof Error ? e.message.slice(0, 80) : "" }); return;
+      }
       const clOpen = clId(side, "OPEN", sig.instrument);
       const placed = await placeOrder(client, {
         instId: sig.instrument, tdMode: "isolated", side: side === "LONG" ? "buy" : "sell",
         posSide: side.toLowerCase() as "long" | "short", ordType: "market", sz: sz.contracts, clOrdId: clOpen,
       });
+      this.consecutiveOrderFailures = 0;
       const filled = await waitForOrderTerminal(client, sig.instrument, placed.ordId, { timeoutMs: 20_000 });
       if (filled.state !== "filled") throw new Error(`scalp entry not filled: ${filled.state}`);
       const entryPx = Number(filled.avgPx) || sig.price;
       const stopPx = side === "LONG" ? entryPx - (sig.price - sig.stopPx) : entryPx + (sig.stopPx - sig.price);
       const tpPx = side === "LONG" ? entryPx + (sig.tpPx - sig.price) : entryPx - (sig.tpPx - sig.price);
       const tradeId = `SCP-${String(Date.now()).slice(-8)}`;
+      const decisionId = nextDecisionId();
+      recordDecision(store, { decisionId, ts: new Date().toISOString(),
+        instrument: sig.instrument, decision: side, strategy: "SCALP_V1", regime: sig.regime,
+        rawConfidence: sig.score, calibratedConfidence: sig.score,
+        thesis: [sig.reason.slice(0, 280)], riskVerdict: { approved: true, reason: `scalp ${this.stance}` } });
       const algo = await placeConditionalProtection(client, {
         instId: sig.instrument, posSide: side === "LONG" ? "long" : "short",
         contracts: sz.contracts, stopPrice: stopPx, takeProfitPrice: tpPx,
         clAlgoId: clId(side, "ALGO", sig.instrument),
       });
       openTrade(store, {
-        tradeId, instrument: sig.instrument, timeframe: TF_TAG, side,
+        tradeId, engine: "SCALP_5M", instrument: sig.instrument, timeframe: TF_TAG, side,
         strategy: "SCALP", strategyVersion: 1, regime: sig.regime, contracts: sz.contracts,
         entryPx, entryTs: new Date().toISOString(), stopPx, takeProfitPx: tpPx,
         clOpenId: clOpen, ordOpenId: placed.ordId,
+        decisionId,
         rawConfidence: sig.score, calibratedConfidence: sig.score,
         plannedRiskPct: cfg.position_pct, leverage: this.d.trading.leverage.default, entryFeatures: features,
       });
@@ -227,13 +301,10 @@ export class ScalpRunner {
       const fills = await getFills(client, sig.instrument, placed.ordId).catch(() => []);
       logSystemEvent(store, "TRADE_OPEN", { tradeId, instId: sig.instrument, side, scalpr: true,
         notional: Math.round(sz.notionalUsdt * 100) / 100 });
-      recordDecision(store, { decisionId: nextDecisionId(), ts: new Date().toISOString(),
-        instrument: sig.instrument, decision: side, strategy: "SCALP", regime: sig.regime,
-        rawConfidence: sig.score, calibratedConfidence: sig.score,
-        thesis: [sig.reason.slice(0, 280)], riskVerdict: { approved: true, reason: `scalp ${this.stance}` } });
       log.info({ event: "scalp_open", tradeId, inst: sig.instrument, side, ct: sz.contracts,
         notional: Math.round(sz.notionalUsdt * 100) / 100, fills: fills.length });
     } catch (e) {
+      this.consecutiveOrderFailures++;
       log.error({ event: "scalp_open_failed", inst: sig.instrument, error: e instanceof Error ? e.message.slice(0, 140) : String(e) });
     } finally { this.inFlight.delete(sig.instrument); }
   }
@@ -244,7 +315,7 @@ export class ScalpRunner {
     try {
       if (isEmergencyHalted(this.d.store)) return;
       const scalps = (getOpenTrades(this.d.store) as Array<Record<string, unknown>>)
-        .filter((t) => String(t.timeframe) === TF_TAG);
+        .filter((t) => isTradeOwnedBy(t, "SCALP_5M"));
       if (scalps.length === 0) return;
       const poss = (await getPositions(this.d.client)).filter((p) => p.pos !== "0");
       const nowS = Math.floor(Date.now() / 1000);

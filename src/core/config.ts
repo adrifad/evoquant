@@ -76,6 +76,7 @@ const TradingSchema = z.object({
     }).default({ enabled: true, activation_r: 1, lock_in_r: 0.05, min_profit_buffer_pct: 0.12 }),
   }).default({ sl_plus: { enabled: true, activation_r: 1, lock_in_r: 0.05, min_profit_buffer_pct: 0.12 } }),
   strategies_enabled: z.array(z.string()).min(1),
+  validation: z.object({ baseline_mode: z.boolean().default(false) }).default({ baseline_mode: false }),
 });
 
 const RiskSchema = z.object({

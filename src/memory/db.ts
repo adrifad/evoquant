@@ -27,6 +27,8 @@ CREATE TABLE IF NOT EXISTS market_snapshots (
 );
 CREATE TABLE IF NOT EXISTS trades (
   trade_id TEXT PRIMARY KEY,
+  engine TEXT NOT NULL DEFAULT 'SWING_15M', -- SWING_15M | SCALP_5M; legacy rows backfilled below
+  result_r_basis TEXT NOT NULL DEFAULT 'NET',
   status TEXT NOT NULL,            -- OPEN | CLOSED
   instrument TEXT NOT NULL,
   timeframe TEXT NOT NULL,
@@ -34,6 +36,7 @@ CREATE TABLE IF NOT EXISTS trades (
   strategy TEXT NOT NULL,
   strategy_version INTEGER NOT NULL,
   regime TEXT NOT NULL,
+  regime_axes TEXT,
   contracts TEXT NOT NULL,
   entry_px REAL, entry_ts TEXT,
   stop_px REAL, initial_stop_px REAL, take_profit_px REAL,
@@ -45,8 +48,9 @@ CREATE TABLE IF NOT EXISTS trades (
   pnl REAL, pnl_pct REAL, result_r REAL,
   mfe REAL, mae REAL, duration_s INTEGER,
   raw_confidence REAL, calibrated_confidence REAL,
-  planned_risk_pct REAL, leverage REAL,
+  planned_risk_pct REAL, leverage REAL, max_hold_bars INTEGER,
   entry_features TEXT,             -- JSON snapshot at entry (§26)
+  entry_conditions TEXT,
   decision_id TEXT REFERENCES decisions(decision_id),
   algo_id TEXT,                    -- §16 Layer A conditional order id
   fees_paid REAL DEFAULT 0         -- §27 accumulated fill fees
@@ -63,6 +67,7 @@ CREATE TABLE IF NOT EXISTS lessons (
   statement TEXT NOT NULL,
   status TEXT NOT NULL,            -- §29 states
   scope_strategy TEXT, scope_instrument TEXT, scope_regime TEXT,
+  scope_engine TEXT, scope_strategy_version INTEGER, scope_direction TEXT, scope_regime_axes TEXT,
   confidence REAL,
   observations INTEGER, wins INTEGER, losses INTEGER, expectancy_r REAL,
   created_ts TEXT, updated_ts TEXT,
@@ -150,11 +155,27 @@ export function openStore(root: string): Store {
   db.exec(SCHEMA);
   // lightweight column migration for pre-existing DBs
   const cols = new Set((db.prepare("PRAGMA table_info(trades)").all() as Array<{ name: string }>).map((c) => c.name));
+  const hadEngine = cols.has("engine");
+  if (!hadEngine) db.exec("ALTER TABLE trades ADD COLUMN engine TEXT NOT NULL DEFAULT 'SWING_15M'");
+  if (!cols.has("result_r_basis")) db.exec("ALTER TABLE trades ADD COLUMN result_r_basis TEXT NOT NULL DEFAULT 'LEGACY_GROSS'");
   if (!cols.has("algo_id")) db.exec("ALTER TABLE trades ADD COLUMN algo_id TEXT");
   if (!cols.has("fees_paid")) db.exec("ALTER TABLE trades ADD COLUMN fees_paid REAL DEFAULT 0");
   if (!cols.has("decision_id")) db.exec("ALTER TABLE trades ADD COLUMN decision_id TEXT");
   if (!cols.has("initial_stop_px")) db.exec("ALTER TABLE trades ADD COLUMN initial_stop_px REAL");
+  if (!cols.has("max_hold_bars")) db.exec("ALTER TABLE trades ADD COLUMN max_hold_bars INTEGER");
+  if (!cols.has("regime_axes")) db.exec("ALTER TABLE trades ADD COLUMN regime_axes TEXT");
+  if (!cols.has("entry_conditions")) db.exec("ALTER TABLE trades ADD COLUMN entry_conditions TEXT");
+  db.exec(`UPDATE trades SET engine=CASE WHEN lower(timeframe)='scalp' THEN 'SCALP_5M' ELSE 'SWING_15M' END
+    WHERE ${hadEngine ? "engine IS NULL OR engine NOT IN ('SWING_15M','SCALP_5M')" : "1=1"}`);
+  db.exec("CREATE INDEX IF NOT EXISTS idx_trades_learning_scope ON trades(engine,status,strategy,strategy_version,instrument,regime,side)");
   db.exec("UPDATE trades SET initial_stop_px=stop_px WHERE initial_stop_px IS NULL AND stop_px IS NOT NULL");
+  const lessonCols = new Set((db.prepare("PRAGMA table_info(lessons)").all() as Array<{ name: string }>).map((c) => c.name));
+  if (!lessonCols.has("scope_engine")) db.exec("ALTER TABLE lessons ADD COLUMN scope_engine TEXT");
+  if (!lessonCols.has("scope_strategy_version")) db.exec("ALTER TABLE lessons ADD COLUMN scope_strategy_version INTEGER");
+  if (!lessonCols.has("scope_direction")) db.exec("ALTER TABLE lessons ADD COLUMN scope_direction TEXT");
+  if (!lessonCols.has("scope_regime_axes")) db.exec("ALTER TABLE lessons ADD COLUMN scope_regime_axes TEXT");
+  // Legacy lesson scope cannot reliably distinguish pre-isolation swing vs
+  // scalp evidence. Keep it preserved but unassigned; consumers exclude NULL.
   migrateFills(db);
   migrateMarketSnapshots(db);
   return {

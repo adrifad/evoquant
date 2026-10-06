@@ -22,6 +22,7 @@ import { logSystemEvent } from "../memory/db.ts";
 import { nextDecisionId, openTrade, recordDecision, computeClosedMetrics, closeTrade, getOpenTrades } from "../memory/trades.ts";
 import { evaluateEntry } from "../risk/engine.ts";
 import { evaluateKillSwitch } from "../risk/limits.ts";
+import { evaluateGlobalEntryGate } from "../risk/global-entry-gate.ts";
 import { sizePosition, stopPriceFor, takeProfitPriceFor } from "../risk/position-sizing.ts";
 import { baseline, getBotState, setBotState, setEmergencyHalted } from "../core/state.ts";
 import type { FeatureSnapshot } from "../market/features.ts";
@@ -33,7 +34,11 @@ import { maybeEvolveWeights } from "../learning/signal-weights.ts";
 import { recomputeCalibration } from "../learning/confidence.ts";
 import type { Decision } from "../agents/decision-agent.ts";
 import type { StrategyDef } from "../strategy/library.ts";
+import type { TradeCandidate } from "../strategy/core-v2.ts";
+import type { CandidateGate } from "../agents/decision-agent.ts";
 import { serializeTradeMutation } from "./trade-mutation.ts";
+import { msForBar } from "../core/scheduler.ts";
+import { isTradeOwnedBy } from "../memory/engines.ts";
 
 const log = createLogger("executor");
 
@@ -223,6 +228,8 @@ export interface TickContext {
   regime: Regime;
   strategies: StrategyDef[];
   decideFn: (f: FeatureSnapshot, regime: Regime, hasPosition: boolean) => Promise<Decision>;
+  candidate?: TradeCandidate;
+  gateCandidateFn?: (candidate: TradeCandidate) => Promise<CandidateGate | null>;
   reviewFn: (tradeId: string) => Promise<void>;
   evolveFns: { weights: () => Promise<void> | void; calibration: () => void; strategies: () => Promise<void> | void; promote: () => void };
 }
@@ -251,6 +258,7 @@ export async function runTick(d: ExecutorDeps, ctx: TickContext, symbol: TickSym
   const possAll = (await getPositions(client)).filter((p) => p.pos !== "0");
   const possSym = possAll.filter((p) => p.instId === instId);
   const localOpenSym = (getOpenTrades(store) as Array<Record<string, unknown>>).filter((t) => String(t.instrument) === instId);
+  const swingOpenSym = localOpenSym.filter((t) => isTradeOwnedBy(t, "SWING_15M"));
   const kill = evaluateKillSwitch(
     {
       apiOk: true, positionMismatch: localOpenSym.length > 0 && possSym.length === 0, orderFailuresRecent: consecutiveOrderFailures,
@@ -275,12 +283,17 @@ export async function runTick(d: ExecutorDeps, ctx: TickContext, symbol: TickSym
     }
   }
 
-  // monitor open positions on THIS symbol (deterministic SL/TP + AI CLOSE)
-  if (possSym.length > 0 && localOpenSym.length > 0) {
-    const t = localOpenSym[0]!;
+  // Monitor only swing-owned positions; baseline V2 additionally uses a deterministic time stop.
+  if (possSym.length > 0 && swingOpenSym.length > 0) {
+    const t = swingOpenSym[0]!;
     const pos = possSym[0]!;
     const mark = Number(pos.markPx);
-    let reason: "SL" | "TP" | "AI_CLOSE" | null = priceTrigger(t, mark);
+    let reason: "SL" | "TP" | "AI_CLOSE" | "TIME_STOP" | null = priceTrigger(t, mark);
+    const maxHoldBars = Number(t.max_hold_bars ?? 0);
+    if (!reason && maxHoldBars > 0) {
+      const ageBars = Math.floor((Date.now() - Date.parse(String(t.entry_ts))) / msForBar(trading.timeframe));
+      if (ageBars >= maxHoldBars) reason = "TIME_STOP";
+    }
     if (!reason) {
       const dec = await ctx.decideFn(ctx.features, ctx.regime, true);
       if (dec.decision === "CLOSE") reason = "AI_CLOSE";
@@ -297,19 +310,38 @@ export async function runTick(d: ExecutorDeps, ctx: TickContext, symbol: TickSym
 
   // §23 NO NEW ENTRIES when: kill active, global cap reached (max_concurrent),
   // or THIS symbol already holds a position (one position per symbol — V1 rule).
-  if (kill || possAll.length >= risk.hard_limits.max_concurrent_positions || localOpenSym.length > 0) return { kill };
-  if (getBotState(store) !== "RUNNING") { log.info({ event: "tick:skipped", state: getBotState(store) }); return { kill }; }
+  const globalGate = evaluateGlobalEntryGate({
+    killSwitchActive: kill, botState: getBotState(store), openPositions: possAll.length,
+    instrument: instId, instrumentOccupied: localOpenSym.length > 0 || possSym.length > 0,
+  }, risk);
+  if (!globalGate.allowed) {
+    log.info({ event: "entry_global_gate_deny", instId, engine: "SWING_15M", reason: globalGate.reason });
+    return { kill };
+  }
 
   const f = ctx.features;
   const hasPosition = false;
-  const decision = await ctx.decideFn(f, ctx.regime, hasPosition);
+  const gate = ctx.candidate ? await ctx.gateCandidateFn?.(ctx.candidate) : null;
+  const candidateAllowed = !ctx.candidate || gate?.verdict === "ALLOW";
+  const decision: Decision = ctx.candidate
+    ? {
+      decision: candidateAllowed ? ctx.candidate.side : "HOLD",
+      strategy: ctx.candidate.strategy,
+      confidence: candidateAllowed ? gate?.confidence ?? 0 : 0,
+      thesis: candidateAllowed ? gate?.reasoning ?? ctx.candidate.reasoning : ["candidate gate denied or unavailable", ...(gate?.risk_flags ?? [])],
+      invalidations: gate?.risk_flags ?? [],
+      suggested_stop_atr: ctx.candidate.stopAtr,
+      suggested_take_profit_atr: ctx.candidate.stopAtr * ctx.candidate.targetR,
+    }
+    : await ctx.decideFn(f, ctx.regime, hasPosition);
   const calConf = calibrate(store, decision.confidence, 30);
   const sid = decision.strategy ?? "";
   const verdict = evaluateEntry(
     {
       action: decision.decision, strategy: decision.strategy ?? undefined, confidence: calConf,
       regime: ctx.regime, instrument: instId,
-      stopDistancePct: Number.isFinite(f.atr14) && f.price ? (decision.suggested_stop_atr * f.atr14) / f.price : undefined,
+      stopDistancePct: ctx.candidate ? Math.abs(ctx.candidate.entryPrice - ctx.candidate.stopPrice) / ctx.candidate.entryPrice
+        : Number.isFinite(f.atr14) && f.price ? (decision.suggested_stop_atr * f.atr14) / f.price : undefined,
     },
     {
       equity: eq, dayStartEquity: base.dayStartEquity, peakEquity: base.peakEquity,
@@ -319,7 +351,7 @@ export async function runTick(d: ExecutorDeps, ctx: TickContext, symbol: TickSym
   );
   const decisionId = nextDecisionId();
   recordDecision(store, {
-    decisionId: nextDecisionId(), ts: new Date().toISOString(), instrument: instId,
+    decisionId, ts: new Date().toISOString(), instrument: instId,
     decision: decision.decision, strategy: decision.strategy ?? undefined, regime: ctx.regime,
     rawConfidence: decision.confidence, calibratedConfidence: calConf,
     thesis: decision.thesis, riskVerdict: verdict,
@@ -328,14 +360,21 @@ export async function runTick(d: ExecutorDeps, ctx: TickContext, symbol: TickSym
   // even during long HOLD streaks (system_events otherwise only trade/risk)
   logSystemEvent(store, "DECISION", { inst: instId, d: decision.decision, conf: calConf,
     rej: verdict.approved ? "ok" : verdict.reason });
+  if (!verdict.approved) logSystemEvent(store, "RISK_REJECT", { engine: "SWING_15M", instrument: instId, reason: verdict.reason, checks: verdict.checks });
+  if (ctx.candidate) logSystemEvent(store, `LLM_GATE_${candidateAllowed ? "ALLOW" : "DENY"}`, {
+    instrument: instId, strategy: ctx.candidate.strategy, side: ctx.candidate.side,
+    setupScore: ctx.candidate.setupScore, reasoning: gate?.reasoning ?? [], riskFlags: gate?.risk_flags ?? [],
+  });
   log.info({ event: "decision", instId, action: decision.decision, strategy: decision.strategy, raw: decision.confidence, calibrated: calConf, approved: verdict.approved, reason: verdict.reason });
 
   if (!verdict.approved || decision.decision === "HOLD") return { kill };
 
   // §24 sizing from strategy params
-  const strat = ctx.strategies.find((s) => `${s.name}_V${s.version}` === sid) ?? ctx.strategies[0]!;
+  const strat = ctx.candidate
+    ? { name: ctx.candidate.strategy.replace(/_V2$/, ""), version: 2 }
+    : ctx.strategies.find((s) => `${s.name}_V${s.version}` === sid) ?? ctx.strategies[0]!;
   const side = decision.decision as "LONG" | "SHORT";
-  const stopPx = stopPriceFor(f.price, f.atr14, decision.suggested_stop_atr, side);
+  const stopPx = ctx.candidate ? ctx.candidate.stopPrice : stopPriceFor(f.price, f.atr14, decision.suggested_stop_atr, side);
   let sz;
   try {
     sz = sizePosition(
@@ -349,10 +388,42 @@ export async function runTick(d: ExecutorDeps, ctx: TickContext, symbol: TickSym
   }
   // RACE GUARD: decision took ~60-90s; re-check slots before placing (§23)
   const freshPoss = (await getPositions(client)).filter((p) => p.pos !== "0");
+  const freshBal = await getBalance(client);
+  const freshEq = usdtEquity(freshBal);
+  const freshBase = baseline(store, freshEq);
   const freshLocal = (getOpenTrades(store) as Array<Record<string, unknown>>);
-  if (freshPoss.length >= risk.hard_limits.max_concurrent_positions ||
-      freshLocal.some((x) => String(x.instrument) === instId && String(x.status) === "OPEN")) {
-    logSystemEvent(store, "RISK_EVENT", { race_guard: "entry skipped — slot/symbol taken during LLM", instId });
+  const freshKeys = new Set(freshPoss.map((p) => `${p.instId}:${p.posSide}`));
+  const localKeys = new Set(freshLocal.filter((x) => String(x.status) === "OPEN")
+    .map((x) => `${String(x.instrument)}:${String(x.side).toLowerCase()}`));
+  const freshKill = evaluateKillSwitch({
+    apiOk: true, positionMismatch: [...freshKeys].some((k) => !localKeys.has(k)) || [...localKeys].some((k) => !freshKeys.has(k)),
+    orderFailuresRecent: consecutiveOrderFailures, clockDriftMs: Date.now() - await getServerTime(client), dbOk: true,
+    instrumentMetaOk: Number(meta.ctVal) > 0, unexpectedPosition: freshPoss.length > risk.hard_limits.max_concurrent_positions,
+    dailyLossPct: freshBase.dayStartEquity > 0 ? ((freshBase.dayStartEquity - freshEq) / freshBase.dayStartEquity) * 100 : 0,
+    drawdownPct: freshBase.peakEquity > 0 ? ((freshBase.peakEquity - freshEq) / freshBase.peakEquity) * 100 : 0,
+  }, risk, store);
+  const freshGate = evaluateGlobalEntryGate({
+    killSwitchActive: freshKill, botState: getBotState(store), openPositions: freshPoss.length,
+    instrument: instId, instrumentOccupied: freshPoss.some((p) => p.instId === instId) || localKeys.size > 0 && [...localKeys].some((k) => k.startsWith(`${instId}:`)),
+  }, risk);
+  const freshRisk = evaluateEntry({
+    action: decision.decision, strategy: decision.strategy ?? undefined, confidence: calConf,
+    regime: ctx.regime, instrument: instId,
+    stopDistancePct: ctx.candidate ? Math.abs(ctx.candidate.entryPrice - ctx.candidate.stopPrice) / ctx.candidate.entryPrice
+      : Number.isFinite(f.atr14) && f.price ? (decision.suggested_stop_atr * f.atr14) / f.price : undefined,
+  }, { equity: freshEq, dayStartEquity: freshBase.dayStartEquity, peakEquity: freshBase.peakEquity,
+    openPositions: freshPoss.length, killSwitchActive: freshKill }, trading, risk);
+  if (!freshGate.allowed || !freshRisk.approved) {
+    logSystemEvent(store, "RISK_EVENT", { race_guard: "entry skipped after refreshed global risk check", instId,
+      reason: freshGate.allowed ? freshRisk.reason : freshGate.reason });
+    return { kill };
+  }
+  // Re-size from refreshed equity so a concurrent account loss cannot leave a stale oversized order.
+  try {
+    sz = sizePosition({ equity: freshEq, entryPrice: f.price, stopPrice: stopPx,
+      leverage: trading.leverage.default, instrument: meta }, risk, trading.sizing);
+  } catch (szErr) {
+    logSystemEvent(store, "RISK_EVENT", { sizing_rejected_after_refresh: szErr instanceof Error ? szErr.message : String(szErr), instId });
     return { kill };
   }
   const clOpen = clId(side, "OPEN", instId);
@@ -371,16 +442,23 @@ export async function runTick(d: ExecutorDeps, ctx: TickContext, symbol: TickSym
     const entryPx = Number(filled.avgPx) || f.price;
     const tradeId = nextTradeId();
     openTrade(store, {
-      tradeId, instrument: instId, timeframe: trading.timeframe, side,
+      tradeId, engine: "SWING_15M", instrument: instId, timeframe: trading.timeframe, side,
       strategy: strat.name, strategyVersion: strat.version, regime: ctx.regime,
+      ...(ctx.candidate ? { regimeAxes: ctx.candidate.regime } : {}),
+      ...(ctx.candidate ? { entryConditions: ctx.candidate.conditions } : {}),
       contracts: sz.contracts, entryPx, entryTs: new Date().toISOString(),
-      stopPx: stopPriceFor(entryPx, f.atr14, decision.suggested_stop_atr, side),
-      takeProfitPx: takeProfitPriceFor(entryPx, f.atr14, decision.suggested_take_profit_atr, side),
+      stopPx: ctx.candidate
+        ? entryPx + (side === "LONG" ? -1 : 1) * Math.abs(ctx.candidate.entryPrice - ctx.candidate.stopPrice)
+        : stopPriceFor(entryPx, f.atr14, decision.suggested_stop_atr, side),
+      takeProfitPx: ctx.candidate
+        ? entryPx + (side === "LONG" ? 1 : -1) * Math.abs(ctx.candidate.entryPrice - ctx.candidate.stopPrice) * ctx.candidate.targetR
+        : takeProfitPriceFor(entryPx, f.atr14, decision.suggested_take_profit_atr, side),
       clOpenId: clOpen, ordOpenId: placed.ordId,
       decisionId,
       rawConfidence: decision.confidence, calibratedConfidence: calConf,
       plannedRiskPct: trading.sizing.mode === "percent_of_equity" ? trading.sizing.position_pct : risk.hard_limits.risk_per_trade_pct,
       leverage: trading.leverage.default,
+      ...(ctx.candidate ? { maxHoldBars: ctx.candidate.maxHoldBars } : {}),
       entryFeatures: f,
     });
     // §16 Layer A — exchange-native conditional (SL+TP) algo orders.
@@ -390,8 +468,12 @@ export async function runTick(d: ExecutorDeps, ctx: TickContext, symbol: TickSym
         instId,
         posSide: side === "LONG" ? "long" : "short",
         contracts: sz.contracts,
-        stopPrice: stopPriceFor(entryPx, f.atr14, decision.suggested_stop_atr, side),
-        takeProfitPrice: takeProfitPriceFor(entryPx, f.atr14, decision.suggested_take_profit_atr, side),
+        stopPrice: ctx.candidate
+          ? entryPx + (side === "LONG" ? -1 : 1) * Math.abs(ctx.candidate.entryPrice - ctx.candidate.stopPrice)
+          : stopPriceFor(entryPx, f.atr14, decision.suggested_stop_atr, side),
+        takeProfitPrice: ctx.candidate
+          ? entryPx + (side === "LONG" ? 1 : -1) * Math.abs(ctx.candidate.entryPrice - ctx.candidate.stopPrice) * ctx.candidate.targetR
+          : takeProfitPriceFor(entryPx, f.atr14, decision.suggested_take_profit_atr, side),
         clAlgoId: clId(side, "ALGO", instId),
       });
       store.db.prepare("UPDATE trades SET algo_id=? WHERE trade_id=?").run(algo.algoId, tradeId);

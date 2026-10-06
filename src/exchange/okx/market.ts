@@ -158,3 +158,27 @@ export async function getHistoryCandles(
   });
   return data.map(mapCandle);
 }
+
+/** Paginate historical bars backward without exceeding OKX's 300-row page cap. */
+export async function getHistoryCandlesPaged(
+  client: OkxClient, instId: string, bar: Bar, sinceTs: number,
+  options: { pageSize?: number; maxPages?: number; requestDelayMs?: number } = {},
+): Promise<Candle[]> {
+  const pageSize = Math.max(1, Math.min(300, Math.floor(options.pageSize ?? 300)));
+  const maxPages = Math.max(1, Math.floor(options.maxPages ?? 1000));
+  const delayMs = Math.max(0, options.requestDelayMs ?? 100);
+  let cursor: number | undefined;
+  let previousOldest = Number.POSITIVE_INFINITY;
+  const byTs = new Map<number, Candle>();
+  for (let page = 0; page < maxPages; page++) {
+    const batch = await getHistoryCandles(client, instId, bar, pageSize, cursor === undefined ? {} : { after: cursor });
+    if (batch.length === 0) break;
+    for (const c of batch) if (c.ts >= sinceTs) byTs.set(c.ts, c);
+    const oldest = Math.min(...batch.map((c) => c.ts));
+    if (!(oldest < previousOldest) || oldest <= sinceTs || batch.length < pageSize) break;
+    previousOldest = oldest;
+    cursor = oldest;
+    if (delayMs > 0) await new Promise<void>((resolve) => setTimeout(resolve, delayMs));
+  }
+  return [...byTs.values()].sort((a, b) => a.ts - b.ts);
+}

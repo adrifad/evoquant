@@ -8,6 +8,7 @@ import type { Store } from "../memory/db.ts";
 import { logSystemEvent } from "../memory/db.ts";
 import { BASE_STRATEGIES, loadStrategies, saveStrategy, type StrategyParams } from "../strategy/library.ts";
 import { regimeStats } from "../memory/regimes.ts";
+import type { TradingEngine } from "../memory/engines.ts";
 
 export const ProposalSchema = z.object({
   proposals: z.array(z.object({
@@ -48,14 +49,14 @@ export function validateProposal(
 
 export async function maybeEvolveStrategies(
   root: string, cfg: LlmConfig, store: Store,
-  interval: number, maxParamChanges: number, minSample: number,
+  interval: number, maxParamChanges: number, minSample: number, engine: TradingEngine = "SWING_15M",
 ): Promise<number> {
-  const closed = (store.db.prepare("SELECT COUNT(*) c FROM trades WHERE status='CLOSED'").get() as { c: number }).c;
+  const closed = (store.db.prepare("SELECT COUNT(*) c FROM trades WHERE status='CLOSED' AND result_r_basis='NET' AND engine=?").get(engine) as { c: number }).c;
   let lastRun = 0;
   for (const row of store.db.prepare("SELECT payload FROM system_events WHERE kind='EVOLUTION' ORDER BY id DESC LIMIT 20").all() as Array<{ payload: string }>) {
     try {
-      const p = JSON.parse(row.payload) as { tradesAtRun?: number };
-      if (typeof p.tradesAtRun === "number") { lastRun = p.tradesAtRun; break; }
+      const p = JSON.parse(row.payload) as { engine?: TradingEngine; tradesAtRun?: number };
+      if ((p.engine ?? "SWING_15M") === engine && typeof p.tradesAtRun === "number") { lastRun = p.tradesAtRun; break; }
     } catch { /* ignore malformed payload */ }
   }
   if (closed < Math.max(minSample, interval) || closed - lastRun < interval) return 0;
@@ -63,14 +64,14 @@ export async function maybeEvolveStrategies(
   const strategies = loadStrategies(store);
   const input = {
     champion_strategies: strategies.filter((s) => s.status === "CHAMPION").map((s) => ({ name: s.name, version: s.version, params: s.params })),
-    regime_stats: regimeStats(store),
-    lessons_verified: store.db.prepare("SELECT lesson_id,statement,scope_strategy,scope_regime,expectancy_r,observations FROM lessons WHERE status='VERIFIED'").all(),
-    closed_trades: closed,
+    regime_stats: regimeStats(store, engine),
+    lessons_verified: store.db.prepare("SELECT lesson_id,statement,scope_engine,scope_strategy,scope_strategy_version,scope_regime,scope_direction,expectancy_r,observations FROM lessons WHERE status='VERIFIED' AND scope_engine=?").all(engine),
+    engine, closed_trades: closed,
     constraints: { max_param_changes: maxParamChanges, minimum_validation_sample: minSample },
   };
   const out = await llmJson(cfg, prompt, JSON.stringify(input), ProposalSchema);
   store.db.prepare("INSERT INTO system_events(ts,kind,payload) VALUES(?,?,?)").run(
-    new Date().toISOString(), "EVOLUTION", JSON.stringify({ tradesAtRun: closed, proposals: out?.proposals?.length ?? 0 }));
+    new Date().toISOString(), "EVOLUTION", JSON.stringify({ engine, tradesAtRun: closed, proposals: out?.proposals?.length ?? 0 }));
   if (!out) return 0;
   let created = 0;
   for (const p of out.proposals) {

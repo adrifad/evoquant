@@ -1,8 +1,12 @@
 # Learning & evolution schedule — spec §3, §31, §34, §36, §48
 review_every_closed_trade: true
-signal_evolution_interval_trades: 10
-strategy_evolution_interval_trades: 15
-minimum_validation_sample: 30
+enabled: true
+signal_learning_enabled: true
+strategy_evolution_enabled: true
+automatic_promotion_enabled: true
+signal_evolution_interval_trades: 50
+strategy_evolution_interval_trades: 100
+minimum_validation_sample: 100
 
 constraints:
   max_weight_change_per_cycle_pct: 10      # §31
@@ -11,4 +15,6 @@ constraints:
   champion_vs_challenger:
     requires_out_of_sample: true
     requires_walk_forward: true
-    min_sample_each_side: 30
+    min_sample_each_side: 100
+    min_positive_symbols: 4
+    min_positive_walk_forward_folds: 2

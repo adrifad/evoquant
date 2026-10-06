@@ -31,6 +31,24 @@ export const DEFAULT_REGIME_PARAMS: RegimeParams = {
   atrPctLowVol: 0.25,
 };
 
+export interface RegimeAxes {
+  trend: "BULL_TREND" | "BEAR_TREND" | "RANGE" | "UNKNOWN";
+  volatility: "LOW" | "NORMAL" | "HIGH";
+}
+
+/** Directional structure and volatility are independent axes; a volatile trend stays directional. */
+export function classifyRegimeAxes(f: FeatureSnapshot, p: RegimeParams = DEFAULT_REGIME_PARAMS): RegimeAxes {
+  if (!f.sufficientData || !Number.isFinite(f.adx14) || !Number.isFinite(f.emaSpreadPct) || !Number.isFinite(f.atrPct)) {
+    return { trend: "UNKNOWN", volatility: "NORMAL" };
+  }
+  const trend = f.adx14 >= p.adxTrendMin && f.emaSpreadPct > p.emaSpreadSidewaysMax
+    ? "BULL_TREND"
+    : f.adx14 >= p.adxTrendMin && f.emaSpreadPct < -p.emaSpreadSidewaysMax
+      ? "BEAR_TREND" : "RANGE";
+  const volatility = f.atrPct >= p.atrPctHighVol ? "HIGH" : f.atrPct <= p.atrPctLowVol ? "LOW" : "NORMAL";
+  return { trend, volatility };
+}
+
 export function classifyRegime(f: FeatureSnapshot, p: RegimeParams = DEFAULT_REGIME_PARAMS): Regime {
   if (!f.sufficientData || Number.isNaN(f.adx14) || Number.isNaN(f.emaSpreadPct) || Number.isNaN(f.atrPct)) {
     return "UNKNOWN"; // §50: UNKNOWN → HOLD downstream

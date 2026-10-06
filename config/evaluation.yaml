@@ -1,0 +1,9 @@
+# Cached historical depth used for baseline/walk-forward evaluation.
+history_days: 180
+history_page_size: 300
+history_max_pages: 100
+costs:
+  entry_fee_pct: 0.05
+  exit_fee_pct: 0.05
+  slippage_bps_per_side: 1.5
+  spread_bps_per_side: 1.5
