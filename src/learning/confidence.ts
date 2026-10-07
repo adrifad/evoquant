@@ -12,19 +12,29 @@ export interface CalibrationTable {
 }
 
 function calibrationKey(engine: TradingEngine, scope: LearningScope = {}): string {
-  return `calibration:${engine}:${scope.strategy ?? "*"}:${scope.strategyVersion ?? "*"}:${scope.instrument ?? "*"}:${scope.regime ?? "*"}:${scope.side ?? "*"}`;
+  return `calibration:${engine}:core${scope.strategyCoreVersion ?? 1}:${scope.strategy ?? "*"}:${scope.strategyVersion ?? "*"}:${scope.instrument ?? "*"}:${scope.regime ?? "*"}:${scope.side ?? "*"}`;
 }
 function scopeArgs(scope: LearningScope = {}): Array<string | number | null> {
-  return [scope.strategy ?? null, scope.strategy ?? null, scope.strategyVersion ?? null, scope.strategyVersion ?? null,
+  return [scope.strategyCoreVersion ?? 1,
+    scope.strategy ?? null, scope.strategy ?? null, scope.strategyVersion ?? null, scope.strategyVersion ?? null,
     scope.instrument ?? null, scope.instrument ?? null, scope.regime ?? null, scope.regime ?? null, scope.side ?? null, scope.side ?? null];
 }
 
 export function calibrate(store: Store, rawConfidence: number, minSample = 30, engine: TradingEngine = "SWING_15M", scope: LearningScope = {}): number {
-  const raw = kvGet(store, calibrationKey(engine, scope)) ??
-    (engine === "SWING_15M" && Object.keys(scope).length === 0 ? kvGet(store, "calibration:SWING_15M") ?? kvGet(store, "calibration") : null);
-  if (!raw) return rawConfidence;
-  const table = JSON.parse(raw) as CalibrationTable;
-  if (table.sample < minSample) return rawConfidence; // not enough evidence → identity map
+  const scopes: LearningScope[] = [scope];
+  if (scope.strategyVersion !== undefined) scopes.push({
+    strategyCoreVersion: scope.strategyCoreVersion ?? 1,
+    ...(scope.strategy === undefined ? {} : { strategy: scope.strategy }),
+  });
+  if (scope.strategy !== undefined || scope.strategyVersion !== undefined) scopes.push({ strategyCoreVersion: scope.strategyCoreVersion ?? 1 });
+  let table: CalibrationTable | null = null;
+  for (const candidate of scopes) {
+    const raw = kvGet(store, calibrationKey(engine, candidate));
+    if (!raw) continue;
+    const parsed = JSON.parse(raw) as CalibrationTable;
+    if (parsed.sample >= minSample) { table = parsed; break; }
+  }
+  if (!table) return rawConfidence;
   for (const b of table.buckets) {
     if (rawConfidence >= b.lo && (rawConfidence < b.hi || (b.hi === 1 && rawConfidence === 1))) {
       return b.n >= 5 ? (rawConfidence + b.winRate) / 2 : rawConfidence; // identity for thin buckets
@@ -35,7 +45,7 @@ export function calibrate(store: Store, rawConfidence: number, minSample = 30, e
 
 export function recomputeCalibration(store: Store, engine: TradingEngine = "SWING_15M", scope: LearningScope = {}): CalibrationTable | null {
   const rows = store.db.prepare(
-    `SELECT raw_confidence AS c, result_r AS r FROM trades WHERE status='CLOSED' AND result_r_basis='NET' AND engine=? AND result_r IS NOT NULL AND raw_confidence IS NOT NULL
+    `SELECT raw_confidence AS c, result_r AS r FROM trades WHERE status='CLOSED' AND result_r_basis='NET' AND engine=? AND strategy_core_version=? AND result_r IS NOT NULL AND raw_confidence IS NOT NULL
       AND (? IS NULL OR strategy=?) AND (? IS NULL OR strategy_version=?)
       AND (? IS NULL OR instrument=?) AND (? IS NULL OR regime=?) AND (? IS NULL OR side=?)`,
   ).all(engine, ...scopeArgs(scope)) as Array<{ c: number; r: number }>;

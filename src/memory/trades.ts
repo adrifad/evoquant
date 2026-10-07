@@ -6,6 +6,7 @@ import type { FeatureSnapshot } from "../market/features.ts";
 import { inferTradingEngine, type TradingEngine } from "./engines.ts";
 import type { RegimeAxes } from "../market/regime.ts";
 import type { StrategyCondition } from "../strategy/core-v2.ts";
+import type { StrategyIdentity } from "../strategy/identity.ts";
 
 let decisionSeq = 0;
 export function nextDecisionId(): string {
@@ -41,6 +42,7 @@ export function openTrade(
   t: {
     tradeId: string; engine?: TradingEngine; instrument: string; timeframe: string; side: "LONG" | "SHORT";
     strategy: string; strategyVersion: number; regime: string; regimeAxes?: RegimeAxes; entryConditions?: StrategyCondition[]; contracts: string;
+    identity?: StrategyIdentity;
     entryPx: number; entryTs: string; stopPx: number; takeProfitPx: number;
     clOpenId: string; ordOpenId: string;
     decisionId?: string;
@@ -51,13 +53,14 @@ export function openTrade(
 ): void {
   store.db
     .prepare(
-      `INSERT INTO trades(trade_id,engine,status,instrument,timeframe,side,strategy,strategy_version,regime,regime_axes,contracts,
+      `INSERT INTO trades(trade_id,engine,status,instrument,timeframe,side,strategy,strategy_core_version,strategy_version,regime,regime_axes,contracts,
         entry_px,entry_ts,stop_px,initial_stop_px,take_profit_px,cl_open_id,ord_open_id,
         raw_confidence,calibrated_confidence,planned_risk_pct,leverage,max_hold_bars,entry_features,entry_conditions,decision_id)
-       VALUES(?,?, 'OPEN', ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+       VALUES(?,?, 'OPEN', ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
     )
     .run(
-      t.tradeId, t.engine ?? inferTradingEngine(t.timeframe), t.instrument, t.timeframe, t.side, t.strategy, t.strategyVersion, t.regime,
+      t.tradeId, t.engine ?? inferTradingEngine(t.timeframe), t.instrument, t.timeframe, t.side,
+      t.identity?.family ?? t.strategy, t.identity?.coreVersion ?? 1, t.identity?.strategyVersion ?? t.strategyVersion, t.regime,
       t.regimeAxes ? JSON.stringify(t.regimeAxes) : null, t.contracts,
       t.entryPx, t.entryTs, t.stopPx, t.stopPx, t.takeProfitPx, t.clOpenId, t.ordOpenId,
       t.rawConfidence, t.calibratedConfidence, t.plannedRiskPct, t.leverage, t.maxHoldBars ?? null, JSON.stringify(t.entryFeatures),

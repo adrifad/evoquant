@@ -16,7 +16,7 @@ import { sizePosition, stopPriceFor, takeProfitPriceFor } from "../src/risk/posi
 import { evaluateKillSwitch } from "../src/risk/limits.ts";
 import { openStore, kvSet, kvGet, persistMarketSnapshot } from "../src/memory/db.ts";
 import { recordDecision, openTrade, computeClosedMetrics, closeTrade } from "../src/memory/trades.ts";
-import { persistFills } from "../src/execution/executor.ts";
+import { persistFills, shouldUseAiPositionExit } from "../src/execution/executor.ts";
 import { upsertLesson, addLessonEvidence, recomputeLesson, getActiveLessons } from "../src/memory/lessons.ts";
 import { getWeights, maybeEvolveWeights } from "../src/learning/signal-weights.ts";
 import { calibrate, recomputeCalibration } from "../src/learning/confidence.ts";
@@ -293,16 +293,22 @@ test("engine migration preserves legacy trades and is idempotent", () => {
   legacy.close();
 
   const store = openStore(root);
-  const migrated = store.db.prepare("SELECT trade_id,engine,result_r_basis FROM trades ORDER BY trade_id").all();
+  const migrated = store.db.prepare("SELECT trade_id,engine,result_r_basis,strategy_core_version FROM trades ORDER BY trade_id").all();
   assert.deepEqual(migrated, [
-    { trade_id: "legacy-scalp", engine: "SCALP_5M", result_r_basis: "LEGACY_GROSS" },
-    { trade_id: "legacy-swing", engine: "SWING_15M", result_r_basis: "LEGACY_GROSS" },
+    { trade_id: "legacy-scalp", engine: "SCALP_5M", result_r_basis: "LEGACY_GROSS", strategy_core_version: 1 },
+    { trade_id: "legacy-swing", engine: "SWING_15M", result_r_basis: "LEGACY_GROSS", strategy_core_version: 1 },
   ]);
   store.close();
   const reopened = openStore(root);
   assert.equal((reopened.db.prepare("SELECT COUNT(*) c FROM trades").get() as { c: number }).c, 2);
   assert.equal((reopened.db.prepare("SELECT engine FROM trades WHERE trade_id='legacy-scalp'").get() as { engine: string }).engine, "SCALP_5M");
   reopened.close();
+});
+
+test("V2 position exits remain deterministic while legacy Core 1 can retain AI close policy", () => {
+  assert.equal(shouldUseAiPositionExit({ strategy_core_version: 2 }), false);
+  assert.equal(shouldUseAiPositionExit({ strategy_core_version: 1 }), true);
+  assert.equal(shouldUseAiPositionExit({}), true, "unmarked historical trades preserve legacy Core 1 semantics");
 });
 
 test("fills preserve partial executions and store reopening is idempotent", () => {

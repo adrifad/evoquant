@@ -72,9 +72,8 @@ export function backtest(def: StrategyDef, candlesChrono: Candle[], timeframe: s
   return { summary: summarize(rs), trades };
 }
 
-// M7 (§36) — walk-forward: K consecutive out-of-sample folds, each fit on the
-// preceding in-sample window; score = mean fold expectancy + stability.
-export function walkForward(def: StrategyDef, candles: Candle[], timeframe: string, folds = 4, costs: V2CostModel = DEFAULT_V2_COSTS): { foldExpectancies: number[]; mean: number; positiveFolds: number } {
+// Sequential OOS robustness folds. Parameters are fixed; this is not rolling model fitting.
+export function sequentialOosFolds(def: StrategyDef, candles: Candle[], timeframe: string, folds = 4, costs: V2CostModel = DEFAULT_V2_COSTS): { foldExpectancies: number[]; mean: number; positiveFolds: number } {
   const size = Math.floor(candles.length / folds);
   const exps: number[] = [];
   for (let k = 1; k < folds; k++) {
@@ -85,6 +84,8 @@ export function walkForward(def: StrategyDef, candles: Candle[], timeframe: stri
   const mean = exps.reduce((a, b) => a + b, 0) / (exps.length || 1);
   return { foldExpectancies: exps, mean, positiveFolds: exps.filter((e) => e > 0).length };
 }
+/** @deprecated Use sequentialOosFolds; V1 parameters are fixed during each segment. */
+export const walkForward = sequentialOosFolds;
 
 export interface V2CostModel {
   entryFeePct: number; exitFeePct: number; // percent of notional, each side
@@ -123,6 +124,7 @@ export function backtestV2(
   costs: V2CostModel = DEFAULT_V2_COSTS,
   instrument = "BACKTEST",
   strategyVersion = 2,
+  tickSize = Math.max(candlesChrono[0]?.c ? candlesChrono[0].c * 1e-8 : 0, Number.EPSILON),
 ): V2BacktestResult {
   void timeframe;
   const candles = candlesChrono.filter((c) => c.confirm === "1").slice().sort((a, b) => a.ts - b.ts);
@@ -168,7 +170,7 @@ export function backtestV2(
       if (costs.slPlus.enabled && favorable / riskDistance >= costs.slPlus.activationR) {
         const nextStop = calculateSlPlusStop({ side: candidate.side, entryPx: entryPrice,
           initialStopPx: stopAt, currentStopPx: activeStop, markPx: c.c,
-          tickSz: Math.max(entryPrice * 1e-8, Number.EPSILON), activationR: costs.slPlus.activationR,
+          tickSz: tickSize, activationR: costs.slPlus.activationR,
           lockInR: costs.slPlus.lockInR, minProfitBufferPct: costs.slPlus.minProfitBufferPct });
         if (nextStop !== null) activeStop = nextStop; // close-based, takes effect from next modeled candle
       }
@@ -199,8 +201,9 @@ export function backtestV2(
   };
 }
 
-export function walkForwardV2(strategy: StrategyV2Id, candles: Candle[], timeframe: string, folds = 5,
-  params: StrategyV2Params = DEFAULT_V2_PARAMS, costs: V2CostModel = DEFAULT_V2_COSTS, strategyVersion = 2): {
+export function rollingForwardRobustnessV2(strategy: StrategyV2Id, candles: Candle[], timeframe: string, folds = 5,
+  params: StrategyV2Params = DEFAULT_V2_PARAMS, costs: V2CostModel = DEFAULT_V2_COSTS, strategyVersion = 2,
+  tickSize = Math.max(candles[0]?.c ? candles[0].c * 1e-8 : 0, Number.EPSILON)): {
   foldExpectancies: number[]; foldTrades: number[]; positiveFolds: number; mean: number; worstFold: number; dispersion: number;
 } {
   const size = Math.floor(candles.length / folds);
@@ -208,7 +211,7 @@ export function walkForwardV2(strategy: StrategyV2Id, candles: Candle[], timefra
   const foldTrades: number[] = [];
   for (let k = 1; k < folds; k++) {
     const fold = candles.slice(k * size, (k + 1) * size);
-    const result = backtestV2(strategy, fold, timeframe, params, costs, "BACKTEST", strategyVersion);
+    const result = backtestV2(strategy, fold, timeframe, params, costs, "BACKTEST", strategyVersion, tickSize);
     foldExpectancies.push(result.netExpectancyR); foldTrades.push(result.trades.length);
   }
   const valid = foldExpectancies.filter((_, i) => foldTrades[i]! > 0);
@@ -217,3 +220,6 @@ export function walkForwardV2(strategy: StrategyV2Id, candles: Candle[], timefra
   return { foldExpectancies, foldTrades, positiveFolds: valid.filter((x) => x > 0).length,
     mean, worstFold: valid.length ? Math.min(...valid) : 0, dispersion: Math.sqrt(variance) };
 }
+
+/** @deprecated Use rollingForwardRobustnessV2; these are fixed-parameter sequential OOS folds. */
+export const walkForwardV2 = rollingForwardRobustnessV2;

@@ -2,6 +2,7 @@ import type { Store } from "../memory/db.ts";
 import {
   DEFAULT_V2_PARAMS, StrategyV2ParamsSchema, type StrategyV2Id, type StrategyV2Params,
 } from "./core-v2.ts";
+import { familyForV2 } from "./identity.ts";
 
 export type V2VersionStatus = "CHAMPION" | "CHALLENGER" | "SHADOW" | "PROMOTED" | "REJECTED" | "SUPERSEDED";
 export interface V2StrategyVersion {
@@ -18,6 +19,7 @@ export interface V2StrategyVersion {
   created_ts: string;
   updated_ts: string;
   status_reason: string | null;
+  shadow_started_ts: string | null;
 }
 
 export const V2_STRATEGIES: readonly StrategyV2Id[] = [
@@ -39,7 +41,7 @@ export function ensureV2Registry(store: Store, configured: StrategyV2Params = DE
     (strategy,version,parent_version,params,status,hypothesis,created_ts,updated_ts)
     VALUES(?,2,NULL,?,'CHAMPION',?,?,?)`);
   for (const strategy of V2_STRATEGIES) {
-    const family = strategy.replace(/_V2$/, "");
+    const family = familyForV2(strategy);
     const legacy = store.db.prepare(`SELECT params,status,hypothesis,created_ts FROM strategy_versions
       WHERE name=? AND version=2`).get(family) as { params: string; status: string; hypothesis: string | null; created_ts: string | null } | undefined;
     if (legacy) {
@@ -130,18 +132,20 @@ export function transitionV2Version(store: Store, strategy: StrategyV2Id, versio
   if (current.status === status) return;
   if (!allowed[current.status].includes(status)) throw new Error(`invalid V2 lifecycle transition ${current.status} -> ${status}`);
   const update = store.db.prepare(`UPDATE strategy_v2_versions SET status=?,status_reason=?,evidence=COALESCE(?,evidence),updated_ts=?
+    ,shadow_started_ts=CASE WHEN ?='SHADOW' THEN COALESCE(shadow_started_ts,?) ELSE shadow_started_ts END
     WHERE strategy=? AND version=? AND status=?`);
   if (status === "PROMOTED") {
     const promote = store.db.transaction(() => {
-      update.run("SUPERSEDED", "replaced by validated Challenger", null, new Date().toISOString(), strategy, inputParentVersion(store, strategy, version), "CHAMPION");
-      update.run("PROMOTED", reason, evidence === undefined ? null : JSON.stringify(evidence), new Date().toISOString(), strategy, version, current.status);
+      update.run("SUPERSEDED", "replaced by validated Challenger", null, new Date().toISOString(), "SUPERSEDED", new Date().toISOString(), strategy, inputParentVersion(store, strategy, version), "CHAMPION");
+      update.run("PROMOTED", reason, evidence === undefined ? null : JSON.stringify(evidence), new Date().toISOString(), "PROMOTED", new Date().toISOString(), strategy, version, current.status);
       store.db.prepare("UPDATE strategy_v2_versions SET status='CHAMPION',status_reason=?,updated_ts=? WHERE strategy=? AND version=? AND status='PROMOTED'")
         .run(reason, new Date().toISOString(), strategy, version);
     });
     promote();
     return;
   }
-  update.run(status, reason, evidence === undefined ? null : JSON.stringify(evidence), new Date().toISOString(), strategy, version, current.status);
+  const now = new Date().toISOString();
+  update.run(status, reason, evidence === undefined ? null : JSON.stringify(evidence), now, status, now, strategy, version, current.status);
 }
 
 function inputParentVersion(store: Store, strategy: StrategyV2Id, version: number): number {

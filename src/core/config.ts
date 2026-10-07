@@ -75,8 +75,12 @@ const TradingSchema = z.object({
       min_profit_buffer_pct: z.number().min(0).max(1).default(0.12),
     }).default({ enabled: true, activation_r: 1, lock_in_r: 0.05, min_profit_buffer_pct: 0.12 }),
   }).default({ sl_plus: { enabled: true, activation_r: 1, lock_in_r: 0.05, min_profit_buffer_pct: 0.12 } }),
-  strategies_enabled: z.array(z.string()).min(1),
-  strategy_core: z.object({ version: z.union([z.literal(1), z.literal(2)]).default(2) }).default({ version: 2 }),
+  strategies_enabled: z.array(z.string()).min(1).optional(), // legacy Core 1 config compatibility
+  strategy_core: z.object({
+    version: z.union([z.literal(1), z.literal(2)]).default(2),
+    enabled_families: z.array(z.enum(["TREND_FOLLOWING", "BREAKOUT", "MEAN_REVERSION"])).min(1)
+      .default(["TREND_FOLLOWING", "BREAKOUT", "MEAN_REVERSION"]),
+  }).default({ version: 2, enabled_families: ["TREND_FOLLOWING", "BREAKOUT", "MEAN_REVERSION"] }),
   validation: z.object({ baseline_mode: z.boolean().default(false) }).default({ baseline_mode: false }),
 });
 

@@ -161,7 +161,7 @@ export function startDashboard(cfg: DashboardConfig): DashboardServer {
       });
     }
     if (p === "/api/trades") {
-      const rows = store.db.prepare("SELECT trade_id,instrument,side,strategy,strategy_version,regime,entry_px,stop_px,take_profit_px,exit_px,result_r,pnl,duration_s,exit_reason,exit_ts,status,calibrated_confidence,contracts,entry_ts FROM trades ORDER BY COALESCE(exit_ts,entry_ts) DESC LIMIT 100").all() as Array<Record<string, unknown>>;
+      const rows = store.db.prepare("SELECT trade_id,instrument,side,strategy,strategy_core_version,strategy_version,regime,entry_px,stop_px,take_profit_px,exit_px,result_r,pnl,duration_s,exit_reason,exit_ts,status,calibrated_confidence,contracts,entry_ts FROM trades ORDER BY COALESCE(exit_ts,entry_ts) DESC LIMIT 100").all() as Array<Record<string, unknown>>;
       const live = await livePnl();
       return send(200, rows.map((x) => {
         if (x.status !== "OPEN") return x;
@@ -204,13 +204,21 @@ export function startDashboard(cfg: DashboardConfig): DashboardServer {
     }
     if (p === "/api/strategies") {
       const rows = store.db.prepare("SELECT name,version,parent_version,params,status,hypothesis,created_ts FROM strategy_versions ORDER BY name,version").all();
-      const shadow = store.db.prepare(`SELECT strategy,strategy_version,instrument,status,COUNT(*) trades,
+      const shadow = store.db.prepare(`SELECT engine,strategy,strategy_core_version,strategy_version,shadow_role,shadow_experiment_id,instrument,status,COUNT(*) trades,
         COALESCE(AVG(net_r),0) expectancy_r,COALESCE(AVG(mfe_r),0) mfe_r,COALESCE(AVG(mae_r),0) mae_r
-        FROM shadow_trades GROUP BY strategy,strategy_version,instrument,status ORDER BY strategy,strategy_version,instrument,status`).all();
+        FROM shadow_trades GROUP BY engine,strategy,strategy_core_version,strategy_version,shadow_role,shadow_experiment_id,instrument,status
+        ORDER BY strategy,strategy_core_version,strategy_version,shadow_role,instrument,status`).all();
+      const weightsByFamily = cfg.strategyCoreVersion === 2
+        ? Object.fromEntries((["TREND_FOLLOWING", "BREAKOUT", "MEAN_REVERSION"] as const).map((strategy) => [strategy,
+          getWeights(store, "SWING_15M", { strategy, strategyCoreVersion: 2 })]))
+        : undefined;
+      const weights = getWeights(store, "SWING_15M", { strategyCoreVersion: cfg.strategyCoreVersion ?? 1 });
       return send(200, { strategies: rows, strategyCore: { version: cfg.strategyCoreVersion ?? 1, baselineMode: cfg.baselineMode ?? false },
         v2Strategies: listV2Versions(store), shadowTrades: shadow,
-        regimeMatrix: regimeStats(store, "SWING_15M"), performance: scopedPerformance(store), weights: getWeights(store, "SWING_15M"),
-        calibration: JSON.parse(kvGet(store, "calibration:SWING_15M:*:*:*:*:*") ?? kvGet(store, "calibration:SWING_15M") ?? kvGet(store, "calibration") ?? "null") }); // §73–§82
+        regimeMatrix: regimeStats(store, "SWING_15M", cfg.strategyCoreVersion ?? 1),
+        performance: scopedPerformance(store, { engine: "SWING_15M", strategyCoreVersion: cfg.strategyCoreVersion ?? 1 }),
+        weights, ...(weightsByFamily ? { weightsByFamily } : {}),
+        calibration: JSON.parse(kvGet(store, `calibration:SWING_15M:core${cfg.strategyCoreVersion ?? 1}:*:*:*:*:*`) ?? "null") }); // §73–§82
     }
     if (p === "/api/lessons") {
       const rows = store.db.prepare("SELECT lesson_id,statement,status,scope_engine,scope_strategy,scope_strategy_version,scope_instrument,scope_regime,scope_regime_axes,scope_direction,confidence,observations,wins,losses,expectancy_r,updated_ts FROM lessons ORDER BY CASE status WHEN 'VERIFIED' THEN 0 WHEN 'REINFORCED' THEN 1 ELSE 2 END, confidence DESC LIMIT 50").all();
@@ -233,7 +241,13 @@ export function startDashboard(cfg: DashboardConfig): DashboardServer {
     }
     if (p === "/api/market") {
       const tick = cfg.getLastTick();
-      return send(200, { snapshot: tick?.features ?? null, regime: tick?.regime ?? "UNKNOWN", updatedAt: tick?.at ?? null, weights: getWeights(store), scan: cfg.getScan() });
+      const weightsByFamily = cfg.strategyCoreVersion === 2
+        ? Object.fromEntries((["TREND_FOLLOWING", "BREAKOUT", "MEAN_REVERSION"] as const).map((strategy) => [strategy,
+          getWeights(store, "SWING_15M", { strategy, strategyCoreVersion: 2 })]))
+        : undefined;
+      const weights = getWeights(store, "SWING_15M", { strategyCoreVersion: cfg.strategyCoreVersion ?? 1 });
+      return send(200, { snapshot: tick?.features ?? null, regime: tick?.regime ?? "UNKNOWN", updatedAt: tick?.at ?? null,
+        weights, ...(weightsByFamily ? { weightsByFamily } : {}), scan: cfg.getScan() });
     }
     if (p === "/api/evolution") {
       const strategies = store.db.prepare("SELECT name,version,parent_version,params,status,hypothesis,created_ts FROM strategy_versions ORDER BY name,version").all();

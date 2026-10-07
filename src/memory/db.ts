@@ -34,6 +34,7 @@ CREATE TABLE IF NOT EXISTS trades (
   timeframe TEXT NOT NULL,
   side TEXT NOT NULL,              -- LONG | SHORT
   strategy TEXT NOT NULL,
+  strategy_core_version INTEGER NOT NULL DEFAULT 1,
   strategy_version INTEGER NOT NULL,
   regime TEXT NOT NULL,
   regime_axes TEXT,
@@ -104,6 +105,7 @@ CREATE TABLE IF NOT EXISTS strategy_v2_versions (
   created_ts TEXT NOT NULL,
   updated_ts TEXT NOT NULL,
   status_reason TEXT,
+  shadow_started_ts TEXT,
   PRIMARY KEY(strategy,version)
 );
 CREATE INDEX IF NOT EXISTS idx_strategy_v2_lifecycle ON strategy_v2_versions(status,strategy,version);
@@ -117,7 +119,10 @@ CREATE TABLE IF NOT EXISTS shadow_trades (
   shadow_trade_id TEXT PRIMARY KEY,
   engine TEXT NOT NULL,
   strategy TEXT NOT NULL,
+  strategy_core_version INTEGER NOT NULL DEFAULT 2,
   strategy_version INTEGER NOT NULL,
+  shadow_role TEXT NOT NULL DEFAULT 'CHALLENGER', -- CHAMPION | CHALLENGER
+  shadow_experiment_id TEXT NOT NULL DEFAULT 'LEGACY',
   instrument TEXT NOT NULL,
   side TEXT NOT NULL,
   status TEXT NOT NULL,             -- PENDING | OPEN | CLOSED
@@ -147,7 +152,8 @@ CREATE TABLE IF NOT EXISTS shadow_trades (
   mfe_r REAL NOT NULL DEFAULT 0,
   mae_r REAL NOT NULL DEFAULT 0,
   costs_json TEXT NOT NULL,
-  UNIQUE(strategy,strategy_version,instrument,signal_ts)
+  tick_size REAL NOT NULL DEFAULT 0.00000001,
+  UNIQUE(strategy,strategy_core_version,strategy_version,shadow_role,instrument,signal_ts)
 );
 CREATE INDEX IF NOT EXISTS idx_shadow_trades_evidence ON shadow_trades(strategy,strategy_version,status,instrument,exit_ts);
 CREATE TABLE IF NOT EXISTS strategy_v2_evaluations (
@@ -235,15 +241,32 @@ export function openStore(root: string): Store {
   if (!cols.has("max_hold_bars")) db.exec("ALTER TABLE trades ADD COLUMN max_hold_bars INTEGER");
   if (!cols.has("regime_axes")) db.exec("ALTER TABLE trades ADD COLUMN regime_axes TEXT");
   if (!cols.has("entry_conditions")) db.exec("ALTER TABLE trades ADD COLUMN entry_conditions TEXT");
+  // Historical records are Core 1 unless a future migration has explicit evidence.
+  if (!cols.has("strategy_core_version")) db.exec("ALTER TABLE trades ADD COLUMN strategy_core_version INTEGER NOT NULL DEFAULT 1");
   db.exec(`UPDATE trades SET engine=CASE WHEN lower(timeframe)='scalp' THEN 'SCALP_5M' ELSE 'SWING_15M' END
     WHERE ${hadEngine ? "engine IS NULL OR engine NOT IN ('SWING_15M','SCALP_5M')" : "1=1"}`);
-  db.exec("CREATE INDEX IF NOT EXISTS idx_trades_learning_scope ON trades(engine,status,strategy,strategy_version,instrument,regime,side)");
+  db.exec("DROP INDEX IF EXISTS idx_trades_learning_scope");
+  db.exec("CREATE INDEX IF NOT EXISTS idx_trades_learning_scope ON trades(engine,strategy_core_version,status,strategy,strategy_version,instrument,regime,side)");
   db.exec("UPDATE trades SET initial_stop_px=stop_px WHERE initial_stop_px IS NULL AND stop_px IS NOT NULL");
   const lessonCols = new Set((db.prepare("PRAGMA table_info(lessons)").all() as Array<{ name: string }>).map((c) => c.name));
   if (!lessonCols.has("scope_engine")) db.exec("ALTER TABLE lessons ADD COLUMN scope_engine TEXT");
   if (!lessonCols.has("scope_strategy_version")) db.exec("ALTER TABLE lessons ADD COLUMN scope_strategy_version INTEGER");
   if (!lessonCols.has("scope_direction")) db.exec("ALTER TABLE lessons ADD COLUMN scope_direction TEXT");
   if (!lessonCols.has("scope_regime_axes")) db.exec("ALTER TABLE lessons ADD COLUMN scope_regime_axes TEXT");
+  const v2VersionCols = new Set((db.prepare("PRAGMA table_info(strategy_v2_versions)").all() as Array<{ name: string }>).map((c) => c.name));
+  if (!v2VersionCols.has("shadow_started_ts")) db.exec("ALTER TABLE strategy_v2_versions ADD COLUMN shadow_started_ts TEXT");
+  const shadowCols = new Set((db.prepare("PRAGMA table_info(shadow_trades)").all() as Array<{ name: string }>).map((c) => c.name));
+  if (!shadowCols.has("strategy_core_version")) db.exec("ALTER TABLE shadow_trades ADD COLUMN strategy_core_version INTEGER NOT NULL DEFAULT 2");
+  if (!shadowCols.has("shadow_role")) db.exec("ALTER TABLE shadow_trades ADD COLUMN shadow_role TEXT NOT NULL DEFAULT 'CHALLENGER'");
+  if (!shadowCols.has("shadow_experiment_id")) db.exec("ALTER TABLE shadow_trades ADD COLUMN shadow_experiment_id TEXT NOT NULL DEFAULT 'LEGACY'");
+  if (!shadowCols.has("tick_size")) db.exec("ALTER TABLE shadow_trades ADD COLUMN tick_size REAL NOT NULL DEFAULT 0.00000001");
+  // Preserve old Challenger-only rows but exclude them from matched experiments.
+  db.exec(`UPDATE shadow_trades SET strategy=CASE strategy
+      WHEN 'TREND_FOLLOWING_V2' THEN 'TREND_FOLLOWING'
+      WHEN 'BREAKOUT_V2' THEN 'BREAKOUT'
+      WHEN 'MEAN_REVERSION_V2' THEN 'MEAN_REVERSION' ELSE strategy END
+    WHERE strategy IN ('TREND_FOLLOWING_V2','BREAKOUT_V2','MEAN_REVERSION_V2')`);
+  db.exec("CREATE INDEX IF NOT EXISTS idx_shadow_experiment ON shadow_trades(strategy,strategy_core_version,strategy_version,shadow_experiment_id,shadow_role,status,instrument)");
   // Legacy lesson scope cannot reliably distinguish pre-isolation swing vs
   // scalp evidence. Keep it preserved but unassigned; consumers exclude NULL.
   migrateFills(db);

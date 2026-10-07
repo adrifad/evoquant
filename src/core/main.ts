@@ -32,6 +32,7 @@ import { compareAndMaybePromote } from "../evaluation/champion-challenger.ts";
 import { DEFAULT_V2_COSTS } from "../evaluation/backtest.ts";
 import { processShadowCycle } from "../evaluation/shadow-challenger.ts";
 import { evaluateV2Lifecycle } from "../evaluation/v2-promotion.ts";
+import { familyForV2 } from "../strategy/identity.ts";
 import { parseEvolutionConfig } from "./evolution-config.ts";
 import { resolveRuntimePolicy } from "./runtime-policy.ts";
 import { runOncePerGlobalCycle } from "./global-cycle.ts";
@@ -214,8 +215,10 @@ async function main(): Promise<void> {
       if (anchorSnap) lastTick = { features: anchorSnap.features, regime: anchorSnap.regime, at: snapshotTs };
       // 2) deterministic pre-rank (§37 opportunity agent as scanner)
       const rows = strategyCoreVersion === 2
-        ? scanCoreV2(snaps, histories, activeV2Params, activeV2Versions, v2Weights(store, activeV2Versions))
-        : scanInstruments(snaps, strategies, getWeights(store, "SWING_15M"));
+        ? scanCoreV2(snaps, histories, activeV2Params, activeV2Versions, v2Weights(store, activeV2Versions), trading.strategy_core.enabled_families)
+        : scanInstruments(snaps, trading.strategies_enabled
+          ? strategies.filter((strategy) => trading.strategies_enabled!.includes(`${strategy.name}_V${strategy.version}`))
+          : strategies, getWeights(store, "SWING_15M", { strategyCoreVersion: 1 }));
       lastScan = rows;
       for (const row of rows) {
         if (row.candidate) logSystemEvent(store, "STRATEGY_CANDIDATE", {
@@ -268,19 +271,24 @@ async function main(): Promise<void> {
             for (const id of Object.keys(book) as StrategyV2Id[]) {
               maybeEvolveWeights(store, evolution.signal_evolution_interval_trades,
                 evolution.constraints.max_weight_change_per_cycle_pct, "SWING_15M", evolution.minimum_validation_sample,
-                { strategy: id, strategyVersion: book[id].version });
+                { strategy: familyForV2(id), strategyCoreVersion: 2, strategyVersion: book[id].version });
             }
           } else {
             maybeEvolveWeights(store, evolution.signal_evolution_interval_trades,
-              evolution.constraints.max_weight_change_per_cycle_pct, "SWING_15M", evolution.minimum_validation_sample);
+              evolution.constraints.max_weight_change_per_cycle_pct, "SWING_15M", evolution.minimum_validation_sample,
+              { strategyCoreVersion: 1 });
           }
         }
-        recomputeCalibration(store, "SWING_15M");
+        if (strategyCoreVersion === 2) {
+          recomputeCalibration(store, "SWING_15M", { strategyCoreVersion: 2 });
+          for (const family of trading.strategy_core.enabled_families) recomputeCalibration(store, "SWING_15M",
+            { strategyCoreVersion: 2, strategy: family });
+        } else recomputeCalibration(store, "SWING_15M", { strategyCoreVersion: 1 });
         if (evolution.strategy_evolution_enabled) {
           if (strategyCoreVersion === 2) {
             await maybeEvolveV2Strategies(REPO_ROOT, llmEvolve, store, {
               intervalTrades: evolution.strategy_evolution_interval_trades,
-              minimumSample: Math.min(evolution.strategy_evolution_interval_trades, evolution.minimum_validation_sample),
+              minimumSample: evolution.minimum_validation_sample,
               maxParamChanges: evolution.constraints.max_param_changes_per_challenger,
               maxParamDeltaPct: evolution.constraints.max_param_delta_pct_per_challenger,
             });
@@ -291,12 +299,14 @@ async function main(): Promise<void> {
           }
         }
         if (strategyCoreVersion === 2) {
-          processShadowCycle(store, snaps, histories, trading.timeframe, backtestCosts);
+          const tickSizes = new Map(Object.entries(instruments).map(([symbol, meta]) => [symbol, Number(meta.tickSz)]));
+          processShadowCycle(store, snaps.map((snapshot) => ({ ...snapshot, tickSize: Number(instruments[snapshot.instrument]?.tickSz) })),
+            histories, trading.timeframe, backtestCosts);
           evaluateV2Lifecycle(store, histories, trading.timeframe, backtestCosts, {
             historicalMinTrades: evolution.promotion.historical_min_trades,
             outOfSampleMinTrades: evolution.promotion.out_of_sample_min_trades,
             shadowForwardMinTrades: evolution.promotion.shadow_forward_min_trades,
-            championForwardMinTrades: evolution.promotion.champion_forward_min_trades,
+            championShadowMinTrades: evolution.promotion.champion_shadow_min_trades,
             outOfSampleFraction: evolution.promotion.out_of_sample_fraction,
             minimumSymbols: evolution.promotion.minimum_symbols,
             minPositiveSymbolFraction: evolution.promotion.min_positive_symbol_fraction,
@@ -307,7 +317,7 @@ async function main(): Promise<void> {
             requireWalkForward: evolution.promotion.require_walk_forward,
             requireMultiSymbol: evolution.promotion.require_multi_symbol,
             automaticPromotionEnabled: evolution.automatic_promotion_enabled,
-          });
+          }, tickSizes);
         } else if (evolution.automatic_promotion_enabled) {
           compareAndMaybePromote(store, histories, trading.timeframe, {
             minSampleEachSide: Math.max(evolution.minimum_validation_sample, evolution.constraints.champion_vs_challenger.min_sample_each_side),
@@ -379,9 +389,9 @@ async function main(): Promise<void> {
 
 function v2Weights(store: import("../memory/db.ts").Store, versions: Record<StrategyV2Id, number>): Partial<Record<StrategyV2Id, SignalWeights>> {
   return {
-    TREND_FOLLOWING_V2: getWeights(store, "SWING_15M", { strategy: "TREND_FOLLOWING_V2", strategyVersion: versions.TREND_FOLLOWING_V2 }),
-    BREAKOUT_V2: getWeights(store, "SWING_15M", { strategy: "BREAKOUT_V2", strategyVersion: versions.BREAKOUT_V2 }),
-    MEAN_REVERSION_V2: getWeights(store, "SWING_15M", { strategy: "MEAN_REVERSION_V2", strategyVersion: versions.MEAN_REVERSION_V2 }),
+    TREND_FOLLOWING_V2: getWeights(store, "SWING_15M", { strategy: familyForV2("TREND_FOLLOWING_V2"), strategyCoreVersion: 2, strategyVersion: versions.TREND_FOLLOWING_V2 }),
+    BREAKOUT_V2: getWeights(store, "SWING_15M", { strategy: familyForV2("BREAKOUT_V2"), strategyCoreVersion: 2, strategyVersion: versions.BREAKOUT_V2 }),
+    MEAN_REVERSION_V2: getWeights(store, "SWING_15M", { strategy: familyForV2("MEAN_REVERSION_V2"), strategyCoreVersion: 2, strategyVersion: versions.MEAN_REVERSION_V2 }),
   };
 }
 

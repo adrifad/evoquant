@@ -24,7 +24,7 @@ promotion:
   historical_min_trades: 50
   out_of_sample_min_trades: 15
   shadow_forward_min_trades: 15
-  champion_forward_min_trades: 15
+  champion_shadow_min_trades: 15
   require_out_of_sample: true
   require_walk_forward: true
   require_multi_symbol: true

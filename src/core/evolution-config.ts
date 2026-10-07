@@ -21,7 +21,9 @@ const EvolutionSchema = z.object({
   }),
   promotion: z.object({
     historical_min_trades: z.number().int().min(1), out_of_sample_min_trades: z.number().int().min(1),
-    shadow_forward_min_trades: z.number().int().min(1), champion_forward_min_trades: z.number().int().min(1),
+    shadow_forward_min_trades: z.number().int().min(1),
+    champion_shadow_min_trades: z.number().int().min(1).default(15),
+    champion_forward_min_trades: z.number().int().min(1).optional(),
     require_out_of_sample: z.boolean(), require_walk_forward: z.boolean(), require_multi_symbol: z.boolean(),
     min_positive_symbol_fraction: z.number().min(0).max(1), min_positive_walk_forward_fraction: z.number().min(0).max(1),
     minimum_walk_forward_folds: z.number().int().min(1), minimum_symbols: z.number().int().min(1),

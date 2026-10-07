@@ -35,6 +35,7 @@ import { recomputeCalibration } from "../learning/confidence.ts";
 import type { Decision } from "../agents/decision-agent.ts";
 import type { StrategyDef } from "../strategy/library.ts";
 import type { TradeCandidate } from "../strategy/core-v2.ts";
+import { familyForV2, identityForV2 } from "../strategy/identity.ts";
 import type { CandidateGate } from "../agents/decision-agent.ts";
 import { serializeTradeMutation } from "./trade-mutation.ts";
 import { msForBar } from "../core/scheduler.ts";
@@ -292,7 +293,9 @@ export async function runTick(d: ExecutorDeps, ctx: TickContext, symbol: TickSym
       const ageBars = Math.floor((Date.now() - Date.parse(String(t.entry_ts))) / msForBar(trading.timeframe));
       if (ageBars >= maxHoldBars) reason = "TIME_STOP";
     }
-    if (!reason) {
+    // Core 2 baseline exits are deterministic; an LLM CLOSE would make its
+    // live evidence incomparable with V2 historical and shadow evaluation.
+    if (!reason && shouldUseAiPositionExit(t)) {
       const dec = await ctx.decideFn(ctx.features, ctx.regime, true);
       if (dec.decision === "CLOSE") reason = "AI_CLOSE";
     }
@@ -326,7 +329,10 @@ export async function runTick(d: ExecutorDeps, ctx: TickContext, symbol: TickSym
       suggested_take_profit_atr: ctx.candidate.stopAtr * ctx.candidate.targetR,
     }
     : await ctx.decideFn(f, ctx.regime, hasPosition);
-  const calConf = calibrate(store, decision.confidence, 30);
+  const candidateIdentity = ctx.candidate ? identityForV2(ctx.candidate.strategy, ctx.candidate.strategyVersion) : null;
+  const calConf = calibrate(store, decision.confidence, 30, "SWING_15M", candidateIdentity
+    ? { strategy: candidateIdentity.family, strategyCoreVersion: candidateIdentity.coreVersion, strategyVersion: candidateIdentity.strategyVersion }
+    : { strategyCoreVersion: 1 });
   const sid = decision.strategy ?? "";
   const verdict = evaluateEntry(
     {
@@ -363,7 +369,7 @@ export async function runTick(d: ExecutorDeps, ctx: TickContext, symbol: TickSym
 
   // §24 sizing from strategy params
   const strat = ctx.candidate
-    ? { name: ctx.candidate.strategy.replace(/_V2$/, ""), version: ctx.candidate.strategyVersion }
+    ? { name: familyForV2(ctx.candidate.strategy), version: ctx.candidate.strategyVersion }
     : ctx.strategies.find((s) => `${s.name}_V${s.version}` === sid) ?? ctx.strategies[0]!;
   const side = decision.decision as "LONG" | "SHORT";
   const stopPx = ctx.candidate ? ctx.candidate.stopPrice : stopPriceFor(f.price, f.atr14, decision.suggested_stop_atr, side);
@@ -435,7 +441,10 @@ export async function runTick(d: ExecutorDeps, ctx: TickContext, symbol: TickSym
     const tradeId = nextTradeId();
     openTrade(store, {
       tradeId, engine: "SWING_15M", instrument: instId, timeframe: trading.timeframe, side,
-      strategy: strat.name, strategyVersion: strat.version, regime: ctx.regime,
+      strategy: candidateIdentity ? candidateIdentity.family : strat.name,
+      strategyVersion: candidateIdentity ? candidateIdentity.strategyVersion : strat.version,
+      ...(candidateIdentity ? { identity: candidateIdentity } : {}),
+      regime: ctx.regime,
       ...(ctx.candidate ? { regimeAxes: ctx.candidate.regime } : {}),
       ...(ctx.candidate ? { entryConditions: ctx.candidate.conditions } : {}),
       contracts: sz.contracts, entryPx, entryTs: new Date().toISOString(),
@@ -499,6 +508,10 @@ export function priceTrigger(t: Record<string, unknown>, markPx: number): "SL" |
   if (side === "LONG" && markPx >= tpPx) return "TP";
   if (side === "SHORT" && markPx <= tpPx) return "TP";
   return null;
+}
+
+export function shouldUseAiPositionExit(trade: Record<string, unknown>): boolean {
+  return Number(trade.strategy_core_version ?? 1) !== 2;
 }
 
 // letters+digits only, ≤32 (§15 + OKX charset gotcha). Ticker derived from instId.

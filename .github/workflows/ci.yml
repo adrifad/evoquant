@@ -1,0 +1,34 @@
+name: CI
+
+on:
+  push:
+    branches: [master, "feat/**"]
+  pull_request:
+    branches: [master]
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - name: Prepare native build tools
+        run: sudo apt-get update && sudo apt-get install -y python3 make g++
+      - name: Install root dependencies
+        run: npm ci
+      - name: Typecheck and test core
+        run: |
+          npm run typecheck
+          npm test
+      - name: Install console dependencies
+        run: npm --prefix apps/console ci
+      - name: Typecheck and build console
+        run: |
+          npm --prefix apps/console run typecheck
+          npm --prefix apps/console run build

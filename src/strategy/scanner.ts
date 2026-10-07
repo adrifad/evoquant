@@ -6,6 +6,8 @@ import { classifyRegime, type Regime } from "../market/regime.ts";
 import { scoreStrategy, type StrategyDef } from "./library.ts";
 import type { Candle } from "../exchange/okx/types.ts";
 import { DEFAULT_V2_PARAMS, DEFAULT_V2_VERSIONS, evaluateAllV2Setups, type SetupEvaluation, type StrategyV2Params, type StrategyV2Versions, type TradeCandidate } from "./core-v2.ts";
+import type { StrategyFamily } from "./identity.ts";
+import { v2StrategyForFamily } from "./identity.ts";
 import type { SignalWeights } from "../learning/signal-weights.ts";
 
 export interface ScanRow {
@@ -27,9 +29,12 @@ export function scanCoreV2(
   params: StrategyV2Params = DEFAULT_V2_PARAMS,
   versions: StrategyV2Versions = DEFAULT_V2_VERSIONS,
   weightsByStrategy: Partial<Record<keyof StrategyV2Params, SignalWeights>> = {},
+  enabledFamilies: readonly StrategyFamily[] = ["TREND_FOLLOWING", "BREAKOUT", "MEAN_REVERSION"],
 ): ScanRow[] {
+  const enabledStrategies = new Set(enabledFamilies.map(v2StrategyForFamily));
   const rows: ScanRow[] = snapshots.map(({ instrument, features }) => {
     const evaluations = evaluateAllV2Setups(features, candlesByInstrument.get(instrument) ?? [], params, versions)
+      .filter((evaluation) => enabledStrategies.has(evaluation.strategy))
       .map((evaluation) => adjustPassedQuality(evaluation, weightsByStrategy[evaluation.strategy]));
     const candidates = evaluations.flatMap((e) => e.candidate ? [e.candidate] : []);
     candidates.sort((a, b) => b.setupScore - a.setupScore);

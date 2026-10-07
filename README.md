@@ -43,12 +43,15 @@ interval. A Challenger must pass after-cost historical, trailing OOS, walk-
 forward, and cross-symbol validation before it enters shadow-forward. Shadow
 trades are simulated in a separate ledger and never reach OKX order APIs,
 account equity, live position limits, or real-trade learning. Promotion is
-deterministic and waits for both Challenger shadow and Champion forward samples.
+deterministic and waits for matched Champion Shadow and Challenger Shadow samples
+from the same persisted experiment boundary. Actual Champion Demo performance is
+reported separately as an execution-sanity metric, not used as the parameter
+comparison baseline.
 
 The defaults are tuned for a short research window, not for guaranteed
 significance: signal learning every 8 closed trades (20-trade evidence floor),
 V2 proposal reviews every 15 family/version trades, historical gate at 50,
-and at least 15 closed shadow trades plus 15 Champion forward trades before
+and at least 15 closed Challenger shadow trades plus 15 Champion shadow trades before
 promotion can be considered. Fee, spread, slippage, OOS, symbol, fold, and
 drawdown assumptions are in `config/evaluation.yaml` and
 `config/evolution.yaml`. This configuration does not establish profitability.

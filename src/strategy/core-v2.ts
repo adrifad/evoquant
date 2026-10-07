@@ -2,6 +2,7 @@ import type { Candle } from "../exchange/okx/types.ts";
 import type { FeatureSnapshot } from "../market/features.ts";
 import { classifyRegimeAxes, type RegimeAxes } from "../market/regime.ts";
 import type { Store } from "../memory/db.ts";
+import { familyForV2 } from "./identity.ts";
 import { z } from "zod";
 
 export interface StrategyCondition {
@@ -259,7 +260,7 @@ export function persistV2Definitions(store: Store, params: StrategyV2Params): vo
   const insert = store.db.prepare(`INSERT INTO strategy_versions(name,version,parent_version,params,status,created_ts,hypothesis)
     VALUES(?,2,NULL,?,'TESTING',?,?) ON CONFLICT(name,version) DO NOTHING`);
   for (const strategy of Object.keys(params) as StrategyV2Id[]) {
-    const name = strategy.replace(/_V2$/, "");
+    const name = familyForV2(strategy);
     insert.run(name, JSON.stringify(params[strategy]), new Date().toISOString(), hypotheses[strategy]);
   }
 }

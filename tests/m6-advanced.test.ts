@@ -6,13 +6,13 @@ import { mkdtempSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-import { openStore } from "../src/memory/db.ts";
+import { openStore, kvSet } from "../src/memory/db.ts";
 import * as lessons from "../src/memory/lessons.ts";
 import { getWeights, measureContributions, maybeEvolveWeights } from "../src/learning/signal-weights.ts";
 import { compareAndMaybePromote } from "../src/evaluation/champion-challenger.ts";
 import { loadStrategies, saveStrategy } from "../src/strategy/library.ts";
 import { backtest } from "../src/evaluation/backtest.ts";
-import { recomputeCalibration } from "../src/learning/confidence.ts";
+import { calibrate, recomputeCalibration } from "../src/learning/confidence.ts";
 import { regimeStats } from "../src/memory/regimes.ts";
 import { scopedPerformance } from "../src/memory/regimes.ts";
 import { BASE_STRATEGIES, type StrategyDef } from "../src/strategy/library.ts";
@@ -76,12 +76,26 @@ test("signal learning aligns profitable and losing bearish SHORT evidence and is
   for (let i = 0; i < 35; i++) insert.run(`SC${i}`, "SCALP_5M", "scalp", -0.5, feat({ emaSpreadPct: -0.8, rsi14: 38 }));
   assert.ok(measureContributions(st, "SWING_15M").trend > 0.5, "profitable bearish SHORT should reinforce aligned trend evidence");
   assert.ok(measureContributions(st, "SCALP_5M").trend < -0.3, "losing bearish SHORT should penalize aligned trend evidence");
-  assert.equal(regimeStats(st, "SWING_15M").TRENDING_BEARISH?.TREND_FOLLOWING_V2?.SHORT?.trades, 35);
-  assert.equal(regimeStats(st, "SCALP_5M").TRENDING_BEARISH?.TREND_FOLLOWING_V2?.SHORT?.trades, 35);
+  assert.equal(regimeStats(st, "SWING_15M").TRENDING_BEARISH?.TREND_FOLLOWING_C1_V2?.SHORT?.trades, 35);
+  assert.equal(regimeStats(st, "SCALP_5M").TRENDING_BEARISH?.TREND_FOLLOWING_C1_V2?.SHORT?.trades, 35);
   assert.equal(scopedPerformance(st, { engine: "SCALP_5M", strategy: "TREND_FOLLOWING", strategyVersion: 2, side: "SHORT" }).length, 1);
   assert.equal(scopedPerformance(st, { engine: "SWING_15M", instrument: "ETH-USDT-SWAP" }).length, 0);
   assert.equal(recomputeCalibration(st, "SWING_15M")?.sample, 35);
   assert.equal(recomputeCalibration(st, "SCALP_5M")?.sample, 35);
+  st.close();
+});
+
+test("V2 confidence calibration never falls back to incompatible Core 1 confidence semantics", () => {
+  const st = openStore(tmpRoot());
+  const table = { updatedTs: "2026-10-01T00:00:00Z", sample: 100,
+    buckets: [{ lo: 0, hi: 1, winRate: 0, n: 100 }] };
+  kvSet(st, "calibration:SWING_15M:core1:*:*:*:*:*", JSON.stringify(table));
+  const scope = { strategyCoreVersion: 2 as const, strategy: "TREND_FOLLOWING" as const, strategyVersion: 3 };
+  assert.equal(calibrate(st, 0.8, 30, "SWING_15M", scope), 0.8);
+  kvSet(st, "calibration:SWING_15M:core2:TREND_FOLLOWING:*:*:*:*", JSON.stringify({
+    ...table, buckets: [{ lo: 0, hi: 1, winRate: 0.4, n: 100 }],
+  }));
+  assert.ok(Math.abs(calibrate(st, 0.8, 30, "SWING_15M", scope) - 0.6) < 1e-12);
   st.close();
 });
 

@@ -54,14 +54,13 @@ scalp:
   llm_gate: true
   llm_max_per_hour: 6
 
-strategies_enabled:
-  - TREND_FOLLOWING_V1
-  - BREAKOUT_V1
-  - MEAN_REVERSION_V1
-
 # Strategy selection is independent of the baseline safety overlay.
 strategy_core:
   version: 2
+  enabled_families:
+    - TREND_FOLLOWING
+    - BREAKOUT
+    - MEAN_REVERSION
 
 validation:
   baseline_mode: false

@@ -9,6 +9,7 @@ import { measureContributions } from "../learning/signal-weights.ts";
 import { summarize } from "../evaluation/performance.ts";
 import { DEFAULT_V2_PARAMS, StrategyV2ParamsSchema, type StrategyV2Id, type StrategyV2Params } from "../strategy/core-v2.ts";
 import { createV2Challenger, getV2Champions, listV2Versions, V2_STRATEGIES } from "../strategy/v2-registry.ts";
+import { familyForV2 } from "../strategy/identity.ts";
 
 const ProposalSchema = z.object({
   proposals: z.array(z.object({
@@ -29,10 +30,25 @@ export interface V2EvolutionConfig {
   maxParamDeltaPct: number;
 }
 
-interface ClosedEvidence {
+export interface ClosedEvidence {
   result_r: number; side: "LONG" | "SHORT"; instrument: string; regime: string;
   regime_axes: string | null; exit_reason: string | null; mfe: number | null; mae: number | null;
-  entry_px: number | null; initial_stop_px: number | null;
+  entry_px: number | null; initial_stop_px: number | null; entry_ts: string; exit_ts: string;
+}
+
+export function getV2EvolutionEvidence(store: Store, strategy: StrategyV2Id, version: number,
+  engine: TradingEngine = "SWING_15M"): ClosedEvidence[] {
+  return store.db.prepare(`SELECT result_r,side,instrument,regime,regime_axes,exit_reason,mfe,mae,entry_px,initial_stop_px,entry_ts,exit_ts
+    FROM trades WHERE status='CLOSED' AND result_r_basis='NET' AND engine=? AND strategy=?
+      AND strategy_core_version=2 AND strategy_version=? ORDER BY exit_ts`)
+    .all(engine, familyForV2(strategy), version) as ClosedEvidence[];
+}
+
+export function evolutionReviewEligible(sample: number, lastReviewed: number, minimumSample: number, interval: number): boolean {
+  return sample >= minimumSample && sample - lastReviewed >= interval;
+}
+export function v2EvolutionStateKey(engine: TradingEngine, strategy: StrategyV2Id, championVersion: number): string {
+  return `evolution_v2:${engine}:${familyForV2(strategy)}:core2:v${championVersion}:last_trade_count`;
 }
 
 export function validateV2Proposal(input: {
@@ -70,13 +86,11 @@ export async function maybeEvolveV2Strategies(root: string, cfg: LlmConfig, stor
   for (const strategy of V2_STRATEGIES) {
     if (listV2Versions(store, strategy).some((version) => version.status === "CHALLENGER" || version.status === "SHADOW")) continue;
     const champion = champions[strategy];
-    const evidence = store.db.prepare(`SELECT result_r,side,instrument,regime,regime_axes,exit_reason,mfe,mae,entry_px,initial_stop_px
-      FROM trades WHERE status='CLOSED' AND result_r_basis='NET' AND engine=? AND strategy=? AND strategy_version=?
-      ORDER BY exit_ts`).all(engine, strategy, champion.version) as ClosedEvidence[];
+    const evidence = getV2EvolutionEvidence(store, strategy, champion.version, engine);
     evidenceByStrategy.set(strategy, evidence);
-    const stateKey = `evolution_v2:${engine}:${strategy}:last_trade_count`;
+    const stateKey = v2EvolutionStateKey(engine, strategy, champion.version);
     const lastCount = Number(kvGet(store, stateKey) ?? "0");
-    if (evidence.length >= evolution.minimumSample && evidence.length - lastCount >= evolution.intervalTrades) ready.push(strategy);
+    if (evolutionReviewEligible(evidence.length, lastCount, evolution.minimumSample, evolution.intervalTrades)) ready.push(strategy);
   }
   if (ready.length === 0) return 0;
 
@@ -96,16 +110,20 @@ export async function maybeEvolveV2Strategies(root: string, cfg: LlmConfig, stor
     const negative = rs.filter((r) => r < 0).reduce((sum, r) => sum + Math.abs(r), 0);
     const shadows = store.db.prepare(`SELECT COUNT(*) trades,COALESCE(AVG(net_r),0) expectancy_r,
       COALESCE(AVG(mfe_r),0) mfe_r,COALESCE(AVG(mae_r),0) mae_r FROM shadow_trades
-      WHERE strategy=? AND strategy_version=? AND status='CLOSED'`).get(strategy, champion.version) as Record<string, number>;
+      WHERE strategy=? AND strategy_core_version=2 AND strategy_version=? AND shadow_role='CHALLENGER' AND status='CLOSED'`)
+      .get(familyForV2(strategy), champion.version) as Record<string, number>;
     return [strategy, {
       champion_version: champion.version, params: champion.params, sample: trades.length,
       performance: summarize(rs), profit_factor: negative > 0 ? rs.filter((r) => r > 0).reduce((a, b) => a + b, 0) / negative : null,
       positive_R_count: positive, by_side: bySide, by_symbol: perSymbol, regime_axes: perRegimeAxes,
       mfe_r_mean: mean(trades.map(normalizedMfe)), mae_r_mean: mean(trades.map(normalizedMae)),
       exit_reasons: countBy(trades.map((trade) => trade.exit_reason ?? "UNKNOWN")),
-      signal_contributions: measureContributions(store, engine, { strategy, strategyVersion: champion.version }),
+      signal_contributions: measureContributions(store, engine, {
+        strategy: familyForV2(strategy), strategyCoreVersion: 2, strategyVersion: champion.version,
+      }),
       shadow_challenger_summary: shadows,
       machine_verified_lessons: [], // Natural-language hypotheses stay provisional until a structured validator exists.
+      evidence_cutoff_ts: latestEvidenceExitTs(trades),
     }];
   }));
   const result = await llmJson(cfg, prompt, JSON.stringify({ engine, strategies: strategyEvidence,
@@ -113,8 +131,8 @@ export async function maybeEvolveV2Strategies(root: string, cfg: LlmConfig, stor
       max_parameter_delta_pct: evolution.maxParamDeltaPct, minimum_closed_trade_sample: evolution.minimumSample } }), ProposalSchema);
   let created = 0;
   for (const strategy of ready) {
-    const trades = evidenceByStrategy.get(strategy)?.length ?? 0;
-    kvSet(store, `evolution_v2:${engine}:${strategy}:last_trade_count`, String(trades));
+    const tradeCount = evidenceByStrategy.get(strategy)?.length ?? 0;
+    kvSet(store, v2EvolutionStateKey(engine, strategy, champions[strategy].version), String(tradeCount));
   }
   if (!result || result.proposals.length === 0) {
     logSystemEvent(store, "EVOLUTION_NO_CHANGE", { engine, strategies: ready, reason: result?.no_change_reason ?? "invalid_or_unavailable_model_response" });
@@ -135,12 +153,14 @@ export async function maybeEvolveV2Strategies(root: string, cfg: LlmConfig, stor
     }
     seen.add(proposal.strategy);
     try {
+      const proposalTrades = evidenceByStrategy.get(proposal.strategy) ?? [];
       const version = createV2Challenger(store, { strategy: proposal.strategy, parentVersion: champion.version,
         params: validation.params, changedParameter: proposal.changed_parameter, oldValue: proposal.old_value,
         newValue: proposal.new_value, hypothesis: proposal.hypothesis,
-        evidence: { engine, sample: evidenceByStrategy.get(proposal.strategy)?.length ?? 0,
-          summary: summarize((evidenceByStrategy.get(proposal.strategy) ?? []).map((trade) => trade.result_r)),
-          capturedAt: new Date().toISOString() } });
+        evidence: { engine, sample: proposalTrades.length,
+          summary: summarize(proposalTrades.map((trade) => trade.result_r)),
+          capturedAt: new Date().toISOString(),
+          evidenceCutoffTs: latestEvidenceExitTs(proposalTrades) } });
       logSystemEvent(store, "CHALLENGER_CREATED", { engine, strategy: proposal.strategy, version,
         parentVersion: champion.version, changedParameter: proposal.changed_parameter,
         oldValue: proposal.old_value, newValue: proposal.new_value });
@@ -156,5 +176,9 @@ export async function maybeEvolveV2Strategies(root: string, cfg: LlmConfig, stor
 
 function normalizedMfe(trade: ClosedEvidence): number { const risk = Math.abs(Number(trade.entry_px) - Number(trade.initial_stop_px)); return risk > 0 ? Number(trade.mfe ?? 0) / risk : 0; }
 function normalizedMae(trade: ClosedEvidence): number { const risk = Math.abs(Number(trade.entry_px) - Number(trade.initial_stop_px)); return risk > 0 ? Number(trade.mae ?? 0) / risk : 0; }
+function latestEvidenceExitTs(trades: ClosedEvidence[]): string | null {
+  const valid = trades.map((trade) => trade.exit_ts).filter((ts) => Number.isFinite(Date.parse(ts)));
+  return valid.length ? new Date(Math.max(...valid.map(Date.parse))).toISOString() : null;
+}
 function mean(values: number[]): number { return values.length ? values.reduce((sum, value) => sum + value, 0) / values.length : 0; }
 function countBy(values: string[]): Record<string, number> { return values.reduce<Record<string, number>>((out, value) => { out[value] = (out[value] ?? 0) + 1; return out; }, {}); }

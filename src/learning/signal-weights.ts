@@ -2,24 +2,28 @@
 import type { Store } from "../memory/db.ts";
 import { kvGet, kvSet, logSystemEvent } from "../memory/db.ts";
 import type { TradingEngine } from "../memory/engines.ts";
+import type { StrategyFamily } from "../strategy/identity.ts";
 
 export interface SignalWeights {
   trend: number; momentum: number; volume: number; volatility: number;
 }
-export interface LearningScope { strategy?: string; strategyVersion?: number; instrument?: string; regime?: string; side?: "LONG" | "SHORT" }
+export interface LearningScope {
+  strategyCoreVersion?: 1 | 2; strategy?: StrategyFamily | "SCALP"; strategyVersion?: number;
+  instrument?: string; regime?: string; side?: "LONG" | "SHORT";
+}
 export const INITIAL_WEIGHTS: SignalWeights = { trend: 1, momentum: 1, volume: 1, volatility: 1 };
 
 function scopeKey(engine: TradingEngine, scope: LearningScope = {}): string {
-  return `signal_weights:${engine}:${scope.strategy ?? "*"}:${scope.strategyVersion ?? "*"}:${scope.instrument ?? "*"}:${scope.regime ?? "*"}:${scope.side ?? "*"}`;
+  return `signal_weights:${engine}:core${scope.strategyCoreVersion ?? 1}:${scope.strategy ?? "*"}:${scope.strategyVersion ?? "*"}:${scope.instrument ?? "*"}:${scope.regime ?? "*"}:${scope.side ?? "*"}`;
 }
 function scopeArgs(scope: LearningScope = {}): Array<string | number | null> {
-  return [scope.strategy ?? null, scope.strategy ?? null, scope.strategyVersion ?? null, scope.strategyVersion ?? null,
+  return [scope.strategyCoreVersion ?? 1,
+    scope.strategy ?? null, scope.strategy ?? null, scope.strategyVersion ?? null, scope.strategyVersion ?? null,
     scope.instrument ?? null, scope.instrument ?? null, scope.regime ?? null, scope.regime ?? null, scope.side ?? null, scope.side ?? null];
 }
 
 export function getWeights(store: Store, engine: TradingEngine = "SWING_15M", scope: LearningScope = {}): SignalWeights {
-  const raw = kvGet(store, scopeKey(engine, scope)) ??
-    (engine === "SWING_15M" && Object.keys(scope).length === 0 ? kvGet(store, "signal_weights") : null);
+  const raw = kvGet(store, scopeKey(engine, scope));
   if (!raw) return { ...INITIAL_WEIGHTS };
   return JSON.parse(raw) as SignalWeights;
 }
@@ -27,11 +31,12 @@ export function getWeights(store: Store, engine: TradingEngine = "SWING_15M", sc
 // contribution per signal group (from entry features vs outcome, §31/§32).
 export function measureContributions(store: Store, engine: TradingEngine = "SWING_15M", scope: LearningScope = {}): Record<keyof SignalWeights, number> {
   const rows = store.db.prepare(`
-    SELECT result_r, entry_features, side FROM trades
+    SELECT result_r, entry_features, entry_conditions, side FROM trades
     WHERE status='CLOSED' AND result_r IS NOT NULL AND result_r_basis='NET' AND engine=?
+      AND strategy_core_version=?
       AND (? IS NULL OR strategy=?) AND (? IS NULL OR strategy_version=?)
       AND (? IS NULL OR instrument=?) AND (? IS NULL OR regime=?) AND (? IS NULL OR side=?)`).all(engine, ...scopeArgs(scope)) as
-    Array<{ result_r: number; entry_features: string; side: "LONG" | "SHORT" }>;
+    Array<{ result_r: number; entry_features: string; entry_conditions: string | null; side: "LONG" | "SHORT" }>;
   const agg: Record<keyof SignalWeights, { sum: number; n: number }> = {
     trend: { sum: 0, n: 0 }, momentum: { sum: 0, n: 0 }, volume: { sum: 0, n: 0 }, volatility: { sum: 0, n: 0 },
   };
@@ -45,11 +50,24 @@ export function measureContributions(store: Store, engine: TradingEngine = "SWIN
     const mom = clamp1(((f.rsi14 ?? 50) - 50) / 25) * sideSign;
     const volu = clamp1(((f.volumeRatio ?? 1) - 1) / 0.5);
     const atrp = (f.atrPct ?? 0);
-    const vola = 1 - clamp01((atrp - 0.25) / 1.25); // low vol favorable for entries
-    agg.trend!.sum += outcome * trend; agg.trend!.n += 1;
-    agg.momentum!.sum += outcome * mom; agg.momentum!.n += 1;
+    const family = scope.strategy;
+    const vola = family === "BREAKOUT" ? clamp01((atrp - 0.25) / 1.25)
+      : 1 - clamp01((atrp - 0.25) / 1.25);
+    const momentum = family === "MEAN_REVERSION" ? -mom : mom;
+    const trendContribution = family === "MEAN_REVERSION" ? 0 : trend;
+    // Breakout records are supported by range-break distance and candle expansion.
+    let breakoutExpansion = 0;
+    if (family === "BREAKOUT" && r.entry_conditions) {
+      try {
+        const conditions = JSON.parse(r.entry_conditions) as Array<{ name: string; value?: number; threshold?: number }>;
+        const distance = conditions.find((entry) => entry.name === "breakout_distance_min");
+        if (distance?.value !== undefined) breakoutExpansion = clamp01(distance.value / Math.max(distance.threshold ?? 0.1, 0.1));
+      } catch { /* optional legacy snapshot */ }
+    }
+    agg.trend!.sum += outcome * trendContribution; agg.trend!.n += 1;
+    agg.momentum!.sum += outcome * momentum; agg.momentum!.n += 1;
     agg.volume!.sum += outcome * volu; agg.volume!.n += 1;
-    agg.volatility!.sum += outcome * vola; agg.volatility!.n += 1;
+    agg.volatility!.sum += outcome * (family === "BREAKOUT" ? Math.max(vola, breakoutExpansion) : vola); agg.volatility!.n += 1;
   }
   const out = {} as Record<keyof SignalWeights, number>;
   for (const k of Object.keys(agg) as Array<keyof SignalWeights>) out[k] = agg[k]!.n ? agg[k]!.sum / agg[k]!.n : 0;
@@ -59,6 +77,7 @@ export function measureContributions(store: Store, engine: TradingEngine = "SWIN
 // §31: update only every N closed trades; ±10% max change per cycle; never below 0.5 / above 2.
 export function maybeEvolveWeights(store: Store, interval: number, maxDeltaPct: number, engine: TradingEngine = "SWING_15M", minimumSample = 30, scope: LearningScope = {}): SignalWeights | null {
   const n = (store.db.prepare(`SELECT COUNT(*) c FROM trades WHERE status='CLOSED' AND result_r_basis='NET' AND engine=?
+    AND strategy_core_version=?
     AND (? IS NULL OR strategy=?) AND (? IS NULL OR strategy_version=?)
     AND (? IS NULL OR instrument=?) AND (? IS NULL OR regime=?) AND (? IS NULL OR side=?)`).get(engine, ...scopeArgs(scope)) as { c: number }).c;
   const scopedKey = scopeKey(engine, scope);
