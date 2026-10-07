@@ -177,6 +177,20 @@ CREATE TABLE IF NOT EXISTS system_events (
   kind TEXT NOT NULL,              -- RISK_EVENT|STATE|PROMOTION|REJECTION|ERROR
   payload TEXT NOT NULL            -- JSON
 );
+CREATE TABLE IF NOT EXISTS llm_runs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts TEXT NOT NULL,
+  role TEXT NOT NULL,
+  provider TEXT NOT NULL,
+  model TEXT NOT NULL,
+  status TEXT NOT NULL,
+  latency_ms INTEGER NOT NULL,
+  input_tokens INTEGER,
+  output_tokens INTEGER,
+  error_class TEXT,
+  context_ref TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_llm_runs_role_ts ON llm_runs(role,ts DESC);
 CREATE TABLE IF NOT EXISTS instruments (
   instId TEXT PRIMARY KEY, instType TEXT, tickSz TEXT, lotSz TEXT, minSz TEXT,
   ctVal TEXT, ctValCcy TEXT, cached_ts TEXT

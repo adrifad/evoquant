@@ -36,6 +36,7 @@ import { familyForV2 } from "../strategy/identity.ts";
 import { parseEvolutionConfig } from "./evolution-config.ts";
 import { resolveRuntimePolicy } from "./runtime-policy.ts";
 import { runOncePerGlobalCycle } from "./global-cycle.ts";
+import { RoleLlmService } from "./llm-role-service.ts";
 import { createLogger } from "./logger.ts";
 import { startDashboard } from "./dashboard.ts";
 import YAML from "yaml";
@@ -72,6 +73,7 @@ async function main(): Promise<void> {
   };
 
   const store = openStore(REPO_ROOT);
+  const llmRoles = new RoleLlmService({ root: REPO_ROOT, store });
   if (strategyCoreVersion === 2) ensureV2Registry(store, configuredV2Params);
   const { client } = createDemoExchange(env);
   // multi-coin scan (§17): watchlist metadata cached at startup (§7.2/§43)
@@ -130,25 +132,6 @@ async function main(): Promise<void> {
   setBotState(store, "RUNNING");
   log.info({ event: "bot_started", state: getBotState(store) });
 
-  const llm = {
-    baseUrl: env.LLM_BASE_URL ?? "", apiKey: env["LLM_API"+"_KEY"] ?? "", model: env.LLM_MODEL ?? "qwen3.8-flash-free",
-    timeoutMs: 150_000, temperature: 0.2,
-  };
-  // §87: different roles may use different models; unset → same as base
-  const llmReview = { ...llm };
-  const llmEvolve = { ...llm };
-  // live re-read each tick so dashboard Settings apply without restart (§87)
-  const refreshLlm = (): void => {
-    const e2 = loadRepoEnv(REPO_ROOT);
-    if (e2.LLM_BASE_URL) { llm.baseUrl = e2.LLM_BASE_URL; llmReview.baseUrl = e2.LLM_BASE_URL; llmEvolve.baseUrl = e2.LLM_BASE_URL; }
-    const k = e2["LLM_API" + "_KEY"];
-    for (const c of [llm, llmReview, llmEvolve]) if (k) c.apiKey = k;
-    if (e2.LLM_MODEL) llm.model = e2.LLM_MODEL;
-    llmReview.model = e2.LLM_MODEL_REVIEW ?? llm.model;
-    llmEvolve.model = e2.LLM_MODEL_EVOLUTION ?? llm.model;
-    if (e2.LLM_TEMPERATURE) { llm.temperature = Number(e2.LLM_TEMPERATURE); llmReview.temperature = Number(e2.LLM_TEMPERATURE); llmEvolve.temperature = Number(e2.LLM_TEMPERATURE); }
-  };
-
   let lastTick: { features: unknown; regime: string; at: string } | null = null;
   let lastKill: string | null = null;
   let lastScan: ScanRow[] = [];
@@ -168,22 +151,23 @@ async function main(): Promise<void> {
     getLastTick: () => lastTick,
     getKillReason: () => getLastKillReason(),
     getScan: () => lastScan,
+    llmRoles,
   });
 
   const ctxFor = (instId2: string, features: FeatureSnapshot, regime: Regime, strategies: StrategyDef[], candidate?: TradeCandidate) => ({
     features, regime, strategies,
-    ...(candidate ? { candidate, gateCandidateFn: (c: TradeCandidate) => gateCandidate(REPO_ROOT, llm, c) } : {}),
+    ...(candidate ? { candidate, gateCandidateFn: (c: TradeCandidate) => gateCandidate(REPO_ROOT, llmRoles, c) } : {}),
     decideFn: async (feat: FeatureSnapshot, reg: Regime, hasPos: boolean): Promise<Decision> =>
       strategyCoreVersion === 2 ? holdBecause("Strategy Core V2: deterministic exit policy; AI CLOSE disabled")
-        : decide(REPO_ROOT, llm, instId2, trading.timeframe, feat, reg, strategies, hasPos, store),
+        : decide(REPO_ROOT, llmRoles, instId2, trading.timeframe, feat, reg, strategies, hasPos, store),
   });
 
+  const reviewsInFlight = new Set<string>();
   let ticking = false;
   const tick = async (): Promise<void> => {
     if (ticking) { log.info({ event: "tick_skipped_overlapping" }); return; } // mutex: 15m ticks can overrun while LLM is slow
     ticking = true;
     try {
-      refreshLlm();
       const strategies = loadStrategies(store);
       const activeV2Params = strategyCoreVersion === 2 ? getV2ChampionParams(store) : configuredV2Params;
       const activeV2Versions = strategyCoreVersion === 2 ? getV2ChampionVersions(store) : {
@@ -258,7 +242,13 @@ async function main(): Promise<void> {
       // after tick: any newly-closed trades get reviewed (M4)
       const closed = store.db.prepare("SELECT trade_id FROM trades WHERE status='CLOSED' AND trade_id NOT IN (SELECT trade_id FROM trade_reviews) ORDER BY exit_ts DESC LIMIT 3").all() as Array<{ trade_id: string }>;
       if (evolution.review_every_closed_trade) {
-        for (const c of closed) await reviewTrade(REPO_ROOT, llmReview, store, c.trade_id).catch(() => undefined);
+        for (const c of closed) {
+          if (reviewsInFlight.has(c.trade_id)) continue;
+          reviewsInFlight.add(c.trade_id);
+          void reviewTrade(REPO_ROOT, llmRoles, store, c.trade_id).catch(() => {
+            log.warn({ event: "review_deferred", tradeId: c.trade_id });
+          }).finally(() => reviewsInFlight.delete(c.trade_id));
+        }
       }
 
       // One system-wide learning/evolution lifecycle per completed global market cycle.
@@ -286,14 +276,14 @@ async function main(): Promise<void> {
         } else recomputeCalibration(store, "SWING_15M", { strategyCoreVersion: 1 });
         if (evolution.strategy_evolution_enabled) {
           if (strategyCoreVersion === 2) {
-            await maybeEvolveV2Strategies(REPO_ROOT, llmEvolve, store, {
+            await maybeEvolveV2Strategies(REPO_ROOT, llmRoles, store, {
               intervalTrades: evolution.strategy_evolution_interval_trades,
               minimumSample: evolution.minimum_validation_sample,
               maxParamChanges: evolution.constraints.max_param_changes_per_challenger,
               maxParamDeltaPct: evolution.constraints.max_param_delta_pct_per_challenger,
             });
           } else {
-            await maybeEvolveStrategies(REPO_ROOT, llmEvolve, store,
+            await maybeEvolveStrategies(REPO_ROOT, llmRoles, store,
               evolution.strategy_evolution_interval_trades, evolution.constraints.max_param_changes_per_challenger,
               evolution.minimum_validation_sample, "SWING_15M");
           }
@@ -376,7 +366,7 @@ async function main(): Promise<void> {
     const scalpCfg: ScalpCfg = { ...sc, watchlist };
     scalpRunner = new ScalpRunner({
       client, trading, risk, store, instruments, cfg: scalpCfg,
-      llm: () => { refreshLlm(); return { ...llm, timeoutMs: 60_000 }; },
+      llm: llmRoles,
     });
     scalpRunner.start();
   }

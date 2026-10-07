@@ -58,6 +58,11 @@ drawdown assumptions are in `config/evaluation.yaml` and
 See [`docs/STRATEGY_CORE_V2_EVOLUTION.md`](docs/STRATEGY_CORE_V2_EVOLUTION.md)
 for lifecycle and limitations.
 
+LLM calls are routed through independent Gate, Scalp, Reviewer, Evolution, and
+Critic role configurations. Defaults, environment variables, budgets, failure
+policies, key handling, and Critic revision flow are documented in
+[`docs/ROLE_BASED_AI.md`](docs/ROLE_BASED_AI.md).
+
 ## Setup
 
 ```bash

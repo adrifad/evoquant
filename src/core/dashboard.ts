@@ -25,6 +25,8 @@ import { existsSync, readFileSync } from "node:fs";
 import { getBalance, getPositions } from "../exchange/okx/account.ts";
 import { createLogger } from "./logger.ts";
 import { listV2Versions } from "../strategy/v2-registry.ts";
+import { LLM_ROLES, type LlmRole } from "./llm-roles.ts";
+import { roleEnvironmentUpdates, type RoleLlmService } from "./llm-role-service.ts";
 
 const log = createLogger("dashboard");
 const REPO_ROOT = path.resolve(import.meta.dirname, "../..");
@@ -49,6 +51,8 @@ export interface DashboardConfig {
     reviewEvery: boolean; signalInterval: number; strategyInterval: number; minSample: number;
     maxWeightChangePct: number; maxParamChanges: number;
   };
+  llmRoles?: RoleLlmService;
+  settingsFile?: string;
 }
 
 export interface DashboardServer {
@@ -58,6 +62,7 @@ export interface DashboardServer {
 
 export function startDashboard(cfg: DashboardConfig): DashboardServer {
   const store = cfg.deps().store;
+  const settingsFile = cfg.settingsFile ?? path.join(REPO_ROOT, ".env");
 
   // §65/§69 — live unrealized PnL per open trade, sourced from the
   // exchange positions endpoint (upl, markPx — source of truth §7.8).
@@ -283,6 +288,43 @@ export function startDashboard(cfg: DashboardConfig): DashboardServer {
       setBotState(store, p.endsWith("pause") ? "PAUSED" : "RUNNING");
       return send(200, { ok: true, state: getBotState(store) });
     }
+    if (p === "/api/settings/llm-roles") {
+      if (!cfg.llmRoles) return send(503, { error: "ROLE_SETTINGS_UNAVAILABLE" });
+      if (method === "GET") return send(200, { roles: cfg.llmRoles.settings() });
+    }
+    const rolePath = p.match(/^\/api\/settings\/llm-roles\/([a-z]+)(?:\/(test|api-key))?$/);
+    if (rolePath && cfg.llmRoles) {
+      const roleName = rolePath[1] ?? "";
+      if (!LLM_ROLES.includes(roleName as LlmRole)) return send(404, { error: "not found" });
+      const role = roleName as LlmRole;
+      const action = rolePath[2] ?? "";
+      if (method === "PUT" && !action) {
+        const body = await readJson(req);
+        try {
+          const update = cfg.llmRoles.validateUpdate(role, body);
+          const envUpdates = roleEnvironmentUpdates(role, update);
+          if (Object.keys(envUpdates).length) setEnvKeys(settingsFile, envUpdates);
+          cfg.llmRoles.updateRuntime(role, update);
+          const changed = Object.keys(envUpdates).map((key) => key.endsWith("_API_KEY") ? "apiKey(set)" : key);
+          log.info({ event: "llm_role_settings_updated", role, changed });
+          return send(200, { ok: true, note: "Saved. The next request for this role uses the updated settings." });
+        } catch {
+          return send(400, { error: "INVALID_ROLE_CONFIG" });
+        }
+      }
+      if (method === "POST" && action === "test") {
+        const result = await cfg.llmRoles.testConnection(role, await readJson(req));
+        return send(result.success ? 200 : 502, result);
+      }
+      if (method === "DELETE" && action === "api-key") {
+        if (url.searchParams.get("confirm") !== "yes") return send(400, { error: "confirm=yes required" });
+        setEnvKeys(settingsFile, roleEnvironmentUpdates(role, {}, true));
+        cfg.llmRoles.clearApiKey(role);
+        log.info({ event: "llm_role_api_key_cleared", role });
+        return send(200, { ok: true, role, apiKeyConfigured: false });
+      }
+      return send(405, { error: "method not allowed" });
+    }
     if (method === "GET" && p === "/api/settings") {
       const env = loadRepoEnvSafe();
       return send(200, {
@@ -312,7 +354,7 @@ export function startDashboard(cfg: DashboardConfig): DashboardServer {
       for (const k of allowed) if (typeof body[k] === "string" || typeof body[k] === "number") updates[k] = String(body[k]);
       const ak = body[KEY_INPUT_NAME];
       if (typeof ak === "string" && ak.startsWith("sk-")) updates[KEY_ENV_NAME] = ak; // never echoed back (§87)
-      setEnvKeys(path.join(REPO_ROOT, ".env"), updates);
+      setEnvKeys(settingsFile, updates);
       log.info({ event: "settings_updated", changed: Object.keys(updates).map((k) => (k === KEY_ENV_NAME ? "apiKey(set)" : k)) });
       return send(200, { ok: true, note: "applies from next candle tick; key never returned to browser" });
     }

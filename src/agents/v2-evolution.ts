@@ -1,7 +1,8 @@
 import { z } from "zod";
 import { readFileSync } from "node:fs";
 import path from "node:path";
-import { llmJson, type LlmConfig } from "../core/llm.ts";
+import type { RoleLlmService } from "../core/llm-role-service.ts";
+import { critiqueV2Proposal, type CriticVerdict } from "./critic-agent.ts";
 import type { Store } from "../memory/db.ts";
 import { logSystemEvent, kvGet, kvSet } from "../memory/db.ts";
 import type { TradingEngine } from "../memory/engines.ts";
@@ -78,7 +79,7 @@ export function validateV2Proposal(input: {
 }
 
 /** Runs at most once per global tick; it only creates immutable V2 Challenger records. */
-export async function maybeEvolveV2Strategies(root: string, cfg: LlmConfig, store: Store,
+export async function maybeEvolveV2Strategies(root: string, roles: RoleLlmService, store: Store,
   evolution: V2EvolutionConfig, engine: TradingEngine = "SWING_15M"): Promise<number> {
   const champions = getV2Champions(store);
   const evidenceByStrategy = new Map<StrategyV2Id, ClosedEvidence[]>();
@@ -126,9 +127,9 @@ export async function maybeEvolveV2Strategies(root: string, cfg: LlmConfig, stor
       evidence_cutoff_ts: latestEvidenceExitTs(trades),
     }];
   }));
-  const result = await llmJson(cfg, prompt, JSON.stringify({ engine, strategies: strategyEvidence,
+  const result = await roles.json("evolution", prompt, JSON.stringify({ engine, strategies: strategyEvidence,
     constraints: { max_parameter_changes_per_challenger: evolution.maxParamChanges,
-      max_parameter_delta_pct: evolution.maxParamDeltaPct, minimum_closed_trade_sample: evolution.minimumSample } }), ProposalSchema);
+      max_parameter_delta_pct: evolution.maxParamDeltaPct, minimum_closed_trade_sample: evolution.minimumSample } }), ProposalSchema, "v2_strategy_evolution");
   let created = 0;
   for (const strategy of ready) {
     const tradeCount = evidenceByStrategy.get(strategy)?.length ?? 0;
@@ -141,37 +142,94 @@ export async function maybeEvolveV2Strategies(root: string, cfg: LlmConfig, stor
   const seen = new Set<StrategyV2Id>();
   for (const proposal of result.proposals) {
     const champion = champions[proposal.strategy];
-    const validation = validateV2Proposal({ strategy: proposal.strategy, parentVersion: proposal.parent_version,
-      changedParameter: proposal.changed_parameter, oldValue: proposal.old_value, newValue: proposal.new_value },
-    champion, evolution.maxParamChanges, evolution.maxParamDeltaPct);
-    let reason = validation.reason;
+    let reason: string | undefined;
     if (!ready.includes(proposal.strategy)) reason = "strategy has not reached its evolution evidence interval";
     if (seen.has(proposal.strategy)) reason = "only one proposal per strategy family is accepted per cycle";
-    if (reason || !validation.params) {
-      logSystemEvent(store, "EVOLUTION_PROPOSAL_REJECTED", { engine, proposal, reason: reason ?? "invalid parameter schema" });
+    const evidence = strategyEvidence[proposal.strategy];
+    const review = reason ? null : await reviewWithCritic(root, roles, store, proposal, evidence);
+    if (!review?.proposal) reason ??= review?.reason ?? "Critic unavailable or rejected proposal";
+    if (reason || !review || !review.proposal) {
+      logSystemEvent(store, "EVOLUTION_PROPOSAL_REJECTED", { engine, strategy: proposal.strategy,
+        parentVersion: proposal.parent_version, changedParameter: proposal.changed_parameter, reason,
+        ...(review ? { criticVerdict: review.verdict, criticConfidence: review.confidence, revisionRound: review.revisionRound } : {}) });
+      continue;
+    }
+    const acceptedProposal = review.proposal;
+    const validation = validateV2Proposal({ strategy: acceptedProposal.strategy, parentVersion: acceptedProposal.parent_version,
+      changedParameter: acceptedProposal.changed_parameter, oldValue: acceptedProposal.old_value, newValue: acceptedProposal.new_value },
+    champion, evolution.maxParamChanges, evolution.maxParamDeltaPct);
+    if (!validation.ok || !validation.params) {
+      logSystemEvent(store, "EVOLUTION_PROPOSAL_REJECTED", { engine, strategy: acceptedProposal.strategy,
+        parentVersion: acceptedProposal.parent_version, changedParameter: acceptedProposal.changed_parameter,
+        criticVerdict: review.verdict, criticConfidence: review.confidence, revisionRound: review.revisionRound,
+        reason: validation.reason ?? "deterministic validator rejected proposal" });
       continue;
     }
     seen.add(proposal.strategy);
     try {
       const proposalTrades = evidenceByStrategy.get(proposal.strategy) ?? [];
-      const version = createV2Challenger(store, { strategy: proposal.strategy, parentVersion: champion.version,
-        params: validation.params, changedParameter: proposal.changed_parameter, oldValue: proposal.old_value,
-        newValue: proposal.new_value, hypothesis: proposal.hypothesis,
+      const version = createV2Challenger(store, { strategy: acceptedProposal.strategy, parentVersion: champion.version,
+        params: validation.params, changedParameter: acceptedProposal.changed_parameter, oldValue: acceptedProposal.old_value,
+        newValue: acceptedProposal.new_value, hypothesis: acceptedProposal.hypothesis,
         evidence: { engine, sample: proposalTrades.length,
           summary: summarize(proposalTrades.map((trade) => trade.result_r)),
           capturedAt: new Date().toISOString(),
-          evidenceCutoffTs: latestEvidenceExitTs(proposalTrades) } });
-      logSystemEvent(store, "CHALLENGER_CREATED", { engine, strategy: proposal.strategy, version,
-        parentVersion: champion.version, changedParameter: proposal.changed_parameter,
-        oldValue: proposal.old_value, newValue: proposal.new_value });
+          evidenceCutoffTs: latestEvidenceExitTs(proposalTrades), evolutionModel: roles.resolve("evolution").config.model,
+          criticModel: roles.resolve("critic").config.model, criticVerdict: review.verdict,
+          criticConfidence: review.confidence, revisionRound: review.revisionRound } });
+      logSystemEvent(store, "CHALLENGER_CREATED", { engine, strategy: acceptedProposal.strategy, version,
+        parentVersion: champion.version, changedParameter: acceptedProposal.changed_parameter,
+        oldValue: acceptedProposal.old_value, newValue: acceptedProposal.new_value, evolutionModel: roles.resolve("evolution").config.model,
+        criticModel: roles.resolve("critic").config.model, criticVerdict: review.verdict,
+        criticConfidence: review.confidence, revisionRound: review.revisionRound });
       created++;
     } catch (e) {
-      logSystemEvent(store, "EVOLUTION_PROPOSAL_REJECTED", { engine, proposal,
+      logSystemEvent(store, "EVOLUTION_PROPOSAL_REJECTED", { engine, strategy: acceptedProposal.strategy,
+        parentVersion: acceptedProposal.parent_version, changedParameter: acceptedProposal.changed_parameter,
         reason: e instanceof Error ? e.message : "immutable registry rejected proposal" });
     }
   }
   if (created === 0 && result.proposals.length > 0) logSystemEvent(store, "EVOLUTION_NO_CHANGE", { engine, strategies: ready, reason: "all proposals rejected" });
   return created;
+}
+
+type ProposalSchemaType = z.infer<typeof ProposalSchema>["proposals"][number];
+
+async function reviewWithCritic(root: string, roles: RoleLlmService, store: Store, proposal: ProposalSchemaType, evidence: unknown): Promise<{
+  proposal: ProposalSchemaType | null; verdict: CriticVerdict["verdict"] | "UNAVAILABLE"; confidence: number | null;
+  revisionRound: number; reason: string | null;
+}> {
+  let current = proposal;
+  const criticModel = roles.resolve("critic").config.maxRevisionRounds;
+  const first = await critiqueV2Proposal(root, roles, { proposal: current, aggregatedEvidence: evidence, revisionRound: 0 });
+  if (!first) return { proposal: null, verdict: "UNAVAILABLE", confidence: null, revisionRound: 0, reason: "Critic unavailable or invalid" };
+  logSystemEvent(store, "CRITIC_REVIEW", { strategy: current.strategy, parentVersion: current.parent_version,
+    changedParameter: current.changed_parameter, verdict: first.verdict, confidence: first.confidence,
+    revisionRound: 0, criticModel: roles.resolve("critic").config.model, issues: first.issues });
+  if (first.verdict === "ACCEPT") return { proposal: current, verdict: first.verdict, confidence: first.confidence, revisionRound: 0, reason: null };
+  if (first.verdict === "REJECT") return { proposal: null, verdict: first.verdict, confidence: first.confidence, revisionRound: 0, reason: first.issues.join("; ") || "Critic rejected proposal" };
+  if (criticModel < 1) return { proposal: null, verdict: first.verdict, confidence: first.confidence, revisionRound: 0, reason: "Critic revision disabled" };
+
+  const evolutionPrompt = readFileSync(path.join(root, "prompts/evolution-v2.md"), "utf8");
+  const revision = await roles.json("evolution", evolutionPrompt, JSON.stringify({
+    task: "Revise this one proposal exactly once using the Critic feedback. Keep the same strategy family and parent version. Return zero or one proposal.",
+    proposal: current, aggregatedEvidence: evidence, criticFeedback: { issues: first.issues, reasoning_summary: first.reasoning_summary },
+    constraints: { maximum_revision_round: 1, maximum_parameters_changed: 1 },
+  }), ProposalSchema, "v2_proposal_revision");
+  if (!revision || revision.proposals.length !== 1 || revision.proposals[0]?.strategy !== proposal.strategy
+    || revision.proposals[0]?.parent_version !== proposal.parent_version) {
+    return { proposal: null, verdict: "REVISE", confidence: first.confidence, revisionRound: 1, reason: "Evolution did not return one revision for the same parent and strategy" };
+  }
+  current = revision.proposals[0];
+  const finalReview = await critiqueV2Proposal(root, roles, { proposal: current, aggregatedEvidence: evidence, revisionRound: 1,
+    previousCritique: { issues: first.issues, reasoning_summary: first.reasoning_summary } });
+  if (!finalReview) return { proposal: null, verdict: "UNAVAILABLE", confidence: null, revisionRound: 1, reason: "Critic unavailable after revision" };
+  logSystemEvent(store, "CRITIC_REVIEW", { strategy: current.strategy, parentVersion: current.parent_version,
+    changedParameter: current.changed_parameter, verdict: finalReview.verdict, confidence: finalReview.confidence,
+    revisionRound: 1, criticModel: roles.resolve("critic").config.model, issues: finalReview.issues });
+  if (finalReview.verdict !== "ACCEPT") return { proposal: null, verdict: finalReview.verdict, confidence: finalReview.confidence,
+    revisionRound: 1, reason: finalReview.issues.join("; ") || "Critic did not accept the single revision" };
+  return { proposal: current, verdict: finalReview.verdict, confidence: finalReview.confidence, revisionRound: 1, reason: null };
 }
 
 function normalizedMfe(trade: ClosedEvidence): number { const risk = Math.abs(Number(trade.entry_px) - Number(trade.initial_stop_px)); return risk > 0 ? Number(trade.mfe ?? 0) / risk : 0; }

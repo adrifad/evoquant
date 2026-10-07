@@ -120,6 +120,8 @@ function toneClass(tone: string): string {
 
 function statusTone(value: string): string {
   const status = value.toUpperCase();
+  if (["AVAILABLE", "SUCCESS"].includes(status)) return "positive";
+  if (["BUDGET_EXHAUSTED", "UNCONFIGURED", "DISABLED"].includes(status)) return status === "BUDGET_EXHAUSTED" ? "warning" : "neutral";
   if (["RUNNING", "APPROVED", "CHAMPION", "VERIFIED", "PROMOTED", "SAFE", "LONG", "WIN"].includes(status)) return status === "LONG" ? "long" : "positive";
   if (["RISK_HALTED", "ERROR", "REJECTED", "HALTED", "LOSS", "SHORT", "DISCONNECTED"].includes(status)) return status === "SHORT" ? "short" : "critical";
   if (["PAUSED", "WARNING", "CHALLENGER", "PROVISIONAL", "REINFORCED", "TESTING"].includes(status)) return "warning";

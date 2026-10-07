@@ -3,7 +3,7 @@
 import { readFileSync } from "node:fs";
 import path from "node:path";
 import { z } from "zod";
-import { llmJson, type LlmConfig } from "../core/llm.ts";
+import type { RoleLlmService } from "../core/llm-role-service.ts";
 import { upsertLesson } from "../memory/lessons.ts";
 import { logSystemEvent } from "../memory/db.ts";
 import type { Store } from "../memory/db.ts";
@@ -30,7 +30,7 @@ export type Review = z.infer<typeof ReviewSchema>;
 
 export async function reviewTrade(
   root: string,
-  cfg: LlmConfig,
+  roles: RoleLlmService,
   store: Store,
   tradeId: string,
 ): Promise<Review | null> {
@@ -41,19 +41,21 @@ export async function reviewTrade(
   const input = {
     trade_id: t.trade_id,
     engine: t.engine ?? (t.timeframe === "scalp" ? "SCALP_5M" : "SWING_15M"),
-    side: t.side, regime: t.regime,
-    strategy: `${t.strategy}_V${t.strategy_version}`,
+    side: t.side, regime: t.regime, regime_axes: t.regime_axes,
+    strategy: t.strategy, strategy_core_version: t.strategy_core_version, strategy_version: t.strategy_version,
     entry: { px: t.entry_px, ts: t.entry_ts, features: JSON.parse(String(t.entry_features ?? "{}")) },
     entry_conditions: (() => { try { return JSON.parse(String(t.entry_conditions ?? "[]")) as unknown[]; } catch { return []; } })(),
     exit: { px: t.exit_px, ts: t.exit_ts, reason: t.exit_reason },
-    result: { pnl: t.pnl, pnl_pct: t.pnl_pct, result_r: t.result_r, net_r: t.result_r, mfe: t.mfe, mae: t.mae,
+    result: { pnl: t.pnl, pnl_pct: t.pnl_pct, gross_r: initialRisk > 0
+      ? ((Number(t.exit_px) - Number(t.entry_px)) * (t.side === "LONG" ? 1 : -1)) / initialRisk : null,
+      result_r: t.result_r, net_r: t.result_r, fees: t.fees, funding: t.funding, mfe: t.mfe, mae: t.mae,
       mfe_r: initialRisk > 0 ? Number(t.mfe) / initialRisk : null, mae_r: initialRisk > 0 ? Number(t.mae) / initialRisk : null,
-      fees: t.fees, exit_reason: t.exit_reason },
+      exit_reason: t.exit_reason },
     execution: { initial_stop_px: t.initial_stop_px, stop_px: t.stop_px, take_profit_px: t.take_profit_px },
     duration_s: t.duration_s,
     decision: { raw_confidence: t.raw_confidence, calibrated_confidence: t.calibrated_confidence },
   };
-  const review = await llmJson(cfg, prompt, JSON.stringify(input), ReviewSchema);
+  const review = await roles.json("reviewer", prompt, JSON.stringify(input), ReviewSchema, "closed_trade_review");
   if (!review) {
     logSystemEvent(store, "REVIEW", { tradeId, result: "llm_invalid_no_review" });
     return null;

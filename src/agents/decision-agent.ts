@@ -5,11 +5,9 @@ import path from "node:path";
 import { z } from "zod";
 import type { FeatureSnapshot } from "../market/features.ts";
 import type { Regime } from "../market/regime.ts";
-import { llmJson, type LlmConfig } from "../core/llm.ts";
+import type { RoleLlmService } from "../core/llm-role-service.ts";
 import type { StrategyDef } from "../strategy/library.ts";
 import type { Store } from "../memory/db.ts";
-import { getRegimeStatsBrief } from "../memory/regimes.ts";
-import { getActiveLessons } from "../memory/lessons.ts";
 import type { TradeCandidate } from "../strategy/core-v2.ts";
 
 export const DecisionSchema = z.object({
@@ -28,18 +26,18 @@ export const CandidateGateSchema = z.object({
   confidence: z.number().min(0).max(1),
   reasoning: z.array(z.string().max(280)).max(5).default([]),
   risk_flags: z.array(z.string().max(120)).max(5).default([]),
-});
+}).strict();
 export type CandidateGate = z.infer<typeof CandidateGateSchema>;
 
 /** LLM may veto or allow only; candidate side, strategy and geometry are immutable. */
-export async function gateCandidate(root: string, cfg: LlmConfig, candidate: TradeCandidate): Promise<CandidateGate | null> {
+export async function gateCandidate(root: string, roles: RoleLlmService, candidate: TradeCandidate): Promise<CandidateGate | null> {
   const prompt = readFileSync(path.join(root, "prompts/candidate-gate.md"), "utf8");
-  return llmJson(cfg, prompt, JSON.stringify({
+  return roles.json("gate", prompt, JSON.stringify({
     instrument: candidate.instrument, engine: candidate.engine, strategy: candidate.strategy,
     version: candidate.strategyVersion, side: candidate.side, setup_score: candidate.setupScore,
     entry: candidate.entryPrice, stop: candidate.stopPrice, take_profit: candidate.takeProfitPrice,
     regime: candidate.regime, conditions: candidate.conditions, reasoning: candidate.reasoning,
-  }), CandidateGateSchema);
+  }), CandidateGateSchema, "candidate_gate");
 }
 
 export const HOLD: Decision = {
@@ -54,7 +52,7 @@ export function holdBecause(reason: string): Decision {
 
 export async function decide(
   root: string,
-  cfg: LlmConfig,
+  roles: RoleLlmService,
   instrument: string,
   timeframe: string,
   f: FeatureSnapshot,
@@ -63,46 +61,8 @@ export async function decide(
   hasPosition: boolean,
   store: Store,
 ): Promise<Decision> {
-  if (!f.sufficientData) return holdBecause("warm-up incomplete — HOLD (§17)");
-  if (regime === "UNKNOWN") return holdBecause("regime UNKNOWN → HOLD (§50)");
-  const prompt = readFileSync(path.join(root, "prompts/decision.md"), "utf8");
-  const input = {
-    instrument, timeframe,
-    market: {
-      regime, price: f.price,
-      ema20: r2(f.ema20), ema50: r2(f.ema50), emaSpreadPct: r2(f.emaSpreadPct),
-      rsi14: r2(f.rsi14), adx14: r2(f.adx14), atr14: r2(f.atr14), atrPct: r2(f.atrPct),
-      volume_ratio: r2(f.volumeRatio),
-    },
-    open_position: hasPosition,
-    enabled_strategies: strategies
-      .filter((s) => s.status === "CHAMPION" && s.allowed_regimes.includes(regime))
-      .map((s) => ({ id: `${s.name}_V${s.version}`, params: s.params })),
-    strategy_memory: getRegimeStatsBrief(store, regime),   // §32
-    lessons: getActiveLessons(store, instrument),          // §29
-  };
-  const out = await llmJson(cfg, prompt, JSON.stringify(input), DecisionSchema);
-  if (!out) return holdBecause("decision LLM invalid output → safe HOLD");
-  // §21: strategy must be one of the enabled+regime-valid set — clamp if not.
-  const validIds = new Set(strategies.filter((s) => s.status === "CHAMPION" && s.allowed_regimes.includes(regime)).map((s) => `${s.name}_V${s.version}`));
-  if (typeof out.strategy === "string" && !validIds.has(out.strategy)) {
-    return { ...out, strategy: [...validIds][0] ?? null };
-  }
-  // 0 from the model means "use strategy defaults" (§21 fields are suggestions)
-  let stop = out.suggested_stop_atr || 0, tp = out.suggested_take_profit_atr || 0;
-  const chosen = strategies.find((s2) => `${s2.name}_V${s2.version}` === out.strategy);
-  if (stop < 0.2 || tp < 0.2) {
-    stop = chosen?.params.stop_atr ?? 1.5;
-    tp = chosen?.params.take_profit_atr ?? 3.0;
-  }
-  const normalized = { ...out, suggested_stop_atr: stop, suggested_take_profit_atr: tp };
-  if (hasPosition && out.decision !== "HOLD" && out.decision !== "CLOSE") {
-    return { ...normalized, decision: "HOLD", thesis: [...out.thesis, "position already open — cannot add (§23)"] };
-  }
-  if (!hasPosition && out.decision === "CLOSE") {
-    return { ...normalized, decision: "HOLD", thesis: [...out.thesis, "nothing to close — HOLD"] };
-  }
-  return normalized;
+  // Legacy Core 1 has no deterministic candidate contract in this repository.
+  // Do not let the Gate role invent direction, strategy, or exit geometry.
+  void root; void roles; void instrument; void timeframe; void f; void regime; void strategies; void hasPosition; void store;
+  return holdBecause("Core 1 directional LLM path disabled; no deterministic candidate available");
 }
-
-const r2 = (n: number): number => (Number.isFinite(n) ? Math.round(n * 100) / 100 : 0);

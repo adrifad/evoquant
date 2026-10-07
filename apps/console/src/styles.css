@@ -417,6 +417,41 @@ th.numeric, td.numeric { text-align: right; font-variant-numeric: tabular-nums; 
 .locked-control-list { display: flex; flex-wrap: wrap; gap: 7px; padding: 12px 14px 14px; }
 .locked-control-list .badge { min-height: 25px; }
 
+.ai-roles-section { display: grid; gap: 11px; min-width: 0; }
+.ai-roles-heading { display: flex; align-items: center; justify-content: space-between; gap: 14px; }
+.ai-roles-heading h2 { margin: 0; color: var(--text-strong); font-size: 15px; font-weight: 620; letter-spacing: -.015em; }
+.ai-roles-heading p { margin: 4px 0 0; color: var(--muted); font-size: 11px; }
+.ai-role-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); align-items: start; gap: 12px; }
+.ai-role-card { min-width: 0; overflow: hidden; border: 1px solid var(--line); border-radius: var(--radius-panel); background: var(--surface); }
+.ai-role-card-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; padding: 13px 14px 11px; border-bottom: 1px solid var(--line); }
+.ai-role-heading-copy { min-width: 0; }
+.ai-role-title-line { display: flex; align-items: center; gap: 8px; }
+.ai-role-title-line h3 { margin: 0; color: var(--text-strong); font-size: 13px; font-weight: 620; }
+.ai-role-heading-copy > p { margin: 4px 0 8px; color: var(--muted); font-size: 10px; }
+.ai-role-endpoint { display: flex; flex-wrap: wrap; gap: 5px 12px; color: var(--quiet); font-size: 10px; }
+.ai-role-endpoint span { max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ai-role-endpoint span:nth-child(2) { color: var(--text); font-family: "IBM Plex Mono", "SFMono-Regular", Consolas, ui-monospace, monospace; }
+.role-enabled { display: inline-flex; align-items: center; gap: 7px; flex: 0 0 auto; min-height: 32px; color: var(--muted); font-size: 10px; cursor: pointer; }
+.role-enabled input { width: 16px; height: 16px; margin: 0; accent-color: var(--accent); }
+.ai-role-form { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px 10px; padding: 11px 14px 13px; }
+.role-form-field { display: grid; align-content: start; gap: 4px; min-width: 0; color: var(--muted); font-size: 10px; }
+.role-form-field > span { display: flex; align-items: baseline; justify-content: space-between; gap: 6px; }
+.role-form-field small { overflow: hidden; color: var(--quiet); font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
+.role-form-field input, .role-form-field select { width: 100%; min-width: 0; min-height: 34px; padding: 6px 8px; border: 1px solid var(--line-strong); border-radius: var(--radius-control); outline: none; background: var(--surface-deep); color: var(--text); font-size: 11px; }
+.role-form-field input::placeholder { color: var(--quiet); }
+.role-form-wide { grid-column: 1 / -1; }
+.ai-role-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 7px; margin-top: 2px; }
+.ai-role-actions .primary-button, .ai-role-actions .secondary-button { min-height: 34px; }
+.role-clear-key { color: var(--warning); }
+.role-message { grid-column: 1 / -1; margin: 0; font-size: 10px; }
+.role-message-positive { color: var(--positive); }
+.role-message-warning { color: var(--warning); }
+.role-message-negative { color: var(--negative); }
+.ai-role-health { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 7px; padding: 9px 14px 11px; border-top: 1px solid var(--line); background: var(--surface-deep); }
+.ai-role-health > div { display: grid; gap: 3px; min-width: 0; }
+.ai-role-health span { color: var(--quiet); font-size: 9px; }
+.ai-role-health strong { overflow: hidden; color: var(--text); font: 10px/1.35 "IBM Plex Mono", "SFMono-Regular", Consolas, ui-monospace, monospace; font-weight: 500; text-overflow: ellipsis; white-space: nowrap; }
+
 .log-controls { align-items: flex-end; justify-content: space-between; flex-wrap: wrap; }
 .log-tabs { flex: 0 1 auto; }
 .log-controls .filter-search { max-width: 350px; }
@@ -537,7 +572,7 @@ th.numeric, td.numeric { text-align: right; font-variant-numeric: tabular-nums; 
   .calibration-axis, .calibration-row { min-width: 590px; grid-template-columns: 92px minmax(90px, 1fr) 48px 57px 125px; gap: 7px; }
   .ledger-filters, .log-controls { align-items: stretch; flex-direction: column; padding: 10px; }
   .filter-control, .log-controls .filter-search { width: 100%; max-width: none; }
-  .filter-control input, .filter-control select, .form-field input { min-height: 44px; }
+  .filter-control input, .filter-control select, .form-field input, .role-form-field input, .role-form-field select { min-height: 44px; }
   .log-tabs { width: 100%; }
   .log-tabs button { flex: 0 0 auto; min-height: 44px; padding-inline: 10px; }
   .trade-dialog { width: calc(100vw - 12px); max-height: 96dvh; border-radius: 6px; }
@@ -550,6 +585,13 @@ th.numeric, td.numeric { text-align: right; font-variant-numeric: tabular-nums; 
   .replay-excursions { grid-template-columns: minmax(0, 1fr); gap: 2px; padding-inline: 7px; }
   .replay-excursions .data-footnote { grid-column: auto; }
   .settings-grid { grid-template-columns: minmax(0, 1fr); gap: 10px; }
+  .ai-role-grid { grid-template-columns: minmax(0, 1fr); gap: 9px; }
+  .ai-role-form { padding: 10px; gap: 8px; }
+  .ai-role-card-heading { padding: 11px 10px 9px; }
+  .ai-role-health { grid-template-columns: repeat(2, minmax(0, 1fr)); padding-inline: 10px; }
+  .ai-role-health > div:last-child { grid-column: 1 / -1; }
+  .ai-role-actions { align-items: stretch; }
+  .ai-role-actions button { flex: 1 1 auto; }
   .locked-control-list { gap: 5px; padding-inline: 10px; }
   .app-footer { flex-wrap: wrap; padding: 0 10px 12px; font-size: 9px; }
 }

@@ -1,0 +1,60 @@
+# Non-secret role defaults. API keys are supplied by server-local environment
+# or the Settings page, never by this file.
+llm:
+  roles:
+    gate:
+      enabled: true
+      provider: ""
+      base_url: ""
+      model: deepseek-v4.1-flash
+      temperature: 0.10
+      timeout_ms: 20000
+      max_output_tokens: 250
+      retries: 1
+      budget:
+        max_calls_per_hour: 30
+    scalp:
+      enabled: true
+      provider: ""
+      base_url: ""
+      model: qwen3.8-flash
+      temperature: 0.15
+      timeout_ms: 20000
+      max_output_tokens: 350
+      retries: 1
+      budget:
+        max_calls_per_hour: 12
+    reviewer:
+      enabled: true
+      provider: ""
+      base_url: ""
+      model: glm-5.3
+      temperature: 0.20
+      timeout_ms: 60000
+      max_output_tokens: 900
+      retries: 2
+      budget:
+        max_calls_per_hour: 10
+    evolution:
+      enabled: true
+      provider: ""
+      base_url: ""
+      model: deepseek-v4-pro:cloudflare
+      temperature: 0.20
+      timeout_ms: 120000
+      max_output_tokens: 1500
+      retries: 2
+      budget:
+        max_calls_per_day: 8
+    critic:
+      enabled: true
+      provider: ""
+      base_url: ""
+      model: qwen3.7-plus
+      temperature: 0.10
+      timeout_ms: 90000
+      max_output_tokens: 1000
+      retries: 2
+      max_revision_rounds: 1
+      budget:
+        max_calls_per_day: 8

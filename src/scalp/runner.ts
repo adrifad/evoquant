@@ -16,7 +16,7 @@ import { placeConditionalProtection } from "../exchange/okx/algo.ts";
 import { updateTradeStopPlus } from "../execution/position-management.ts";
 import type { RiskConfig, TradingConfig } from "../core/config.ts";
 import type { Store } from "../memory/db.ts";
-import { kvGet, kvSet, logSystemEvent } from "../memory/db.ts";
+import { kvSet, logSystemEvent } from "../memory/db.ts";
 import { openTrade, nextDecisionId, recordDecision } from "../memory/trades.ts";
 import { getOpenTrades } from "../memory/trades.ts";
 import { buildFeatures, type FeatureSnapshot } from "../market/features.ts";
@@ -24,10 +24,10 @@ import { classifyRegime } from "../market/regime.ts";
 import { clId, closeTradeOnExchange, priceTrigger } from "../execution/executor.ts";
 import { CandleCloseScheduler, msForBar } from "../core/scheduler.ts";
 import { createLogger } from "../core/logger.ts";
-import type { LlmConfig } from "../core/llm.ts";
+import type { RoleLlmService } from "../core/llm-role-service.ts";
 import { fetchStance, gateSignal } from "../agents/scalp-agent.ts";
 import {
-  evaluateSignal, stanceAllows, budgetAllows, dailyAllows, hourKey,
+  evaluateSignal, stanceAllows, dailyAllows,
   type ScalpCfg, type ScalpSignal, type Stance,
 } from "./signals.ts";
 import { sizePosition } from "../risk/position-sizing.ts";
@@ -47,7 +47,7 @@ export interface ScalpDeps {
   risk: RiskConfig;
   store: Store;
   instruments: Record<string, InstrumentInfo>;
-  llm: () => LlmConfig;          // live provider config (refreshed by main)
+  llm: RoleLlmService;
   cfg: ScalpCfg;
 }
 
@@ -98,7 +98,7 @@ export class ScalpRunner {
     const session = this.d.store.db.prepare(
       "SELECT COALESCE(SUM(result_r),0) s, COUNT(*) n FROM trades WHERE timeframe=? AND entry_ts>=?",
     ).get(TF_TAG, dayStart) as { s: number; n: number };
-    const st = await fetchStance(this.d.llm(), {
+    const st = await fetchStance(this.d.llm, {
       regimes, atrPcts: atrs, sessionPnlR: Math.round(session.s * 100) / 100, tradesToday: session.n,
     });
     this.stance = st.stance;
@@ -154,26 +154,20 @@ export class ScalpRunner {
       }
       signals.sort((a, b) => b.score - a.score);
 
-      // policy filter first (deterministic), LLM gate only for survivors — budgeted
-      const hk = hourKey(new Date().toISOString());
-      const budgetUsed = Number(JSON.parse(kvGet(this.d.store, `scalp_gate_${hk}`) ?? "0"));
+      // Deterministic policy first. The shared role service owns request budgets.
       for (const sig of signals) {
         if (openAll.length + this.inFlight.size >= this.d.risk.hard_limits.max_concurrent_positions) break;
         if (openAll.some((t) => String(t.instrument) === sig.instrument)) continue; // one/symbol (shared)
         if (this.inFlight.has(sig.instrument)) continue;
         const pol = stanceAllows(this.stance, sig);
         if (!pol.allow) { log.info({ event: "scalp_policy_deny", inst: sig.instrument, reason: pol.reason }); continue; }
-        if (this.d.cfg.llm_gate) {
-          if (!budgetAllows(budgetUsed, this.d.cfg.llm_max_per_hour)) { log.info({ event: "scalp_gate_budget" }); break; }
-          const snap = snaps.find((s) => s.instrument === sig.instrument)!;
-          const g = await gateSignal(this.d.llm(), sig, this.d.cfg, {
-            stance: this.stance, regime: snap.regime, atrPct15m: snap.features.atrPct, spreadOk: true,
-          });
-          const used = budgetUsed + 1;
-          kvSet(this.d.store, `scalp_gate_${hk}`, String(used));
-          if (!g.allow) { log.info({ event: "scalp_llm_deny", inst: sig.instrument, reason: g.reason.slice(0, 120) }); continue; }
-          log.info({ event: "scalp_llm_allow", inst: sig.instrument, conf: g.confidence });
-        }
+        if (!this.d.cfg.llm_gate) { log.info({ event: "scalp_skip_gate_disabled" }); break; }
+        const snap = snaps.find((s) => s.instrument === sig.instrument)!;
+        const g = await gateSignal(this.d.llm, sig, this.d.cfg, {
+          stance: this.stance, regime: snap.regime, atrPct15m: snap.features.atrPct, spreadOk: true,
+        });
+        if (!g.allow) { log.info({ event: "scalp_llm_deny", inst: sig.instrument, reason: g.reason.slice(0, 120) }); continue; }
+        log.info({ event: "scalp_llm_allow", inst: sig.instrument, conf: g.confidence });
         await this.openScalp(sig, snaps.find((s) => s.instrument === sig.instrument)!.features);
         if (signals.length > 0) break; // ≤1 new scalp per candle
       }

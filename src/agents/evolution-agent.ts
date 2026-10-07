@@ -3,7 +3,7 @@
 import { readFileSync } from "node:fs";
 import path from "node:path";
 import { z } from "zod";
-import { llmJson, type LlmConfig } from "../core/llm.ts";
+import type { RoleLlmService } from "../core/llm-role-service.ts";
 import type { Store } from "../memory/db.ts";
 import { logSystemEvent } from "../memory/db.ts";
 import { BASE_STRATEGIES, loadStrategies, saveStrategy, type StrategyParams } from "../strategy/library.ts";
@@ -48,7 +48,7 @@ export function validateProposal(
 }
 
 export async function maybeEvolveStrategies(
-  root: string, cfg: LlmConfig, store: Store,
+  root: string, roles: RoleLlmService, store: Store,
   interval: number, maxParamChanges: number, minSample: number, engine: TradingEngine = "SWING_15M",
 ): Promise<number> {
   const closed = (store.db.prepare("SELECT COUNT(*) c FROM trades WHERE status='CLOSED' AND result_r_basis='NET' AND engine=? AND strategy_core_version=1").get(engine) as { c: number }).c;
@@ -69,7 +69,7 @@ export async function maybeEvolveStrategies(
     engine, closed_trades: closed,
     constraints: { max_param_changes: maxParamChanges, minimum_validation_sample: minSample },
   };
-  const out = await llmJson(cfg, prompt, JSON.stringify(input), ProposalSchema);
+  const out = await roles.json("evolution", prompt, JSON.stringify(input), ProposalSchema, "legacy_strategy_evolution");
   store.db.prepare("INSERT INTO system_events(ts,kind,payload) VALUES(?,?,?)").run(
     new Date().toISOString(), "EVOLUTION", JSON.stringify({ engine, tradesAtRun: closed, proposals: out?.proposals?.length ?? 0 }));
   if (!out) return 0;
