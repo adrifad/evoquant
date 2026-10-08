@@ -62,5 +62,10 @@ Files: `src/core/llm.ts`, `src/core/llm-role-service.ts`,
 - [x] Run an isolated preview and inspect/edit/save/reload Settings at desktop,
   laptop, tablet and mobile. Verify 10% ceilings and connection messages.
 - [x] Independently review specification compliance then implementation quality.
-- [ ] Commit/push feature branch, verify CI for exact SHA; merge only if authorized
+- [x] Commit/push feature branch, verify CI for exact SHA; merge only if authorized
   for this new feature. Document actual applied settings and verification limits.
+
+Implementation `95543984aa9660039f61df894b2fb51bc4c020da` was pushed; its
+[CI run](https://github.com/adrifad/evoquant/actions/runs/37740508759) passed.
+The original checkout changes remain untouched. No merge or operator-instance
+restart was performed for this follow-up.

@@ -83,6 +83,7 @@ exchange financial projections, charts, promotion rules or live activation.
 | Core tests | PASS: 183 tests, no failures/skips |
 | Console typecheck | PASS |
 | Console production build | PASS |
+| GitHub CI | PASS for implementation `95543984aa9660039f61df894b2fb51bc4c020da`: [run 37740508759](https://github.com/adrifad/evoquant/actions/runs/37740508759) |
 | Browser interactions | PASS: 28 configuration/probe checks |
 | Browser states, keyboard and contrast | PASS: 14 additional checks |
 | Independent specification review | PASS |
@@ -160,4 +161,6 @@ provide secondary operational evidence.
 
 The running operator instance was not restarted or modified. New code must be
 deployed and restarted once to install these services; subsequent supported
-settings updates apply without restart. CI and delivery SHA are reported after push.
+settings updates apply without restart. Implementation is pushed to the feature
+branch; it has not been merged into master. The final delivery SHA may additionally
+include this verification record.
