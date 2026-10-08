@@ -29,6 +29,7 @@ import { LLM_ROLES, type LlmRole } from "./llm-roles.ts";
 import { roleEnvironmentUpdates, type RoleLlmService } from "./llm-role-service.ts";
 import { accountCapital, positionCapital, prepareCapitalStore, finite } from "./capital.ts";
 import { RuntimeRiskError, type RuntimeRiskService } from "./runtime-risk.ts";
+import { RuntimeTradingError, type RuntimeTradingService } from "./runtime-trading.ts";
 import { evolutionFamilies, scannerProjection } from "./workstation.ts";
 import type { ScanRow } from "../strategy/scanner.ts";
 import { getCandles, type Bar } from "../exchange/okx/market.ts";
@@ -59,6 +60,7 @@ export interface DashboardConfig {
   };
   llmRoles?: RoleLlmService;
   runtimeRisk?: RuntimeRiskService;
+  runtimeTrading?: RuntimeTradingService;
   settingsFile?: string;
 }
 
@@ -288,10 +290,23 @@ export function startDashboard(cfg: DashboardConfig): DashboardServer {
     }
     if (p === "/api/risk") {
       if (!cfg.runtimeRisk) return send(503, { error: "Runtime risk settings unavailable." });
-      if (method === "GET") return send(200, { ...cfg.runtimeRisk.snapshot(), audit: store.db.prepare("SELECT ts,kind,payload FROM system_events WHERE kind='RISK_LIMIT_CHANGED' ORDER BY id DESC LIMIT 30").all() });
+      const audit = () => store.db.prepare("SELECT ts,kind,payload FROM system_events WHERE kind='RISK_LIMIT_CHANGED' ORDER BY id DESC LIMIT 30").all();
+      if (method === "GET") return send(200, { ...cfg.runtimeRisk.snapshot(), audit: audit() });
       if (method === "PUT") {
-        try { return send(200, cfg.runtimeRisk.update(await readJson(req))); }
+        try { return send(200, { ...cfg.runtimeRisk.update(await readJson(req)), audit: audit() }); }
         catch (error) { return send(error instanceof RuntimeRiskError ? error.status : 500, { error: error instanceof RuntimeRiskError ? error.message : "Risk settings could not be saved." }); }
+      }
+      return send(405, { error: "Method not allowed." });
+    }
+    if (p === "/api/trading") {
+      if (!cfg.runtimeTrading) return send(503, { error: "Runtime trading settings unavailable." });
+      if (method === "GET") return send(200, cfg.runtimeTrading.snapshot());
+      if (method === "PUT") {
+        try { return send(200, cfg.runtimeTrading.update(await readJson(req))); }
+        catch (error) { return send(error instanceof RuntimeTradingError ? error.status : 500, {
+          error: error instanceof RuntimeTradingError ? error.message : "Trading settings could not be saved.",
+          ...(error instanceof RuntimeTradingError ? { code: error.code } : {}),
+        }); }
       }
       return send(405, { error: "Method not allowed." });
     }

@@ -69,7 +69,7 @@ export interface SafeRoleSettings {
   errorClass: string | null;
 }
 
-const TestSchema = z.object({ ok: z.boolean() }).passthrough();
+const TestSchema = z.object({ ok: z.literal(true) }).strict();
 const COUNTED_STATUSES = ["SUCCESS", "TIMEOUT", "RATE_LIMIT", "AUTHENTICATION_FAILED", "PROVIDER_ERROR", "HTTP_ERROR", "INVALID_RESPONSE", "NETWORK_ERROR"];
 
 export class RoleLlmService {
@@ -130,7 +130,7 @@ export class RoleLlmService {
     return result.value;
   }
 
-  async testConnection(role: LlmRole, input: unknown): Promise<{ success: boolean; role: LlmRole; provider?: string; model?: string; latency_ms?: number; error?: string }> {
+  async testConnection(role: LlmRole, input: unknown): Promise<{ success: boolean; role: LlmRole; provider?: string; model?: string; latency_ms?: number; error?: string; detail?: string }> {
     let parsed: RoleUpdate;
     try { parsed = this.validateUpdate(role, input); }
     catch (error) {
@@ -150,11 +150,20 @@ export class RoleLlmService {
       return { success: false, role, error };
     }
     // Connection checks are bounded and inexpensive regardless of role settings.
-    const testConfig = { ...candidate.config, temperature: 0, timeoutMs: Math.min(candidate.config.timeoutMs, 15_000),
-      maxOutputTokens: 24, retryCount: 0 };
+    const testConfig = { ...candidate.config, timeoutMs: Math.min(candidate.config.timeoutMs, 60_000),
+      maxOutputTokens: Math.min(candidate.config.maxOutputTokens, 2048), retryCount: 0 };
     const result = await this.execute(role, { config: testConfig, status: candidate.status },
       "Return only JSON: {\"ok\":true}", "{}", TestSchema, "test_connection");
-    if (result.status !== "SUCCESS") return { success: false, role, error: result.status };
+    if (result.status !== "SUCCESS") {
+      const details = {
+        OUTPUT_LIMIT: `Provider reached the ${testConfig.maxOutputTokens}-token output limit before a complete reply. ${testConfig.maxOutputTokens < 2048 ? "Increase Max output tokens; the connection probe is capped at 2048 tokens." : "This probe is already at its 2048-token cap. Raising the role limit further will not extend this test; use a model that can complete this short structured check within the cap."}`,
+        EMPTY_CONTENT: "Provider returned no final answer. Reasoning-only output is not a valid structured reply.",
+        MALFORMED_COMPLETION: "Provider did not return the expected chat completion response. Check Base URL and model compatibility.",
+        INVALID_JSON: "Provider replied, but the final answer was not valid JSON. This test requires a structured reply.",
+        SCHEMA_MISMATCH: 'Provider JSON did not match the required acknowledgement {"ok":true}.',
+      };
+      return { success: false, role, error: result.status, ...(result.failureReason ? { detail: details[result.failureReason] } : {}) };
+    }
     return { success: true, role, provider: candidate.config.provider || "custom", model: candidate.config.model, latency_ms: result.latencyMs };
   }
 
@@ -197,7 +206,8 @@ export class RoleLlmService {
       result.status === "SUCCESS" ? null : result.status, contextRef, requests);
     const payload = { role, provider: config.provider || "custom", model: config.model, latency_ms: result.latencyMs,
       attempt: result.attempts, success: result.status === "SUCCESS", ...(result.inputTokens !== undefined ? { input_tokens: result.inputTokens } : {}),
-      ...(result.outputTokens !== undefined ? { output_tokens: result.outputTokens } : {}), ...(result.status !== "SUCCESS" ? { error_class: result.status } : {}), contextRef: safeContextRef(contextRef) };
+      ...(result.outputTokens !== undefined ? { output_tokens: result.outputTokens } : {}), ...(result.status !== "SUCCESS" ? { error_class: result.status } : {}),
+      ...(result.failureReason ? { failure_reason: result.failureReason } : {}), contextRef: safeContextRef(contextRef) };
     if (result.status === "SUCCESS") logSystemEvent(this.options.store, "LLM_SUCCESS", payload);
     else logSystemEvent(this.options.store, eventKind(result.status), payload);
     return result;

@@ -84,6 +84,24 @@ short context reference. They do not store credentials, request bodies, full
 prompts, or raw provider errors. The connection test uses only the selected
 role's draft URL/key/model and returns sanitized status/latency.
 
+### Connection test limits and failures
+
+The connection test uses the draft temperature, output-token limit and timeout.
+It caps output at 2048 tokens and timeout at 60 seconds, and makes one HTTP
+attempt with no retries. It consumes the role's normal request budget. The old
+24-token/15-second override could truncate reasoning models even when the
+configured role worked manually; it has been removed.
+
+Success requires a completed structured acknowledgement, `{"ok":true}`. It is
+not equivalent to a successful HTTP response or a free-form manual chat. An
+`INVALID_RESPONSE` now includes a safe explanation for output-limit truncation,
+empty final content, malformed completion, invalid JSON or schema mismatch.
+Reasoning-only output and `finish_reason: "length"` are failures, even if the
+provider returns HTTP 200. Raising the role limit above 2048 does not increase
+the probe cap; a model that cannot finish a short check within that cap remains
+unsuitable for this probe. Provider bodies, reasoning and keys are never returned.
+Production role contracts remain strictly validated.
+
 Default internal request budgets are Gate 30/hour, Scalp 12/hour, Reviewer
 10/hour, Evolution 8/day, and Critic 8/day. Each actual provider HTTP attempt,
 including retries, reserves one budget unit transactionally before dispatch.

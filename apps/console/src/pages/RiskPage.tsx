@@ -24,7 +24,7 @@ export function RiskPage({ status }: { status: ApiState<Row> }) {
   return <div className="page">
     <PageHeading title="Risk" description="Deterministic controls and risk events remain separate from AI decisions." detail={<StatusBadge value={riskState}/>}/>
     <CapitalSummary status={s}/>
-    <RiskSettings equity={s.equity} positions={open} onSaved={status.reload}/>
+    <RiskSettings equity={s.equity} positions={open} onSaved={() => status.reload(true)}/>
     <section className="metric-strip risk-metric-strip" aria-label="Current risk status">
       <Metric label="Current drawdown" value={formatPercent(drawdown, 2, false)} tone={drawdown !== null && drawdown > 0 ? "warning" : "neutral"} detail={drawdownLimit ? `${formatNumber(drawdownLimit)}% hard limit` : "Limit unavailable"}/>
       <Metric label="Daily loss" value={formatPercent(dailyPct, 2, false)} tone={dailyPct !== null && dailyPct > 0 ? "warning" : "neutral"} detail={dailyLimit ? `${formatNumber(dailyLimit)}% hard limit` : "Limit unavailable"}/>

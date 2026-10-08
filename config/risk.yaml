@@ -1,9 +1,8 @@
 # Risk limits — spec §3, §23. HARD CODES: values here are validated
-# against absolute maximums in src/risk/limits.ts; out-of-range config
+# against absolute maximums in src/core/config.ts; out-of-range config
 # fails startup. The AI/evolution layer must never write this file.
 hard_limits:
-  risk_per_trade_pct: 2.0   # spec §48 absolute max; keeps $50-notional sizing intact at
-                            # stops up to ~2% (loss-at-stop ≈ $0.2–1 per trade, still tiny $)
+  risk_per_trade_pct: 2.0   # operational default retained; dashboard may select up to the 10% absolute ceiling
   max_daily_loss_pct: 3.0
   max_drawdown_pct: 10.0
   max_leverage: 5

@@ -104,6 +104,27 @@ test("test connection uses only its role and failures never persist provider bod
   } finally { f.close(); }
 });
 
+test("connection probe respects configured output and timeout settings and requires true acknowledgement", async () => {
+  let output: Record<string, unknown> = {};
+  let acknowledge = true;
+  const f = fixture({ LLM_SCALP_BASE_URL: "https://scalp.test/v1", LLM_SCALP_API_KEY: "fake-probe-key", LLM_SCALP_MODEL: "reasoning-model" }, async (_url, init) => {
+    output = JSON.parse(String(init?.body)) as Record<string, unknown>;
+    return new Response(JSON.stringify({ choices: [{ message: { content: JSON.stringify({ ok: acknowledge }) } }] }));
+  });
+  try {
+    const result = await f.service.testConnection("scalp", { maxOutputTokens: 1200, timeoutMs: 60000, temperature: 0.2 });
+    assert.equal(result.success, true);
+    assert.equal(output.max_tokens, 1200);
+    assert.equal(output.temperature, 0.2);
+    await f.service.testConnection("scalp", { maxOutputTokens: 16000, timeoutMs: 120000 });
+    assert.equal(output.max_tokens, 2048, "probe remains bounded");
+    acknowledge = false;
+    const invalid = await f.service.testConnection("scalp", { maxOutputTokens: 1200 });
+    assert.equal(invalid.success, false);
+    assert.equal(invalid.error, "INVALID_RESPONSE");
+  } finally { f.close(); }
+});
+
 test("provider output cannot echo a role API key into returned data or audit storage", async () => {
   const secret = "fake-output-echo-secret";
   const f = fixture({ LLM_GATE_BASE_URL: "https://gate.test/v1", LLM_GATE_API_KEY: secret }, async () =>

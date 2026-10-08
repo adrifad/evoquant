@@ -57,6 +57,24 @@ test("risk API rejects ceilings, cross-origin writes and stale revisions; commit
   assert.equal(f.exchangeRequests(), 0, "risk changes must not resize positions or call exchange");
 });
 
+test("risk API publishes 10 percent ceiling, requires confirmation and rejects 10.01 percent", async t => {
+  const f = await fixture(t);
+  const initial = await json<RiskResponse>(await f.request("/api/risk"));
+  assert.equal(initial.ceilings.risk_per_trade_pct, 10);
+  assert.equal(initial.limits.risk_per_trade_pct, 2, "raising the ceiling never raises active risk automatically");
+  const put = (riskPerTrade: number, confirmRiskIncrease = false, revision = 0) => f.request("/api/risk", {
+    method: "PUT", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ revision, limits: { ...initial.limits, risk_per_trade_pct: riskPerTrade }, confirmRiskIncrease }),
+  });
+  assert.equal((await put(10)).status, 400);
+  assert.equal((await put(10, true)).status, 200);
+  const over = await put(10.01, true, 1);
+  assert.equal(over.status, 400);
+  assert.equal((await json<{ error: string }>(over)).error, "Maximum allowed risk per trade is 10%.");
+  assert.equal(f.risk.hard_limits.risk_per_trade_pct, 10);
+  assert.equal(f.exchangeRequests(), 0);
+});
+
 test("offline account stays unavailable and shared snapshots bound exchange requests", async t => {
   const f = await fixture(t);
   const [a, b] = await Promise.all([f.request("/api/status"), f.request("/api/trades")]);

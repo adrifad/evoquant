@@ -64,7 +64,9 @@ is bounded, aborts timed-out requests and ignores obsolete responses.
 
 Supported controls are risk per trade, maximum concurrent positions, maximum
 leverage, daily loss limit and maximum drawdown. Existing absolute ceilings are
-2%, 3 positions, 10x, 5% and 20% respectively. Invalid values are rejected with
+10%, 3 positions, 10x, 5% and 20% respectively. The risk-per-trade ceiling was
+raised from 2% by explicit operator request on 2026-10-08; the shipped active
+default remains 2%. Invalid values are rejected with
 an understandable error; they are not silently clamped. Baseline mode retains
 its one-position restriction.
 

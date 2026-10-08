@@ -171,7 +171,7 @@ test("kill switch evaluator ordering + emergency store (§23)", () => {
 // ---- sizing (§24) ----------------------------------------------------------
 test("risk budget → contracts honors the configured risk cap", () => {
   const inst = { instId: "BTC-USDT-SWAP", tickSz: "0.01", lotSz: "0.01", minSz: "0.01", ctVal: "0.01", ctValCcy: "BTC" };
-  // pin to 0.5% so the clamp MATH is tested independently of live tuning (§48 max 2%)
+  // Pin to 0.5% so clamp math is independent of live tuning (operator ceiling 10%).
   const pinnedRisk = { ...risk, hard_limits: { ...risk.hard_limits, risk_per_trade_pct: 0.5 } };
   const res = sizePosition({ equity: 1000, entryPrice: 100_000, stopPrice: 98_500, leverage: 3, instrument: inst }, pinnedRisk);
   // risk budget = $5; loss per contract = 0.01×1500 = $15 → 0 contracts after floor → minSz path or below-min throw?

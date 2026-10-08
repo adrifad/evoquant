@@ -44,7 +44,7 @@ appear as comments in code.
    enforcing demo-only.
 8. `src/core/config.ts` — load config/trading.yaml + risk.yaml (yaml pkg),
    zod-validate, abort on environment!=demo or limits outside absolute max
-   (absolute maxes hardcoded here: leverage<=10, risk/trade<=2%, daily<=5%,
+   (absolute maxes hardcoded here: leverage<=10, risk/trade<=10%, daily<=5%,
    dd<=20% — outside = misconfiguration, refuse).
 9. `src/core/logger.ts` — leveled JSON logger; REDACTS apiKey/passphrase/
    signature/secret fields always (§51) — implement redaction in one place.

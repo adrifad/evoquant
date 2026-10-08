@@ -37,8 +37,9 @@ export function RiskSettings({ equity, positions, onSaved }: { equity: unknown; 
       const response = await fetch("/api/risk", { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ revision, limits, confirmRiskIncrease: increases.length > 0 }) });
       const body = await response.json() as Row;
       if (!response.ok) throw new Error(asText(body.error, "Risk settings could not be saved."));
+      api.applyResponse(body);
       setDraft(null); setEditingRevision(null);
-      await api.reload(); await onSaved();
+      await api.reload(true); await onSaved();
       setNotice("Saved. New entries use these limits. Existing positions retain their current size and leverage.");
     } catch (error) { setNotice(error instanceof Error ? error.message : "Save failed."); }
     finally { setSaving(false); }

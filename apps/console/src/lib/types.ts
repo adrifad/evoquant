@@ -5,7 +5,8 @@ export interface ApiState<T> {
   error: string | null;
   loading: boolean;
   updatedAt: number | null;
-  reload: () => Promise<void>;
+  reload: (force?: boolean) => Promise<void>;
+  applyResponse: (data: T) => void;
 }
 
 export function asRows(value: unknown): Row[] {

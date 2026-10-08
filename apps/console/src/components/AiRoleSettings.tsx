@@ -60,7 +60,7 @@ export function AiRoleSettings() {
       setForms(previous => ({ ...previous, [role]: { ...(previous[role] ?? EMPTY), apiKey: "" } }));
       setDirty(previous => ({ ...previous, [role]: false }));
       setMessage(previous => ({ ...previous, [role]: { text: "Saved. The next request uses these settings.", tone: "positive" } }));
-      await api.reload();
+      await api.reload(true);
     } catch (error) {
       setMessage(previous => ({ ...previous, [role]: { text: error instanceof Error ? error.message : "Settings could not be saved.", tone: "negative" } }));
     } finally { setBusy(null); }
@@ -71,12 +71,13 @@ export function AiRoleSettings() {
     try {
       const response = await fetch(`/api/settings/llm-roles/${role}/test`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(payload(forms[role] ?? EMPTY)) });
       const result = await readResponse(response);
-      if (!response.ok || result.success !== true) throw new Error(asText(result.error, `Connection test failed (${response.status})`));
+      if (!response.ok || result.success !== true) throw new Error([asText(result.error, `Connection test failed (${response.status})`), asText(result.detail, "")].filter(Boolean).join(": "));
       const latency = asNumber(result.latency_ms);
       setTestMessage(previous => ({ ...previous, [role]: `Connection succeeded${latency === null ? "." : ` in ${Math.round(latency)} ms.`}` }));
-      await api.reload();
+      await api.reload(true);
     } catch (error) {
       setTestMessage(previous => ({ ...previous, [role]: error instanceof Error ? error.message : "Connection test failed." }));
+      await api.reload(true);
     } finally { setBusy(null); }
   };
 
@@ -90,7 +91,7 @@ export function AiRoleSettings() {
       setForms(previous => ({ ...previous, [role]: { ...(previous[role] ?? EMPTY), apiKey: "" } }));
       setDirty(previous => ({ ...previous, [role]: false }));
       setMessage(previous => ({ ...previous, [role]: { text: "Saved API key cleared.", tone: "warning" } }));
-      await api.reload();
+      await api.reload(true);
     } catch (error) {
       setMessage(previous => ({ ...previous, [role]: { text: error instanceof Error ? error.message : "API key could not be cleared.", tone: "negative" } }));
     } finally { setBusy(null); }
@@ -132,19 +133,20 @@ export function AiRoleSettings() {
               <label className="role-form-field"><span>Retry count</span><input type="number" min="0" max="3" value={form.retryCount} onChange={event => change(roleName, "retryCount", event.target.value)}/></label>
               <label className="role-form-field"><span>HTTP requests / hour</span><input type="number" min="1" max="100000" value={form.maxCallsPerHour} onChange={event => change(roleName, "maxCallsPerHour", event.target.value)} placeholder="Keep saved limit"/></label>
               <label className="role-form-field"><span>HTTP requests / day</span><input type="number" min="1" max="1000000" value={form.maxCallsPerDay} onChange={event => change(roleName, "maxCallsPerDay", event.target.value)} placeholder="Keep saved limit"/></label>
-              {roleName === "critic" ? <label className="role-form-field"><span>Max revision rounds</span><select value={form.maxRevisionRounds} onChange={event => change(roleName, "maxRevisionRounds", event.target.value)}><option value="0">0 — no revision</option><option value="1">1 — one revision</option></select></label> : null}
+              {roleName === "critic" ? <label className="role-form-field"><span>Max revision rounds</span><select value={form.maxRevisionRounds} onChange={event => change(roleName, "maxRevisionRounds", event.target.value)}><option value="0">0: no revision</option><option value="1">1: one revision</option></select></label> : null}
               <div className="ai-role-actions role-form-wide">
                 <button className="primary-button" type="submit" disabled={isBusy}><Save size={13} aria-hidden="true"/>{busy?.role === roleName && busy.action === "save" ? "Saving" : "Save role"}</button>
                 <button className="secondary-button" type="button" onClick={() => void testConnection(roleName)} disabled={isBusy}><PlugZap size={13} aria-hidden="true"/>{busy?.role === roleName && busy.action === "test" ? "Testing" : "Test connection"}</button>
                 <button className="secondary-button role-clear-key" type="button" onClick={() => void clearKey(roleName)} disabled={isBusy || role.apiKeyConfigured !== true}><Trash2 size={13} aria-hidden="true"/>{busy?.role === roleName && busy.action === "clear" ? "Clearing" : "Clear key"}</button>
               </div>
+              <p className="role-message role-form-wide">Connection test checks a structured reply using your token and timeout settings, capped at 2048 tokens and 60 seconds, with no retries.</p>
               {currentMessage ? <p className={`role-message role-message-${currentMessage.tone}`} role="status">{currentMessage.text}</p> : null}
               {currentTest ? <p className={`role-message ${currentTest.startsWith("Connection succeeded") ? "role-message-positive" : "role-message-negative"}`} role="status">{currentTest}</p> : null}
             </form>
             <div className="ai-role-health" aria-label={`${ROLE_COPY[roleName].title} request health`}>
               <div><span>Last success</span><strong>{formatTime(role.lastSuccess)}</strong></div>
               <div><span>Last failure</span><strong>{formatTime(role.lastFailure)}{role.errorClass ? ` · ${asText(role.errorClass)}` : ""}</strong></div>
-              <div><span>Last latency</span><strong>{role.lastLatencyMs == null ? "—" : `${Math.round(Number(role.lastLatencyMs))} ms`}</strong></div>
+              <div><span>Last latency</span><strong>{role.lastLatencyMs == null ? "Unavailable" : `${Math.round(Number(role.lastLatencyMs))} ms`}</strong></div>
               <div><span>Budget used this hour</span><strong>{asText(role.budgetRequestsThisHour ?? role.providerRequestsThisHour, "0")} / {asText(budget.maxCallsPerHour, "∞")}</strong></div>
               <div><span>Budget used today</span><strong>{asText(role.budgetRequestsToday ?? role.providerRequestsToday, "0")} / {asText(budget.maxCallsPerDay, "∞")}</strong></div>
             </div>
@@ -187,7 +189,7 @@ async function readResponse(response: Response): Promise<Row> {
 }
 
 function formatTime(value: unknown): string {
-  if (typeof value !== "string" || !value) return "—";
+  if (typeof value !== "string" || !value) return "Unavailable";
   const timestamp = Date.parse(value);
-  return Number.isFinite(timestamp) ? new Date(timestamp).toLocaleString() : "—";
+  return Number.isFinite(timestamp) ? new Date(timestamp).toLocaleString() : "Unavailable";
 }

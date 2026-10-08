@@ -22,7 +22,8 @@ import { getOpenTrades } from "../memory/trades.ts";
 import { buildFeatures, type FeatureSnapshot } from "../market/features.ts";
 import { classifyRegime } from "../market/regime.ts";
 import { clId, closeTradeOnExchange, priceTrigger, synchronizeEntryLeverage, confirmedFillLeverage, submitReservedEntry } from "../execution/executor.ts";
-import { riskFingerprint, selectedEntryLeverage, serializeRiskEntry, releaseEntry } from "../core/runtime-risk.ts";
+import { selectedEntryLeverage, serializeRiskEntry, releaseEntry } from "../core/runtime-risk.ts";
+import { entrySettingsFingerprint } from "../core/runtime-trading.ts";
 import { persistEntryCapital } from "../core/capital.ts";
 import { CandleCloseScheduler, msForBar } from "../core/scheduler.ts";
 import { createLogger } from "../core/logger.ts";
@@ -231,7 +232,7 @@ export class ScalpRunner {
       } catch (e) {
         log.info({ event: "scalp_sizing_reject", inst: sig.instrument, error: e instanceof Error ? e.message.slice(0, 80) : "" }); return;
       }
-      const riskAtPreparation = riskFingerprint(risk);
+      const settingsAtPreparation = entrySettingsFingerprint(this.d.trading, risk);
       const leverage = await synchronizeEntryLeverage(this.d, sig.instrument);
       // Re-read global risk immediately before the exchange write; bot pause,
       // emergency stop, loss limits, or an external position may have changed.
@@ -257,9 +258,9 @@ export class ScalpRunner {
         instrument: sig.instrument, instrumentOccupied: finalPositions.some((p) => p.instId === sig.instrument) ||
           finalLocal.some((t) => String(t.instrument) === sig.instrument),
       }, risk);
-      if (!finalGate.allowed || riskFingerprint(risk) !== riskAtPreparation) {
+      if (!finalGate.allowed || entrySettingsFingerprint(this.d.trading, risk) !== settingsAtPreparation) {
         log.info({ event: "scalp_global_risk_reject", inst: sig.instrument,
-          reason: riskFingerprint(risk) !== riskAtPreparation ? "RISK_SETTINGS_CHANGED" : finalGate.reason, stage: "pre_order" });
+          reason: entrySettingsFingerprint(this.d.trading, risk) !== settingsAtPreparation ? "ENTRY_SETTINGS_CHANGED" : finalGate.reason, stage: "pre_order" });
         return;
       }
       try {

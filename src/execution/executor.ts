@@ -41,7 +41,8 @@ import type { CandidateGate } from "../agents/decision-agent.ts";
 import { serializeTradeMutation } from "./trade-mutation.ts";
 import { msForBar } from "../core/scheduler.ts";
 import { isTradeOwnedBy } from "../memory/engines.ts";
-import { riskFingerprint, selectedEntryLeverage, serializeRiskEntry, reserveEntry, releaseEntry, unresolvedEntry } from "../core/runtime-risk.ts";
+import { selectedEntryLeverage, serializeRiskEntry, reserveEntry, releaseEntry, unresolvedEntry } from "../core/runtime-risk.ts";
+import { entrySettingsFingerprint } from "../core/runtime-trading.ts";
 import { persistEntryCapital } from "../core/capital.ts";
 
 const log = createLogger("executor");
@@ -427,7 +428,7 @@ export async function runTick(d: ExecutorDeps, ctx: TickContext, symbol: TickSym
     return { kill };
   }
   return serializeRiskEntry(store, async () => {
-    const riskAtPreparation = riskFingerprint(risk);
+    const settingsAtPreparation = entrySettingsFingerprint(trading, risk);
     let leverage: number;
     try { leverage = await synchronizeEntryLeverage(d, instId); }
     catch (error) {
@@ -461,9 +462,9 @@ export async function runTick(d: ExecutorDeps, ctx: TickContext, symbol: TickSym
         : Number.isFinite(f.atr14) && f.price ? (decision.suggested_stop_atr * f.atr14) / f.price : undefined,
     }, { equity: freshEq, dayStartEquity: freshBase.dayStartEquity, peakEquity: freshBase.peakEquity,
       openPositions: freshPoss.length, killSwitchActive: freshKill }, trading, risk);
-    if (!freshGate.allowed || !freshRisk.approved || riskFingerprint(risk) !== riskAtPreparation) {
+    if (!freshGate.allowed || !freshRisk.approved || entrySettingsFingerprint(trading, risk) !== settingsAtPreparation) {
       logSystemEvent(store, "RISK_EVENT", { race_guard: "entry skipped after refreshed global risk check", instId,
-        reason: riskFingerprint(risk) !== riskAtPreparation ? "RISK_SETTINGS_CHANGED" : freshGate.allowed ? freshRisk.reason : freshGate.reason });
+        reason: entrySettingsFingerprint(trading, risk) !== settingsAtPreparation ? "ENTRY_SETTINGS_CHANGED" : freshGate.allowed ? freshRisk.reason : freshGate.reason });
       return { kill };
     }
     // Re-size from refreshed equity so a concurrent account loss cannot leave a stale oversized order.

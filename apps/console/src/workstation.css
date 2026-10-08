@@ -117,3 +117,7 @@ details.technical pre { white-space: pre-wrap; overflow-wrap: anywhere; font-siz
   .trade-dialog { width: calc(100vw - 16px); max-height: calc(100dvh - 16px); }
   .panel-heading { flex-wrap: wrap; }
 }
+.trading-form .risk-form-row { grid-template-columns: minmax(120px, 1fr) minmax(130px, 180px) 115px; }
+.trading-form select { min-width: 0; width: 100%; padding: 8px; color: var(--text); background: #fff; border: 1px solid var(--line); border-radius: 4px; font: inherit; }
+.role-form-field input:focus-visible, .role-form-field select:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+@media (max-width: 720px) { .trading-form .risk-form-row { grid-template-columns: 1fr; } }

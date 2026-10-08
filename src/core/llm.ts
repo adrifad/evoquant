@@ -15,6 +15,7 @@ export interface LlmConfig {
 
 export type LlmErrorClass = "TIMEOUT" | "RATE_LIMIT" | "AUTHENTICATION_FAILED" | "PROVIDER_ERROR" | "HTTP_ERROR" | "INVALID_RESPONSE" | "NETWORK_ERROR" | "BUDGET_EXHAUSTED";
 export type LlmTransportStatus = "SUCCESS" | LlmErrorClass;
+export type LlmFailureReason = "OUTPUT_LIMIT" | "EMPTY_CONTENT" | "MALFORMED_COMPLETION" | "INVALID_JSON" | "SCHEMA_MISMATCH";
 export interface LlmTransportResult<T> {
   value: T | null;
   status: LlmTransportStatus;
@@ -22,6 +23,7 @@ export interface LlmTransportResult<T> {
   latencyMs: number;
   inputTokens?: number;
   outputTokens?: number;
+  failureReason?: LlmFailureReason;
 }
 
 interface ParsedCompletion {
@@ -43,6 +45,10 @@ export async function llmJsonDetailed<T>(
   let lastStatus: LlmTransportStatus = "NETWORK_ERROR";
   let inputTokens: number | undefined;
   let outputTokens: number | undefined;
+  const invalid = (failureReason: LlmFailureReason, attempts: number): LlmTransportResult<T> => ({
+    value: null, status: "INVALID_RESPONSE", failureReason, attempts, latencyMs: Date.now() - started,
+    ...(inputTokens !== undefined ? { inputTokens } : {}), ...(outputTokens !== undefined ? { outputTokens } : {}),
+  });
 
   for (let attempt = 0; attempt <= retries; attempt++) {
     if (cfg.beforeRequest && !cfg.beforeRequest()) return { value: null, status: "BUDGET_EXHAUSTED", attempts: attempt, latencyMs: Date.now() - started };
@@ -73,20 +79,25 @@ export async function llmJsonDetailed<T>(
       let parsed: ParsedCompletion;
       try {
         const data = JSON.parse(raw) as {
-          choices?: Array<{ message?: { content?: unknown } }>;
+          choices?: Array<{ finish_reason?: unknown; message?: { content?: unknown } }>;
           usage?: { prompt_tokens?: unknown; completion_tokens?: unknown };
         };
-        const text = data.choices?.[0]?.message?.content;
-        if (typeof text !== "string" || !text) throw new Error("invalid completion");
         const usage = data.usage;
         const tokens = (value: unknown): number | undefined => typeof value === "number" && Number.isInteger(value) && value >= 0 ? value : undefined;
         const promptTokens = tokens(usage?.prompt_tokens);
         const completionTokens = tokens(usage?.completion_tokens);
+        inputTokens = promptTokens;
+        outputTokens = completionTokens;
+        const choice = data.choices?.[0];
+        if (!choice?.message) return invalid("MALFORMED_COMPLETION", attempt + 1);
+        if (choice.finish_reason === "length") return invalid("OUTPUT_LIMIT", attempt + 1);
+        const text = choice.message.content;
+        if (text === null || text === undefined || typeof text === "string" && !text.trim()) return invalid("EMPTY_CONTENT", attempt + 1);
+        if (typeof text !== "string") return invalid("MALFORMED_COMPLETION", attempt + 1);
         parsed = { text, ...(promptTokens !== undefined ? { inputTokens: promptTokens } : {}),
           ...(completionTokens !== undefined ? { outputTokens: completionTokens } : {}) };
       } catch {
-        lastStatus = "INVALID_RESPONSE";
-        return { value: null, status: lastStatus, attempts: attempt + 1, latencyMs: Date.now() - started };
+        return invalid("MALFORMED_COMPLETION", attempt + 1);
       }
       inputTokens = parsed.inputTokens;
       outputTokens = parsed.outputTokens;
@@ -96,17 +107,14 @@ export async function llmJsonDetailed<T>(
       const safeText = cfg.apiKey ? parsed.text.replaceAll(cfg.apiKey, "[REDACTED]") : parsed.text;
       const start = safeText.indexOf("{");
       const end = safeText.lastIndexOf("}");
-      if (start < 0 || end <= start) return { value: null, status: "INVALID_RESPONSE", attempts: attempt + 1,
-        latencyMs: Date.now() - started, ...(inputTokens !== undefined ? { inputTokens } : {}), ...(outputTokens !== undefined ? { outputTokens } : {}) };
+      if (start < 0 || end <= start) return invalid("INVALID_JSON", attempt + 1);
       try {
         const result = schema.safeParse(JSON.parse(safeText.slice(start, end + 1)) as unknown);
-        if (!result.success) return { value: null, status: "INVALID_RESPONSE", attempts: attempt + 1,
-          latencyMs: Date.now() - started, ...(inputTokens !== undefined ? { inputTokens } : {}), ...(outputTokens !== undefined ? { outputTokens } : {}) };
+        if (!result.success) return invalid("SCHEMA_MISMATCH", attempt + 1);
         return { value: result.data, status: "SUCCESS", attempts: attempt + 1, latencyMs: Date.now() - started,
           ...(inputTokens !== undefined ? { inputTokens } : {}), ...(outputTokens !== undefined ? { outputTokens } : {}) };
       } catch {
-        return { value: null, status: "INVALID_RESPONSE", attempts: attempt + 1, latencyMs: Date.now() - started,
-          ...(inputTokens !== undefined ? { inputTokens } : {}), ...(outputTokens !== undefined ? { outputTokens } : {}) };
+        return invalid("INVALID_JSON", attempt + 1);
       }
     } catch (error) {
       lastStatus = error instanceof Error && error.name === "AbortError" ? "TIMEOUT" : "NETWORK_ERROR";

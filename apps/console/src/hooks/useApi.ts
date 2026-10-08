@@ -9,8 +9,9 @@ export function useApi<T = unknown>(path: string, fallbackInterval = 15_000): Ap
   const request = useRef<AbortController | null>(null);
   const activePath = useRef(path);
 
-  const reload = useCallback(async () => {
-    if (request.current) return;
+  const reload = useCallback(async (force = false) => {
+    if (request.current && !force) return;
+    request.current?.abort();
     const controller = new AbortController();
     request.current = controller;
     const timeout = window.setTimeout(() => controller.abort(), 12_000);
@@ -34,6 +35,12 @@ export function useApi<T = unknown>(path: string, fallbackInterval = 15_000): Ap
     }
   }, [path]);
 
+  const applyResponse = useCallback((next: T) => {
+    if (activePath.current !== path) return;
+    request.current?.abort(); request.current = null;
+    setData(next); setError(null); setLoading(false); setUpdatedAt(Date.now());
+  }, [path]);
+
   useEffect(() => {
     activePath.current = path;
     request.current?.abort(); request.current = null;
@@ -50,7 +57,7 @@ export function useApi<T = unknown>(path: string, fallbackInterval = 15_000): Ap
     };
   }, [fallbackInterval, reload, path]);
 
-  return { data, error, loading, updatedAt, reload };
+  return { data, error, loading, updatedAt, reload, applyResponse };
 }
 
 export function useRefreshSocket(): boolean {

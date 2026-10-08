@@ -36,6 +36,7 @@ import { familyForV2 } from "../strategy/identity.ts";
 import { parseEvolutionConfig } from "./evolution-config.ts";
 import { resolveRuntimePolicy } from "./runtime-policy.ts";
 import { RuntimeRiskService } from "./runtime-risk.ts";
+import { RuntimeTradingService } from "./runtime-trading.ts";
 import { runOncePerGlobalCycle } from "./global-cycle.ts";
 import { RoleLlmService } from "./llm-role-service.ts";
 import { createLogger } from "./logger.ts";
@@ -89,7 +90,7 @@ async function main(): Promise<void> {
   }
   const watchlist = Object.keys(instruments);
   if (watchlist.length === 0) throw new Error("no watchlist instruments have metadata (§43)");
-  const anchor = watchlist.includes(trading.instrument.id) ? trading.instrument.id : watchlist[0]!;
+  const runtimeTrading = new RuntimeTradingService({ store, trading, risk, instruments: watchlist });
   const deps = { client, trading, risk, store, instruments, watchlist };
   if (!runtimePolicy.evolutionEnabled) {
     logSystemEvent(store, "EVOLUTION_FROZEN", { reason: baselineMode ? "baseline_validation_mode" : "configuration_disabled",
@@ -141,7 +142,7 @@ async function main(): Promise<void> {
     port: Number(env.DASHBOARD_PORT ?? 8790),
     ...(env.DASHBOARD_BIND ? { bind: env.DASHBOARD_BIND } : {}),
     ...(env.DASHBOARD_USER ? { auth: { user: env.DASHBOARD_USER, password: env[["DASHBOARD","PASSWORD"].join("_")] ?? "" } } : {}),
-    trading, risk, runtimeRisk, strategyCoreVersion, baselineMode, deps: () => deps,
+    trading, risk, runtimeRisk, runtimeTrading, strategyCoreVersion, baselineMode, deps: () => deps,
     evolution: {
       enabled: runtimePolicy.evolutionEnabled,
       automaticPromotion: evolution.automatic_promotion_enabled,
@@ -199,7 +200,7 @@ async function main(): Promise<void> {
           log.warn({ event: "symbol_fetch_failed", instId: sym, error: e instanceof Error ? e.message : String(e) });
         }
       }
-      const anchorSnap = snaps.find((s) => s.instrument === anchor) ?? snaps[0];
+      const anchorSnap = snaps.find((s) => s.instrument === trading.instrument.id) ?? snaps[0];
       const snapshotTs = new Date().toISOString();
       for (const snap of snaps) persistMarketSnapshot(store, snapshotTs, snap.instrument, snap.features);
       if (anchorSnap) lastTick = { features: anchorSnap.features, regime: anchorSnap.regime, at: snapshotTs };
