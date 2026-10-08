@@ -137,6 +137,53 @@ test("placeOrder requires sCode 0 else OrderRejectedError (§14)", async () => {
   );
 });
 
+test("submission rejection classification preserves transport evidence and fails closed", async () => {
+  const order = { instId: "BTC-USDT-SWAP", tdMode: "isolated", side: "buy", posSide: "long",
+    ordType: "market", sz: "1", clOrdId: "C1" } as const;
+  const rejected = { sCode: "51008", sMsg: "Insufficient balance", ordId: "", clOrdId: "C1" };
+  const cases: Array<{ name: string; code: string; data: unknown; definitive: boolean; status?: number }> = [
+    ...["51000", "51008", "51121"].flatMap((sCode) => [
+      { name: `item ${sCode}`, code: "0", data: [{ ...rejected, sCode }], definitive: true },
+      { name: `envelope item ${sCode}`, code: "1", data: [{ ...rejected, sCode }], definitive: true },
+      { name: `envelope ${sCode}`, code: sCode, data: [], definitive: true },
+    ]),
+    { name: "omitted rejected client ID", code: "1", data: [{ sCode: "51008", sMsg: "failure", ordId: "" }], definitive: false },
+    { name: "blank rejected client ID", code: "1", data: [{ ...rejected, clOrdId: "" }], definitive: true },
+    { name: "different client ID", code: "1", data: [{ ...rejected, clOrdId: "OTHER" }], definitive: false },
+    { name: "already assigned order", code: "1", data: [{ ...rejected, ordId: "O1" }], definitive: false },
+    { name: "missing code", code: "0", data: [{ ordId: "", clOrdId: "C1" }], definitive: false },
+    { name: "missing order ID", code: "1", data: [{ sCode: "51008", sMsg: "failure", clOrdId: "C1" }], definitive: false },
+    { name: "missing message", code: "1", data: [{ sCode: "51008", ordId: "", clOrdId: "C1" }], definitive: false },
+    { name: "numeric status", code: "0", data: [{ ...rejected, sCode: 51008 }], definitive: false },
+    { name: "duplicate ID", code: "1", data: [{ ...rejected, sCode: "51016" }], definitive: false },
+    { name: "timeout", code: "50004", data: [], definitive: false },
+    { name: "item timeout", code: "0", data: [{ ...rejected, sCode: "50004" }], definitive: false },
+    { name: "unknown code", code: "1", data: [{ ...rejected, sCode: "59999" }], definitive: false },
+    { name: "multiple items", code: "1", data: [rejected, rejected], definitive: false },
+    { name: "conflicting envelope", code: "51008", data: [{ sCode: "0", ordId: "O1" }], definitive: false },
+    { name: "null item", code: "0", data: [null], definitive: false },
+    { name: "null data", code: "1", data: null, definitive: false },
+    { name: "server failure", code: "1", data: [rejected], definitive: false, status: 503 },
+    { name: "server failure with successful envelope", code: "0", data: [rejected], definitive: false, status: 503 },
+  ];
+  for (const c of cases) {
+    const client = new OkxClient({ environment: "demo", credentials: { apiKey: "k", secret: "s", passphrase: "p" },
+      fetchImpl: async () => new Response(JSON.stringify({ code: c.code, msg: "failed", data: c.data }), { status: c.status ?? 200 }) });
+    await assert.rejects(() => placeOrder(client, order), (error: unknown) => {
+      assert.equal(error instanceof OrderRejectedError && error.definitive, c.definitive, c.name);
+      return true;
+    });
+  }
+  const data = [{ ...rejected, sMsg: "long reason ".repeat(80) }];
+  const client = new OkxClient({ environment: "demo",
+    fetchImpl: async () => new Response(JSON.stringify({ code: "1", msg: "failed", data }), { status: 200 }) });
+  await assert.rejects(() => client.post("/api/v5/trade/order", order), (error: unknown) => {
+    assert.ok(error instanceof OkxApiError);
+    assert.deepEqual(error.data, data);
+    return true;
+  });
+});
+
 test("closePosition flips order side per posSide (§4.2) and normalizes sz", async () => {
   let sentBody: Record<string, string> | undefined;
   const client = new OkxClient({

@@ -94,7 +94,12 @@ export interface Position {
   markPx: string;
   lever: string;
   upl: string;
-  mgnMode: "isolated";
+  mgnMode: "isolated" | "cross" | "unknown";
+  margin?: string;
+  imr?: string;
+  notionalUsd?: string;
+  ccy?: string;
+  uTime?: string;
 }
 
 // spec §5.2/§6 — generic OKX REST envelope

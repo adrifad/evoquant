@@ -130,8 +130,8 @@ export function AiRoleSettings() {
               <label className="role-form-field"><span>Timeout (ms)</span><input type="number" min="500" max="120000" step="100" value={form.timeoutMs} onChange={event => change(roleName, "timeoutMs", event.target.value)}/></label>
               <label className="role-form-field"><span>Max output tokens</span><input type="number" min="1" max="16000" value={form.maxOutputTokens} onChange={event => change(roleName, "maxOutputTokens", event.target.value)}/></label>
               <label className="role-form-field"><span>Retry count</span><input type="number" min="0" max="3" value={form.retryCount} onChange={event => change(roleName, "retryCount", event.target.value)}/></label>
-              <label className="role-form-field"><span>Calls / hour</span><input type="number" min="1" max="100000" value={form.maxCallsPerHour} onChange={event => change(roleName, "maxCallsPerHour", event.target.value)} placeholder="Keep saved limit"/></label>
-              <label className="role-form-field"><span>Calls / day</span><input type="number" min="1" max="1000000" value={form.maxCallsPerDay} onChange={event => change(roleName, "maxCallsPerDay", event.target.value)} placeholder="Keep saved limit"/></label>
+              <label className="role-form-field"><span>HTTP requests / hour</span><input type="number" min="1" max="100000" value={form.maxCallsPerHour} onChange={event => change(roleName, "maxCallsPerHour", event.target.value)} placeholder="Keep saved limit"/></label>
+              <label className="role-form-field"><span>HTTP requests / day</span><input type="number" min="1" max="1000000" value={form.maxCallsPerDay} onChange={event => change(roleName, "maxCallsPerDay", event.target.value)} placeholder="Keep saved limit"/></label>
               {roleName === "critic" ? <label className="role-form-field"><span>Max revision rounds</span><select value={form.maxRevisionRounds} onChange={event => change(roleName, "maxRevisionRounds", event.target.value)}><option value="0">0 — no revision</option><option value="1">1 — one revision</option></select></label> : null}
               <div className="ai-role-actions role-form-wide">
                 <button className="primary-button" type="submit" disabled={isBusy}><Save size={13} aria-hidden="true"/>{busy?.role === roleName && busy.action === "save" ? "Saving" : "Save role"}</button>
@@ -145,9 +145,10 @@ export function AiRoleSettings() {
               <div><span>Last success</span><strong>{formatTime(role.lastSuccess)}</strong></div>
               <div><span>Last failure</span><strong>{formatTime(role.lastFailure)}{role.errorClass ? ` · ${asText(role.errorClass)}` : ""}</strong></div>
               <div><span>Last latency</span><strong>{role.lastLatencyMs == null ? "—" : `${Math.round(Number(role.lastLatencyMs))} ms`}</strong></div>
-              <div><span>Calls this hour</span><strong>{asText(role.callsThisHour, "0")} / {asText(budget.maxCallsPerHour, "∞")}</strong></div>
-              <div><span>Calls today</span><strong>{asText(role.callsToday, "0")} / {asText(budget.maxCallsPerDay, "∞")}</strong></div>
+              <div><span>Budget used this hour</span><strong>{asText(role.budgetRequestsThisHour ?? role.providerRequestsThisHour, "0")} / {asText(budget.maxCallsPerHour, "∞")}</strong></div>
+              <div><span>Budget used today</span><strong>{asText(role.budgetRequestsToday ?? role.providerRequestsToday, "0")} / {asText(budget.maxCallsPerDay, "∞")}</strong></div>
             </div>
+            {Number(role.legacyBudgetChargesThisHour ?? 0) > 0 || Number(role.legacyBudgetChargesToday ?? 0) > 0 ? <p className="role-legacy-note">Budget includes {asText(role.legacyBudgetChargesThisHour, "0")} legacy charges this hour and {asText(role.legacyBudgetChargesToday, "0")} today. Their HTTP request count is unavailable.</p> : null}
             {dirty[roleName] ? <span className="sr-only" role="status">Unsaved changes for {ROLE_COPY[roleName].title}</span> : null}
           </section>;
         })}

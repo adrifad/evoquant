@@ -57,6 +57,15 @@ export interface SafeRoleSettings {
   lastLatencyMs: number | null;
   callsThisHour: number;
   callsToday: number;
+  providerRequestsThisHour: number;
+  providerRequestsToday: number;
+  legacyBudgetChargesThisHour: number;
+  legacyBudgetChargesToday: number;
+  budgetRequestsThisHour: number;
+  budgetRequestsToday: number;
+  retriesToday: number;
+  inputTokensToday: number | null;
+  outputTokensToday: number | null;
   errorClass: string | null;
 }
 
@@ -75,6 +84,13 @@ export class RoleLlmService {
     this.fetchImpl = options.fetchImpl ?? fetch;
     this.now = options.now ?? Date.now;
     this.sleep = options.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
+    options.store.db.exec(`CREATE TABLE IF NOT EXISTS llm_provider_requests (
+      id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL, role TEXT NOT NULL, retry INTEGER NOT NULL);
+      CREATE INDEX IF NOT EXISTS idx_llm_provider_requests_role_ts ON llm_provider_requests(role,ts)`);
+    const columns = options.store.db.prepare("PRAGMA table_info(llm_runs)").all() as Array<{ name: string }>;
+    if (!columns.some(column => column.name === "provider_requests")) {
+      options.store.db.exec("ALTER TABLE llm_runs ADD COLUMN provider_requests INTEGER");
+    }
   }
 
   resolve(role: LlmRole): ResolvedRoleConfig {
@@ -155,19 +171,30 @@ export class RoleLlmService {
     if (quota.exhausted) {
       this.recordRun(role, config, "BUDGET_EXHAUSTED", 0, null, null, null, contextRef);
       logSystemEvent(this.options.store, "LLM_BUDGET_EXHAUSTED", { role, provider: config.provider || "custom", model: config.model, contextRef: safeContextRef(contextRef) });
-      return { value: null, status: "INVALID_RESPONSE", attempts: 0, latencyMs: 0 };
+      return { value: null, status: "BUDGET_EXHAUSTED", attempts: 0, latencyMs: 0 };
     }
     logSystemEvent(this.options.store, "LLM_REQUEST", { role, provider: config.provider || "custom", model: config.model, contextRef: safeContextRef(contextRef) });
     let result: LlmTransportResult<T>;
+    let requests = 0;
     try {
       result = await llmJsonDetailed({ baseUrl: config.baseUrl, apiKey: config.apiKey, model: config.model,
         temperature: config.temperature, timeoutMs: config.timeoutMs, maxOutputTokens: config.maxOutputTokens,
-        retryCount: config.retryCount }, system, user, schema, this.fetchImpl, this.sleep);
+        retryCount: config.retryCount, beforeRequest: () => {
+          // Synchronous reservation is shared by all service instances using this DB.
+          return this.options.store.db.transaction(() => {
+            if (this.budgetState(role, config, this.now()).exhausted) return false;
+            this.options.store.db.prepare("INSERT INTO llm_provider_requests(ts,role,retry) VALUES(?,?,?)")
+              .run(new Date(this.now()).toISOString(), role, requests > 0 ? 1 : 0);
+            requests++;
+            return true;
+          }).immediate();
+        } }, system, user, schema, this.fetchImpl, this.sleep);
     } catch {
       result = { value: null, status: "NETWORK_ERROR", attempts: 1, latencyMs: 0 };
     }
-    this.recordRun(role, config, result.status, result.latencyMs, result.inputTokens ?? null, result.outputTokens ?? null,
-      result.status === "SUCCESS" ? null : result.status, contextRef);
+    this.recordRun(role, config, result.status, result.latencyMs, requests === 1 ? result.inputTokens ?? null : null,
+      requests === 1 ? result.outputTokens ?? null : null,
+      result.status === "SUCCESS" ? null : result.status, contextRef, requests);
     const payload = { role, provider: config.provider || "custom", model: config.model, latency_ms: result.latencyMs,
       attempt: result.attempts, success: result.status === "SUCCESS", ...(result.inputTokens !== undefined ? { input_tokens: result.inputTokens } : {}),
       ...(result.outputTokens !== undefined ? { output_tokens: result.outputTokens } : {}), ...(result.status !== "SUCCESS" ? { error_class: result.status } : {}), contextRef: safeContextRef(contextRef) };
@@ -190,10 +217,23 @@ export class RoleLlmService {
       .get(role) as { ts: string } | undefined;
     const failure = this.options.store.db.prepare("SELECT ts,error_class FROM llm_runs WHERE role=? AND status NOT IN ('SUCCESS','DISABLED','UNCONFIGURED','INVALID_CONFIG','BUDGET_EXHAUSTED') ORDER BY id DESC LIMIT 1")
       .get(role) as { ts: string; error_class: string | null } | undefined;
-    const overBudget = (config.budget.maxCallsPerHour !== undefined && callsThisHour >= config.budget.maxCallsPerHour)
-      || (config.budget.maxCallsPerDay !== undefined && callsToday >= config.budget.maxCallsPerDay);
+    const budgetRequestsThisHour = this.countRequests(role, hourStart);
+    const budgetRequestsToday = this.countRequests(role, todayStart);
+    const legacyBudgetChargesThisHour = this.countLegacyCharges(role, hourStart);
+    const legacyBudgetChargesToday = this.countLegacyCharges(role, todayStart);
+    const providerRequestsThisHour = budgetRequestsThisHour - legacyBudgetChargesThisHour;
+    const providerRequestsToday = budgetRequestsToday - legacyBudgetChargesToday;
+    const usage = this.options.store.db.prepare(`SELECT
+      CASE WHEN COUNT(*)=COUNT(input_tokens) THEN SUM(input_tokens) END input,
+      CASE WHEN COUNT(*)=COUNT(output_tokens) THEN SUM(output_tokens) END output,
+      COALESCE(SUM(provider_requests),0) completed_requests
+      FROM llm_runs WHERE role=? AND ts>=? AND (provider_requests>0 OR (provider_requests IS NULL AND status IN (${COUNTED_STATUSES.map(() => "?").join(",")})))`)
+      .get(role, todayStart, ...COUNTED_STATUSES) as { input: number | null; output: number | null; completed_requests: number };
+    const retry = this.options.store.db.prepare("SELECT COALESCE(SUM(retry),0) count FROM llm_provider_requests WHERE role=? AND ts>=?").get(role, todayStart) as { count: number };
+    const overBudget = (config.budget.maxCallsPerHour !== undefined && budgetRequestsThisHour >= config.budget.maxCallsPerHour)
+      || (config.budget.maxCallsPerDay !== undefined && budgetRequestsToday >= config.budget.maxCallsPerDay);
     const status = resolved.status !== "AVAILABLE" ? resolved.status : overBudget ? "BUDGET_EXHAUSTED"
-      : recent && recent.status !== "SUCCESS" && recent.status !== "UNCONFIGURED" && recent.status !== "DISABLED" ? "ERROR" : "AVAILABLE";
+      : recent && recent.status !== "SUCCESS" && recent.status !== "UNCONFIGURED" && recent.status !== "DISABLED" && recent.status !== "BUDGET_EXHAUSTED" ? "ERROR" : "AVAILABLE";
     let baseUrlHost = "";
     try { baseUrlHost = new URL(config.baseUrl).hostname; } catch { /* not configured */ }
     return {
@@ -202,30 +242,47 @@ export class RoleLlmService {
       maxOutputTokens: config.maxOutputTokens, retryCount: config.retryCount, budget: config.budget,
       maxRevisionRounds: config.maxRevisionRounds, apiKeyConfigured: Boolean(config.apiKey), apiKeyMasked: maskApiKey(config.apiKey),
       status, lastSuccess: success?.ts ?? null, lastFailure: failure?.ts ?? null, lastLatencyMs: recent?.latency_ms ?? null,
-      callsThisHour, callsToday, errorClass: recent?.error_class ?? resolved.errorClass ?? null,
+      callsThisHour, callsToday, errorClass: status === "AVAILABLE" ? null : recent?.error_class ?? resolved.errorClass ?? null,
+      providerRequestsThisHour, providerRequestsToday, retriesToday: retry.count,
+      legacyBudgetChargesThisHour, legacyBudgetChargesToday, budgetRequestsThisHour, budgetRequestsToday,
+      inputTokensToday: usage.completed_requests === providerRequestsToday && !legacyBudgetChargesToday ? usage.input : null,
+      outputTokensToday: usage.completed_requests === providerRequestsToday && !legacyBudgetChargesToday ? usage.output : null,
     };
   }
 
   private budgetState(role: LlmRole, config: RoleLlmConfig, now: number): { exhausted: boolean } {
-    const hour = this.countCalls(role, new Date(now - 3_600_000).toISOString());
+    const hour = this.countRequests(role, new Date(now - 3_600_000).toISOString());
     const midnight = new Date(now).toISOString().slice(0, 10) + "T00:00:00.000Z";
-    const day = this.countCalls(role, midnight);
+    const day = this.countRequests(role, midnight);
     return { exhausted: (config.budget.maxCallsPerHour !== undefined && hour >= config.budget.maxCallsPerHour)
       || (config.budget.maxCallsPerDay !== undefined && day >= config.budget.maxCallsPerDay) };
   }
 
   private countCalls(role: LlmRole, since: string): number {
     const placeholders = COUNTED_STATUSES.map(() => "?").join(",");
-    const row = this.options.store.db.prepare(`SELECT COUNT(*) count FROM llm_runs WHERE role=? AND ts>=? AND status IN (${placeholders})`)
+    const row = this.options.store.db.prepare(`SELECT COUNT(*) count FROM llm_runs WHERE role=? AND ts>=? AND (provider_requests>0 OR (provider_requests IS NULL AND status IN (${placeholders})))`)
       .get(role, since, ...COUNTED_STATUSES) as { count: number };
     return row.count;
   }
 
+  private countRequests(role: LlmRole, since: string): number {
+    const requests = (this.options.store.db.prepare("SELECT COUNT(*) count FROM llm_provider_requests WHERE role=? AND ts>=?").get(role, since) as { count: number }).count;
+    // Legacy runs predate attempt accounting. Preserve their existing budget
+    // charge rather than resetting a role's allowance during migration.
+    return requests + this.countLegacyCharges(role, since);
+  }
+
+  private countLegacyCharges(role: LlmRole, since: string): number {
+    return (this.options.store.db.prepare(`SELECT COUNT(*) count FROM llm_runs WHERE role=? AND ts>=?
+      AND provider_requests IS NULL AND status IN (${COUNTED_STATUSES.map(() => "?").join(",")})`)
+      .get(role, since, ...COUNTED_STATUSES) as { count: number }).count;
+  }
+
   private recordRun(role: LlmRole, config: RoleLlmConfig, status: string, latencyMs: number, inputTokens: number | null,
-    outputTokens: number | null, errorClass: string | null, contextRef: string): void {
-    this.options.store.db.prepare(`INSERT INTO llm_runs(ts,role,provider,model,status,latency_ms,input_tokens,output_tokens,error_class,context_ref)
-      VALUES(?,?,?,?,?,?,?,?,?,?)`).run(new Date(this.now()).toISOString(), role, config.provider || "custom", config.model,
-      status, Math.max(0, Math.trunc(latencyMs)), inputTokens, outputTokens, errorClass, safeContextRef(contextRef));
+    outputTokens: number | null, errorClass: string | null, contextRef: string, requests = 0): void {
+    this.options.store.db.prepare(`INSERT INTO llm_runs(ts,role,provider,model,status,latency_ms,input_tokens,output_tokens,error_class,context_ref,provider_requests)
+      VALUES(?,?,?,?,?,?,?,?,?,?,?)`).run(new Date(this.now()).toISOString(), role, config.provider || "custom", config.model,
+      status, Math.max(0, Math.trunc(latencyMs)), inputTokens, outputTokens, errorClass, safeContextRef(contextRef), requests);
   }
 
   private recordUnavailable(role: LlmRole, resolved: ResolvedRoleConfig, contextRef: string, errorClass: string): void {
@@ -285,6 +342,7 @@ function safeContextRef(value: string): string {
 }
 
 function eventKind(status: LlmErrorClass): string {
+  if (status === "BUDGET_EXHAUSTED") return "LLM_BUDGET_EXHAUSTED";
   if (status === "TIMEOUT") return "LLM_TIMEOUT";
   if (status === "RATE_LIMIT") return "LLM_RATE_LIMIT";
   if (status === "AUTHENTICATION_FAILED") return "LLM_AUTH_FAILURE";

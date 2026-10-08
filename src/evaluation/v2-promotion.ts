@@ -1,6 +1,7 @@
 import type { Candle } from "../exchange/okx/types.ts";
 import type { Store } from "../memory/db.ts";
-import { logSystemEvent } from "../memory/db.ts";
+import { logSystemEvent, kvGet, kvSet } from "../memory/db.ts";
+import { createHash } from "node:crypto";
 import { backtestV2, rollingForwardRobustnessV2, type V2CostModel } from "./backtest.ts";
 import { summarize, type PerfSummary } from "./performance.ts";
 import { completeV2Params, getV2Champions, listV2Versions, transitionV2Version, type V2StrategyVersion } from "../strategy/v2-registry.ts";
@@ -35,10 +36,10 @@ export function evaluateV2Lifecycle(store: Store, source: ReadonlyMap<string, Ca
   for (const challenger of listV2Versions(store).filter((v) => v.status === "CHALLENGER" || v.status === "SHADOW")) {
     const champion = champions[challenger.strategy], cutoff = evidenceCutoff(challenger);
     const aligned = align(beforeCutoff(source, cutoff)), split = splitOos(aligned, criteria.outOfSampleFraction);
-    const trainC = evaluate(champion, split.train, timeframe, costs, tickSizes);
-    const trainX = evaluate(challenger, split.train, timeframe, costs, tickSizes);
-    const oosC = evaluate(champion, split.oos, timeframe, costs, tickSizes);
-    const oosX = evaluate(challenger, split.oos, timeframe, costs, tickSizes);
+    const trainC = cachedEvaluate(store, champion, split.train, timeframe, costs, tickSizes, "train");
+    const trainX = cachedEvaluate(store, challenger, split.train, timeframe, costs, tickSizes, "train");
+    const oosC = cachedEvaluate(store, champion, split.oos, timeframe, costs, tickSizes, "oos");
+    const oosX = cachedEvaluate(store, challenger, split.oos, timeframe, costs, tickSizes, "oos");
     let comparison = comparisonFor(champion, challenger, trainX, oosX, cutoff, split, "AWAITING_EVIDENCE");
     if (challenger.status === "CHALLENGER") {
       const enough = trainX.trades >= criteria.historicalMinTrades && trainC.trades >= criteria.historicalMinTrades
@@ -115,7 +116,14 @@ export function evaluateV2Lifecycle(store: Store, source: ReadonlyMap<string, Ca
   return result;
 }
 function evidenceCutoff(v: V2StrategyVersion): number {
-  try { const e = JSON.parse(String(v.evidence ?? "{}")) as { evidenceCutoffTs?: string }; const n = e.evidenceCutoffTs ? Date.parse(e.evidenceCutoffTs) : NaN; if (Number.isFinite(n)) return n; }
+  try {
+    const e = JSON.parse(String(v.evidence ?? "{}")) as { evidenceCutoffTs?: string; validationCutoffTs?: string };
+    // Older lifecycle transitions replaced proposal context with validation.
+    // Reuse its persisted cutoff when present; never extend it to newer candles.
+    const ts = e.evidenceCutoffTs ?? e.validationCutoffTs;
+    const n = ts ? Date.parse(ts) : NaN;
+    if (Number.isFinite(n)) return n;
+  }
   catch { /* legacy versions */ }
   return Date.parse(v.created_ts);
 }
@@ -131,7 +139,7 @@ function splitOos(h: ReadonlyMap<string, Candle[]>, fraction: number): {
   train: Map<string, Candle[]>; oos: Map<string, Candle[]>; historicalEndTs: number | null; oosStartTs: number | null; oosEndTs: number | null;
 } {
   const all = [...h.values()].flat(); if (!all.length) return { train: new Map(), oos: new Map(), historicalEndTs: null, oosStartTs: null, oosEndTs: null };
-  const start = Math.min(...all.map((c) => c.ts)), end = Math.max(...all.map((c) => c.ts)), boundary = Math.floor(start + (end - start) * (1 - fraction));
+  const start = all.reduce((n, c) => Math.min(n, c.ts), Infinity), end = all.reduce((n, c) => Math.max(n, c.ts), -Infinity), boundary = Math.floor(start + (end - start) * (1 - fraction));
   const train = new Map<string, Candle[]>(), oos = new Map<string, Candle[]>();
   for (const [s, cs] of h) { train.set(s, cs.filter((c) => c.ts < boundary)); oos.set(s, cs.filter((c) => c.ts >= boundary)); }
   return { train, oos, historicalEndTs: boundary - 1, oosStartTs: boundary, oosEndTs: end };
@@ -148,6 +156,55 @@ function evaluate(v: V2StrategyVersion, h: ReadonlyMap<string, Candle[]>, tf: st
     }
   }
   return { summary: summarize(rs), trades: rs.length, bySymbol, folds, validFolds, positiveFolds };
+}
+
+// Revision must change when evaluator, feature, fill or metric semantics change.
+// One replaceable slot per immutable version/stage bounds storage growth.
+export const HISTORICAL_CACHE_REVISION = 4;
+function cacheJson(value: unknown): string {
+  return JSON.stringify(value, (_key, item: unknown) => item === Infinity ? "__POSITIVE_INFINITY__" : item);
+}
+function cacheDigest(value: unknown): string {
+  return createHash("sha256").update(cacheJson(value)).digest("hex");
+}
+export function historicalFingerprint(v: Pick<V2StrategyVersion, "strategy" | "version" | "params">,
+  h: ReadonlyMap<string, Candle[]>, tf: string, costs: V2CostModel, ticks: ReadonlyMap<string, number>): string {
+  const hash = createHash("sha256").update(JSON.stringify({ revision: HISTORICAL_CACHE_REVISION, strategy: v.strategy, version: v.version, params: v.params, tf, costs }));
+  for (const [symbol, candles] of h) {
+    hash.update(JSON.stringify([symbol, ticks.get(symbol) ?? null]));
+    for (const c of candles) hash.update(JSON.stringify([c.ts, c.o, c.h, c.l, c.c, c.vol, c.volCcy, c.confirm]));
+  }
+  return hash.digest("hex");
+}
+function cachedEvaluate(store: Store, v: V2StrategyVersion, h: ReadonlyMap<string, Candle[]>, tf: string, costs: V2CostModel,
+  ticks: ReadonlyMap<string, number>, stage: string): Aggregate {
+  const key = `historical_validation:${v.strategy}:${v.version}:${stage}`;
+  const fingerprint = historicalFingerprint(v, h, tf, costs, ticks);
+  try {
+    const cached = JSON.parse(kvGet(store, key) ?? "null", (_key, value: unknown) => value === "__POSITIVE_INFINITY__" ? Infinity : value) as { fingerprint: string; valueDigest: string; value: Omit<Aggregate, "bySymbol"> & { bySymbol: Array<[string, number[]]> } } | null;
+    if (cached?.fingerprint === fingerprint && cached.valueDigest === cacheDigest(cached.value) && validCachedAggregate(cached.value, h)) {
+      return { ...cached.value, bySymbol: new Map(cached.value.bySymbol) };
+    }
+  } catch { /* Invalid caches are recomputed from source evidence. */ }
+  const value = evaluate(v, h, tf, costs, ticks);
+  const encoded = { ...value, bySymbol: [...value.bySymbol] };
+  kvSet(store, key, cacheJson({ fingerprint, valueDigest: cacheDigest(encoded), value: encoded }));
+  return value;
+}
+function validCachedAggregate(value: unknown, source: ReadonlyMap<string, Candle[]>): value is Omit<Aggregate, "bySymbol"> & { bySymbol: Array<[string, number[]]> } {
+  if (!value || typeof value !== "object") return false;
+  const row = value as Record<string, unknown>;
+  const finiteArray = (v: unknown): v is number[] => Array.isArray(v) && v.every(n => typeof n === "number" && Number.isFinite(n));
+  if (!Array.isArray(row.bySymbol) || !finiteArray(row.folds)) return false;
+  const returns: number[] = [], symbols = new Set<string>();
+  for (const pair of row.bySymbol) {
+    if (!Array.isArray(pair) || pair.length !== 2 || typeof pair[0] !== "string" || !source.has(pair[0]) || symbols.has(pair[0]) || !finiteArray(pair[1])) return false;
+    symbols.add(pair[0]); returns.push(...pair[1]);
+  }
+  if (symbols.size !== source.size || row.trades !== returns.length || row.validFolds !== row.folds.length
+    || row.positiveFolds !== row.folds.filter(n => n > 0).length || !row.summary || typeof row.summary !== "object") return false;
+  const summary = row.summary as Record<string, unknown>;
+  return Object.entries(summarize(returns)).every(([key, number]) => summary[key] === number);
 }
 function positiveFraction(a: Aggregate): number {
   const values = [...a.bySymbol.values()].filter((rs) => rs.length); return values.length ? values.filter((rs) => summarize(rs).expectancy_r > 0).length / values.length : 0;

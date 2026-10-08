@@ -4,7 +4,9 @@ import { AppShell, type PageId } from "./components/AppShell";
 import { useApi, useRefreshSocket } from "./hooks/useApi";
 import { asRow } from "./lib/types";
 import { DashboardPage } from "./pages/DashboardPage";
-import { EvolutionPage } from "./pages/EvolutionPage";
+import { EvolutionWorkspace } from "./pages/EvolutionWorkspace";
+import { TradingPage } from "./pages/TradingPage";
+import { AiPage } from "./pages/AiPage";
 import { LogsPage } from "./pages/LogsPage";
 import { MarketsPage } from "./pages/MarketsPage";
 import { MemoryPage } from "./pages/MemoryPage";
@@ -13,6 +15,7 @@ import { SettingsPage } from "./pages/SettingsPage";
 import { StrategiesPage } from "./pages/StrategiesPage";
 import { TradesPage } from "./pages/TradesPage";
 import "./styles.css";
+import "./workstation.css";
 
 function App() {
   const [page, setPage] = useState<PageId>("dashboard");
@@ -22,10 +25,12 @@ function App() {
 
   const pages: Record<PageId, ReactNode> = {
     dashboard: <DashboardPage status={status}/>,
+    trading: <TradingPage status={status}/>,
+    ai: <AiPage/>,
     markets: <MarketsPage status={status}/>,
     trades: <TradesPage/>,
     strategies: <StrategiesPage/>,
-    evolution: <EvolutionPage/>,
+    evolution: <EvolutionWorkspace/>,
     memory: <MemoryPage/>,
     risk: <RiskPage status={status}/>,
     logs: <LogsPage/>,

@@ -35,6 +35,7 @@ import { evaluateV2Lifecycle } from "../evaluation/v2-promotion.ts";
 import { familyForV2 } from "../strategy/identity.ts";
 import { parseEvolutionConfig } from "./evolution-config.ts";
 import { resolveRuntimePolicy } from "./runtime-policy.ts";
+import { RuntimeRiskService } from "./runtime-risk.ts";
 import { runOncePerGlobalCycle } from "./global-cycle.ts";
 import { RoleLlmService } from "./llm-role-service.ts";
 import { createLogger } from "./logger.ts";
@@ -73,6 +74,7 @@ async function main(): Promise<void> {
   };
 
   const store = openStore(REPO_ROOT);
+  const runtimeRisk = new RuntimeRiskService({ store, risk, baselineMode });
   const llmRoles = new RoleLlmService({ root: REPO_ROOT, store });
   if (strategyCoreVersion === 2) ensureV2Registry(store, configuredV2Params);
   const { client } = createDemoExchange(env);
@@ -139,8 +141,12 @@ async function main(): Promise<void> {
     port: Number(env.DASHBOARD_PORT ?? 8790),
     ...(env.DASHBOARD_BIND ? { bind: env.DASHBOARD_BIND } : {}),
     ...(env.DASHBOARD_USER ? { auth: { user: env.DASHBOARD_USER, password: env[["DASHBOARD","PASSWORD"].join("_")] ?? "" } } : {}),
-    trading, risk, strategyCoreVersion, baselineMode, deps: () => deps,
+    trading, risk, runtimeRisk, strategyCoreVersion, baselineMode, deps: () => deps,
     evolution: {
+      enabled: runtimePolicy.evolutionEnabled,
+      automaticPromotion: evolution.automatic_promotion_enabled,
+      shadowMinimum: evolution.promotion.shadow_forward_min_trades,
+      championShadowMinimum: evolution.promotion.champion_shadow_min_trades,
       reviewEvery: evolution.review_every_closed_trade,
       signalInterval: evolution.signal_evolution_interval_trades,
       strategyInterval: evolution.strategy_evolution_interval_trades,

@@ -27,9 +27,19 @@ export function formatMoney(value: unknown, currency = "USDT"): string {
   return `${number < 0 ? "−" : number > 0 ? "+" : ""}${numberFormat.format(Math.abs(number))} ${currency}`;
 }
 
-export function formatPercent(value: unknown, digits = 2): string {
+export function formatAmount(value: unknown, currency = "USDT"): string {
   const number = asNumber(value);
-  return number === null ? "N/A" : `${number > 0 ? "+" : ""}${formatNumber(number, digits)}%`;
+  if (number === null) return "N/A";
+  return `${numberFormat.format(number)}${currency ? ` ${currency}` : ""}`;
+}
+
+export function formatLeverage(value: unknown): string {
+  return asNumber(value) === null ? "N/A" : `${formatPrice(value)}x`;
+}
+
+export function formatPercent(value: unknown, digits = 2, signed = true): string {
+  const number = asNumber(value);
+  return number === null ? "N/A" : `${signed && number > 0 ? "+" : ""}${formatNumber(number, digits)}%`;
 }
 
 export function formatR(value: unknown): string {

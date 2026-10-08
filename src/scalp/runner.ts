@@ -11,7 +11,7 @@ import type { InstrumentInfo } from "../exchange/okx/types.ts";
 import { getCandles } from "../exchange/okx/market.ts";
 import { getBalance, getPositions } from "../exchange/okx/account.ts";
 import { getServerTime } from "../exchange/okx/market.ts";
-import { placeOrder, waitForOrderTerminal, getFills } from "../exchange/okx/orders.ts";
+import { waitForOrderTerminal, getFills } from "../exchange/okx/orders.ts";
 import { placeConditionalProtection } from "../exchange/okx/algo.ts";
 import { updateTradeStopPlus } from "../execution/position-management.ts";
 import type { RiskConfig, TradingConfig } from "../core/config.ts";
@@ -21,7 +21,9 @@ import { openTrade, nextDecisionId, recordDecision } from "../memory/trades.ts";
 import { getOpenTrades } from "../memory/trades.ts";
 import { buildFeatures, type FeatureSnapshot } from "../market/features.ts";
 import { classifyRegime } from "../market/regime.ts";
-import { clId, closeTradeOnExchange, priceTrigger } from "../execution/executor.ts";
+import { clId, closeTradeOnExchange, priceTrigger, synchronizeEntryLeverage, confirmedFillLeverage, submitReservedEntry } from "../execution/executor.ts";
+import { riskFingerprint, selectedEntryLeverage, serializeRiskEntry, releaseEntry } from "../core/runtime-risk.ts";
+import { persistEntryCapital } from "../core/capital.ts";
 import { CandleCloseScheduler, msForBar } from "../core/scheduler.ts";
 import { createLogger } from "../core/logger.ts";
 import type { RoleLlmService } from "../core/llm-role-service.ts";
@@ -179,6 +181,10 @@ export class ScalpRunner {
   // ---------- deterministic entry with LLM-approved context ----------
 
   private async openScalp(sig: ScalpSignal, features: FeatureSnapshot): Promise<void> {
+    return serializeRiskEntry(this.d.store, () => this.openScalpSerialized(sig, features));
+  }
+
+  private async openScalpSerialized(sig: ScalpSignal, features: FeatureSnapshot): Promise<void> {
     const { client, store, cfg, risk, instruments } = this.d;
     const meta = instruments[sig.instrument]!;
     try {
@@ -220,11 +226,13 @@ export class ScalpRunner {
       let sz;
       try {
         sz = sizePosition({ equity, entryPrice: sig.price, stopPrice: sig.stopPx,
-          leverage: this.d.trading.leverage.default, instrument: meta }, risk,
+          leverage: selectedEntryLeverage(this.d.trading, risk), instrument: meta }, risk,
         { mode: "percent_of_equity", position_pct: cfg.position_pct });
       } catch (e) {
         log.info({ event: "scalp_sizing_reject", inst: sig.instrument, error: e instanceof Error ? e.message.slice(0, 80) : "" }); return;
       }
+      const riskAtPreparation = riskFingerprint(risk);
+      const leverage = await synchronizeEntryLeverage(this.d, sig.instrument);
       // Re-read global risk immediately before the exchange write; bot pause,
       // emergency stop, loss limits, or an external position may have changed.
       const finalPositions = (await getPositions(client)).filter((p) => p.pos !== "0");
@@ -249,19 +257,20 @@ export class ScalpRunner {
         instrument: sig.instrument, instrumentOccupied: finalPositions.some((p) => p.instId === sig.instrument) ||
           finalLocal.some((t) => String(t.instrument) === sig.instrument),
       }, risk);
-      if (!finalGate.allowed) {
-        log.info({ event: "scalp_global_risk_reject", inst: sig.instrument, reason: finalGate.reason, stage: "pre_order" });
+      if (!finalGate.allowed || riskFingerprint(risk) !== riskAtPreparation) {
+        log.info({ event: "scalp_global_risk_reject", inst: sig.instrument,
+          reason: riskFingerprint(risk) !== riskAtPreparation ? "RISK_SETTINGS_CHANGED" : finalGate.reason, stage: "pre_order" });
         return;
       }
       try {
         sz = sizePosition({ equity: finalEquity, entryPrice: sig.price, stopPrice: sig.stopPx,
-          leverage: this.d.trading.leverage.default, instrument: meta }, risk,
+          leverage, instrument: meta }, risk,
         { mode: "percent_of_equity", position_pct: cfg.position_pct });
       } catch (e) {
         log.info({ event: "scalp_sizing_reject", inst: sig.instrument, stage: "pre_order", error: e instanceof Error ? e.message.slice(0, 80) : "" }); return;
       }
       const clOpen = clId(side, "OPEN", sig.instrument);
-      const placed = await placeOrder(client, {
+      const placed = await submitReservedEntry(this.d, {
         instId: sig.instrument, tdMode: "isolated", side: side === "LONG" ? "buy" : "sell",
         posSide: side.toLowerCase() as "long" | "short", ordType: "market", sz: sz.contracts, clOrdId: clOpen,
       });
@@ -277,11 +286,8 @@ export class ScalpRunner {
         instrument: sig.instrument, decision: side, strategy: "SCALP_V1", regime: sig.regime,
         rawConfidence: sig.score, calibratedConfidence: sig.score,
         thesis: [sig.reason.slice(0, 280)], riskVerdict: { approved: true, reason: `scalp ${this.stance}` } });
-      const algo = await placeConditionalProtection(client, {
-        instId: sig.instrument, posSide: side === "LONG" ? "long" : "short",
-        contracts: sz.contracts, stopPrice: stopPx, takeProfitPrice: tpPx,
-        clAlgoId: clId(side, "ALGO", sig.instrument),
-      });
+      const entryPosition = (await getPositions(client, sig.instrument).catch(() => []))
+        .find((p) => p.instId === sig.instrument && p.posSide === side.toLowerCase() && Number(p.pos) !== 0);
       openTrade(store, {
         tradeId, engine: "SCALP_5M", instrument: sig.instrument, timeframe: TF_TAG, side,
         strategy: "SCALP", strategyVersion: 1, regime: sig.regime, contracts: sz.contracts,
@@ -289,9 +295,22 @@ export class ScalpRunner {
         clOpenId: clOpen, ordOpenId: placed.ordId,
         decisionId,
         rawConfidence: sig.score, calibratedConfidence: sig.score,
-        plannedRiskPct: cfg.position_pct, leverage: this.d.trading.leverage.default, entryFeatures: features,
+        plannedRiskPct: Number(sz.contracts) * Number(meta.ctVal) * Math.abs(entryPx - stopPx) / finalEquity * 100,
+        leverage: confirmedFillLeverage(entryPosition ?? filled, confirmedFillLeverage(filled, leverage)), entryFeatures: features,
       });
-      store.db.prepare("UPDATE trades SET algo_id=? WHERE trade_id=?").run(algo.algoId, tradeId);
+      try {
+        const algo = await placeConditionalProtection(client, {
+          instId: sig.instrument, posSide: side === "LONG" ? "long" : "short",
+          contracts: sz.contracts, stopPrice: stopPx, takeProfitPrice: tpPx,
+          clAlgoId: clId(side, "ALGO", sig.instrument),
+        });
+        store.db.prepare("UPDATE trades SET algo_id=? WHERE trade_id=?").run(algo.algoId, tradeId);
+      } catch (error) {
+        logSystemEvent(store, "RISK_EVENT", { protection_degraded: String(error), tradeId, fallback: "Layer B bot monitor" });
+      }
+      releaseEntry(store, clOpen);
+      try { persistEntryCapital(store, tradeId, entryPosition, meta, finalEquity, leverage); }
+      catch { log.warn({ event: "entry_capital_persistence_failed", tradeId }); }
       const fills = await getFills(client, sig.instrument, placed.ordId).catch(() => []);
       logSystemEvent(store, "TRADE_OPEN", { tradeId, instId: sig.instrument, side, scalpr: true,
         notional: Math.round(sz.notionalUsdt * 100) / 100 });

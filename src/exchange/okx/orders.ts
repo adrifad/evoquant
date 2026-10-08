@@ -5,17 +5,36 @@
 // waitForOrderTerminal (§14). tdMode fixed isolated (§3). No secrets logged.
 
 import type { OkxClient } from "./client.ts";
-import { firstOf } from "./client.ts";
+import { firstOf, OkxApiError } from "./client.ts";
 import { normalizeContractSize } from "./sizing.ts";
 import type { Fill, OrderDetail, OrderRequest, PosSide, Side } from "./types.ts";
 
 export class OrderRejectedError extends Error {
   readonly sCode: string;
-  constructor(sCode: string, sMsg: string) {
+  readonly definitive: boolean;
+  constructor(sCode: string, sMsg: string, definitive = false) {
     super(`order rejected by OKX: sCode=${sCode} sMsg=${sMsg || "(none)"}`);
     this.name = "OrderRejectedError";
     this.sCode = sCode;
+    this.definitive = definitive;
   }
+}
+
+// OKX error codes: invalid parameters, insufficient balance, invalid lot multiple.
+// https://www.okx.com/docs-v5/en/ and https://www.okx.com/en-au/help/api-faq
+// Unknown codes (including duplicate IDs and timeouts) require reconciliation (§45).
+const DEFINITIVE_REJECTIONS = new Set(["51000", "51008", "51121"]);
+
+function rejectionFromItem(data: unknown, order: OrderRequest): OrderRejectedError | null {
+  if (!Array.isArray(data) || data.length !== 1) return null;
+  const item: unknown = data[0];
+  if (item === null || typeof item !== "object") return null;
+  const row = item as Record<string, unknown>;
+  if (typeof row.sCode !== "string" || row.sCode === "0") return null;
+  const definitive = DEFINITIVE_REJECTIONS.has(row.sCode) && row.ordId === ""
+    && typeof row.sMsg === "string" && typeof row.clOrdId === "string"
+    && (row.clOrdId === "" || row.clOrdId === order.clOrdId);
+  return new OrderRejectedError(row.sCode, typeof row.sMsg === "string" ? row.sMsg : "", definitive);
 }
 
 export class OrderTimeoutError extends Error {
@@ -39,7 +58,24 @@ export interface PlaceOrderResult {
 // spec §9–§13 — submit one order. Per-item sCode "0" = accepted for
 // processing only; fill state must be confirmed separately (§14).
 export async function placeOrder(client: OkxClient, order: OrderRequest): Promise<PlaceOrderResult> {
-  const data = await client.post<Array<Record<string, string>>>("/api/v5/trade/order", order, true);
+  let data: Array<Record<string, string>>;
+  try {
+    data = await client.post<Array<Record<string, string>>>("/api/v5/trade/order", order, true);
+  } catch (error) {
+    if (error instanceof OkxApiError && error.httpStatus === 200) {
+      if (error.code === "1") {
+        const rejection = rejectionFromItem(error.data, order);
+        if (rejection) throw rejection;
+      }
+      if (DEFINITIVE_REJECTIONS.has(error.code) && Array.isArray(error.data) && error.data.length === 0) {
+        throw new OrderRejectedError(error.code, error.msg, true);
+      }
+    }
+    throw error;
+  }
+  const rejection = rejectionFromItem(data, order);
+  if (rejection) throw rejection;
+  if (!Array.isArray(data) || data.length !== 1) throw new Error("Malformed trade/order response");
   const first = firstOf(data, "trade/order response");
   const sCode = first.sCode ?? "";
   if (sCode !== "0") throw new OrderRejectedError(sCode, first.sMsg ?? "");

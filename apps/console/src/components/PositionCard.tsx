@@ -36,7 +36,7 @@ export function PositionCard({ status }: { status: Row }) {
       <Badge tone={side === "LONG" ? "long" : "short"}><Icon size={13} aria-hidden="true"/>{side}</Badge>
     </div>
     <div className="position-main-metrics">
-        <div><span>Unrealized PnL</span><strong className={`mono ${toneFor(pnl)}`}>{formatMoney(pnl)}</strong><small>{liveKnown ? `${formatPercent(position.pnl_pct)} | ${formatR(position.r)}` : "Live return unavailable"}</small></div>
+        <div><span>Unrealized PnL</span><strong className={`mono ${toneFor(pnl)}`}>{formatMoney(pnl)}</strong><small>{liveKnown ? `${formatR(position.r)} price return, before costs` : "Live return unavailable"}</small></div>
       <div className="position-live-state"><span className={position.live === false ? "state-dot state-muted" : "state-dot"}/>{position.live === false ? "Mark unavailable" : "Exchange mark live"}</div>
     </div>
     <div className="position-grid">
@@ -46,7 +46,7 @@ export function PositionCard({ status }: { status: Row }) {
       <Field label="Take profit" value={formatPrice(position.take_profit_px)} tone="positive"/>
       <Field label="Contracts" value={asText(position.contracts)}/>
       <Field label="Duration" value={formatDuration(position.duration_s)}/>
-      <Field label="Leverage" value={position.leverage ? `${asText(position.leverage)}x` : "Not supplied"}/>
+      <Field label="Actual leverage" value={asNumber(position.actual_leverage) === null ? "Unavailable" : `${asText(position.actual_leverage)}x`} detail={position.leverage_mismatch ? "Differs from configured leverage" : asText(position.margin_mode, "Exchange value")}/>
       <Field label="Strategy" value={strategy} mono={false}/>
       <Field label="Regime" value={asText(position.regime ?? status.regime)} mono={false}/>
     </div>

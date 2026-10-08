@@ -63,6 +63,11 @@ interface RawPosition {
   lever?: string;
   upl?: string;
   mgnMode?: string;
+  margin?: string;
+  imr?: string;
+  notionalUsd?: string;
+  ccy?: string;
+  uTime?: string;
 }
 
 function mapPosition(raw: RawPosition): Position {
@@ -76,7 +81,9 @@ function mapPosition(raw: RawPosition): Position {
     markPx: String(raw.markPx ?? ""),
     lever: String(raw.lever ?? ""),
     upl: String(raw.upl ?? ""),
-    mgnMode: "isolated",
+    mgnMode: raw.mgnMode === "isolated" || raw.mgnMode === "cross" ? raw.mgnMode : "unknown",
+    margin: String(raw.margin ?? ""), imr: String(raw.imr ?? ""),
+    notionalUsd: String(raw.notionalUsd ?? ""), ccy: String(raw.ccy ?? ""), uTime: String(raw.uTime ?? ""),
   };
 }
 
@@ -128,7 +135,7 @@ async function setLeverageForSide(
   const raw = firstOf(data, `set leverage ${instId} ${posSide}`);
   return {
     instId: String(raw.instId ?? instId),
-    lever: String(raw.lever ?? String(lever)),
+    lever: String(raw.lever ?? ""),
     mgnMode: "isolated",
     posSide: raw.posSide === "short" ? "short" : "long",
   };

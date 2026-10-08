@@ -10,9 +10,10 @@ export interface LlmConfig {
   temperature?: number;
   maxOutputTokens?: number;
   retryCount?: number;
+  beforeRequest?: () => boolean;
 }
 
-export type LlmErrorClass = "TIMEOUT" | "RATE_LIMIT" | "AUTHENTICATION_FAILED" | "PROVIDER_ERROR" | "HTTP_ERROR" | "INVALID_RESPONSE" | "NETWORK_ERROR";
+export type LlmErrorClass = "TIMEOUT" | "RATE_LIMIT" | "AUTHENTICATION_FAILED" | "PROVIDER_ERROR" | "HTTP_ERROR" | "INVALID_RESPONSE" | "NETWORK_ERROR" | "BUDGET_EXHAUSTED";
 export type LlmTransportStatus = "SUCCESS" | LlmErrorClass;
 export interface LlmTransportResult<T> {
   value: T | null;
@@ -44,6 +45,7 @@ export async function llmJsonDetailed<T>(
   let outputTokens: number | undefined;
 
   for (let attempt = 0; attempt <= retries; attempt++) {
+    if (cfg.beforeRequest && !cfg.beforeRequest()) return { value: null, status: "BUDGET_EXHAUSTED", attempts: attempt, latencyMs: Date.now() - started };
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), cfg.timeoutMs ?? 90_000);
     try {

@@ -1,4 +1,4 @@
-// V1 operations console (§57–102). Single-page dark dashboard + JSON API,
+// Operations console and JSON API (§57–102),
 // served by the bot process on 127.0.0.1 only (access via SSH tunnel — keeps
 // emergency controls off the public net). Priorities per §97: risk state,
 // open position, PnL, bot state, latest decision — AI narrative last.
@@ -27,6 +27,11 @@ import { createLogger } from "./logger.ts";
 import { listV2Versions } from "../strategy/v2-registry.ts";
 import { LLM_ROLES, type LlmRole } from "./llm-roles.ts";
 import { roleEnvironmentUpdates, type RoleLlmService } from "./llm-role-service.ts";
+import { accountCapital, positionCapital, prepareCapitalStore, finite } from "./capital.ts";
+import { RuntimeRiskError, type RuntimeRiskService } from "./runtime-risk.ts";
+import { evolutionFamilies, scannerProjection } from "./workstation.ts";
+import type { ScanRow } from "../strategy/scanner.ts";
+import { getCandles, type Bar } from "../exchange/okx/market.ts";
 
 const log = createLogger("dashboard");
 const REPO_ROOT = path.resolve(import.meta.dirname, "../..");
@@ -50,8 +55,10 @@ export interface DashboardConfig {
   evolution: {
     reviewEvery: boolean; signalInterval: number; strategyInterval: number; minSample: number;
     maxWeightChangePct: number; maxParamChanges: number;
+    enabled?: boolean; automaticPromotion?: boolean; shadowMinimum?: number; championShadowMinimum?: number;
   };
   llmRoles?: RoleLlmService;
+  runtimeRisk?: RuntimeRiskService;
   settingsFile?: string;
 }
 
@@ -62,21 +69,32 @@ export interface DashboardServer {
 
 export function startDashboard(cfg: DashboardConfig): DashboardServer {
   const store = cfg.deps().store;
+  prepareCapitalStore(store);
+  type ExchangeSnapshot = { at: number; balance: Awaited<ReturnType<typeof getBalance>> | null; positions: Awaited<ReturnType<typeof getPositions>> | null };
+  let snapshot: ExchangeSnapshot | null = null;
+  let pendingSnapshot: Promise<ExchangeSnapshot> | null = null;
+  const exchangeSnapshot = async () => {
+    if (snapshot && Date.now() - snapshot.at < 5_000) return snapshot;
+    if (!pendingSnapshot) pendingSnapshot = Promise.all([
+      getBalance(cfg.deps().client).catch(() => null), getPositions(cfg.deps().client).catch(() => null),
+    ]).then(([balance, positions]) => (snapshot = { at: Date.now(), balance, positions })).finally(() => { pendingSnapshot = null; });
+    return pendingSnapshot;
+  };
+  const projectTrade = (trade: Record<string, unknown>, positions: Awaited<ReturnType<typeof getPositions>> | null, equity: number | null) => {
+    const saved = store.db.prepare("SELECT observed_at,snapshot FROM entry_capital WHERE trade_id=?").get(String(trade.trade_id)) as { observed_at: string; snapshot: string } | undefined;
+    const entryCapital = saved ? JSON.parse(saved.snapshot) as Record<string, unknown> : null;
+    if (trade.status !== "OPEN") return { ...trade, entry_capital: entryCapital, capital_observed_at: saved?.observed_at ?? null };
+    const position = positions?.find(p => p.instId === trade.instrument && p.posSide === String(trade.side).toLowerCase() && Number(p.pos) !== 0);
+    const capital = positionCapital(trade, position, cfg.deps().instruments[String(trade.instrument)], equity,
+      Math.min(cfg.trading.leverage.default, Number(cfg.risk.hard_limits.max_leverage)));
+    const r = capital.mark_px !== null ? rMultiple(Number(trade.entry_px), Number(trade.initial_stop_px ?? trade.stop_px), capital.mark_px, String(trade.side)) : null;
+    const duration = Math.max(0, Math.round((Date.now() - Date.parse(String(trade.entry_ts))) / 1000));
+    return { ...trade, ...capital, entry_capital: entryCapital, r, live_r: r, duration_s: duration, live_dur_s: duration };
+  };
+  const candleCache = new Map<string, { at: number; rows: unknown[] }>();
+  const candleRequests = new Map<string, Promise<unknown[]>>();
   const settingsFile = cfg.settingsFile ?? path.join(REPO_ROOT, ".env");
 
-  // §65/§69 — live unrealized PnL per open trade, sourced from the
-  // exchange positions endpoint (upl, markPx — source of truth §7.8).
-  async function livePnl(): Promise<Map<string, { mark: number; upl: number; pos: string; lever: string }>> {
-    const map = new Map<string, { mark: number; upl: number; pos: string; lever: string }>();
-    try {
-      const poss = await getPositions(cfg.deps().client).catch(() => [] as Awaited<ReturnType<typeof getPositions>>);
-      for (const p of poss) {
-        if (p.pos === "0") continue;
-        map.set(`${p.instId}:${p.posSide}`, { mark: Number(p.markPx), upl: Number(p.upl), pos: p.pos, lever: p.lever });
-      }
-    } catch { /* offline → no live data */ }
-    return map;
-  }
   const rMultiple = (entry: number, stop: number, mark: number, side: string): number => {
     const risk = Math.abs(entry - stop);
     if (!(risk > 0)) return 0;
@@ -100,12 +118,14 @@ export function startDashboard(cfg: DashboardConfig): DashboardServer {
       res.end(out);
     };
     if (p === "/api/status") {
-      const bal = await getBalance(cfg.deps().client).catch(() => null);
+      const exchange = await exchangeSnapshot();
+      const bal = exchange.balance;
       const usdt = bal?.details.find((d) => d.ccy === "USDT");
-      const eq = usdt ? Number(usdt.eq) || Number(usdt.availEq) || 0 : 0; // eq incl. locked margin
-      const base = baseline(store, eq);
+      const eq = finite(usdt?.eq);
+      const base = eq !== null ? baseline(store, eq) : null;
       const open = store.db.prepare("SELECT * FROM trades WHERE status='OPEN'").all() as Array<Record<string, unknown>>;
-      const live = await livePnl();
+      const capital = accountCapital(bal, exchange.positions, open, cfg.deps().instruments, cfg.trading.leverage.default);
+      const projected = open.map(t => projectTrade(t, exchange.positions, eq));
       const closed = store.db.prepare("SELECT COUNT(*) c, COALESCE(SUM(pnl),0) p, COALESCE(AVG(result_r),0) e FROM trades WHERE status='CLOSED'").get() as { c: number; p: number; e: number };
       return send(200, {
         environment: "DEMO",                       // §96 always visible
@@ -116,49 +136,19 @@ export function startDashboard(cfg: DashboardConfig): DashboardServer {
         emergencyHalted: isEmergencyHalted(store),
         killReason: cfg.getKillReason(),
         equity: eq,
-        daily: { dayStart: base.dayStartEquity, lossPct: base.dayStartEquity ? Math.max(0, (base.dayStartEquity - eq) / base.dayStartEquity * 100) : 0 },
-        drawdownPct: base.peakEquity ? Math.max(0, (base.peakEquity - eq) / base.peakEquity * 100) : 0,
+        capital, exchangeState: capital.state, updatedAt: new Date(exchange.at).toISOString(), marketUpdatedAt: cfg.getLastTick()?.at ?? null,
+        watchlist: cfg.deps().watchlist,
+        daily: { dayStart: base?.dayStartEquity ?? null, pnl: base && eq !== null ? eq - base.dayStartEquity : null,
+          lossPct: base && eq !== null && base.dayStartEquity > 0 ? Math.max(0, (base.dayStartEquity - eq) / base.dayStartEquity * 100) : null },
+        drawdownPct: base && eq !== null && base.peakEquity > 0 ? Math.max(0, (base.peakEquity - eq) / base.peakEquity * 100) : null,
         totals: { closed: closed.c, pnl: closed.p, expectancyR: closed.e },
-        openPositions: ((): Array<Record<string, unknown>> => {
-          // §65 — every open trade with live mark, PnL (USDT + %), R, duration
-          const out: Array<Record<string, unknown>> = [];
-          for (const t of open) {
-            const key = `${String(t.instrument)}:${String(t.side).toLowerCase()}`;
-            const lp = live.get(key);
-            const entry = Number(t.entry_px);
-            const mark = lp?.mark ?? entry;
-            const side = String(t.side);
-            const upl = lp?.upl ?? 0;
-            const pnlPct = entry > 0 && lp ? Math.round(((mark - entry) * (side === "LONG" ? 1 : -1) / entry) * 10000) / 100 : 0;
-            out.push({
-              trade_id: t.trade_id, instrument: t.instrument, side, status: t.status,
-              strategy: `${String(t.strategy)}_V${t.strategy_version}`,
-              contracts: t.contracts, entry_px: entry, stop_px: t.stop_px, take_profit_px: t.take_profit_px,
-              mark_px: mark, upl, pnl_pct: pnlPct, r: rMultiple(entry, Number(t.stop_px), mark, side),
-              duration_s: Math.max(0, Math.round((Date.now() - Date.parse(String(t.entry_ts ?? ""))) / 1000)),
-              live: lp ? true : false,
-            });
-          }
-          return out;
-        })(),
-        openPosition: ((): Record<string, unknown> | null => {
-          if (open.length === 0) return null;
-          const t = open[0] as Record<string, unknown>;
-          const key = `${String(t.instrument)}:${String(t.side).toLowerCase()}`;
-          const liveP = live.get(key);
-          const entry = Number(t.entry_px);
-          const mark = liveP?.mark ?? entry;
-          const side = String(t.side);
-          return {
-            ...t,
-            mark_px: mark,
-            upl: liveP?.upl ?? 0,
-            pnl_pct: entry > 0 && liveP ? Math.round(((mark - entry) * (side === "LONG" ? 1 : -1) / entry) * 10000) / 100 : 0,
-            r: rMultiple(entry, Number(t.stop_px), mark, side),
-            duration_s: Math.max(0, Math.round((Date.now() - Date.parse(String(t.entry_ts))) / 1000)),
-          };
-        })(),             // §65
+        openPositions: projected, openPosition: projected[0] ?? null,
+        criticalEvents: store.db.prepare("SELECT ts,kind,payload FROM system_events WHERE kind IN ('ERROR','RISK_EVENT','LLM_TIMEOUT','LLM_AUTH_FAILURE') ORDER BY id DESC LIMIT 4").all(),
+        aiRoles: cfg.llmRoles?.settings() ?? [],
+        scan: scannerProjection(store, cfg.getScan() as ScanRow[], cfg.getLastTick()?.at ?? null),
+        evolution: { enabled: cfg.evolution.enabled ?? null, active: listV2Versions(store).filter(v => v.status === "CHALLENGER" || v.status === "SHADOW").map(v => ({ strategy: v.strategy, version: v.version, status: v.status })) },
         latestDecision: store.db.prepare("SELECT * FROM decisions ORDER BY ts DESC LIMIT 1").get() ?? null, // §66
+        latestExecution: store.db.prepare("SELECT ts,kind,payload FROM system_events WHERE kind IN ('TRADE_OPEN','TRADE_CLOSED') ORDER BY id DESC LIMIT 1").get() ?? null,
         regime: cfg.getLastTick()?.regime ?? "UNKNOWN",
         market: cfg.getLastTick()?.features ?? null,
         limits: cfg.risk.hard_limits,              // §83
@@ -166,22 +156,9 @@ export function startDashboard(cfg: DashboardConfig): DashboardServer {
       });
     }
     if (p === "/api/trades") {
-      const rows = store.db.prepare("SELECT trade_id,instrument,side,strategy,strategy_core_version,strategy_version,regime,entry_px,stop_px,take_profit_px,exit_px,result_r,pnl,duration_s,exit_reason,exit_ts,status,calibrated_confidence,contracts,entry_ts FROM trades ORDER BY COALESCE(exit_ts,entry_ts) DESC LIMIT 100").all() as Array<Record<string, unknown>>;
-      const live = await livePnl();
-      return send(200, rows.map((x) => {
-        if (x.status !== "OPEN") return x;
-        const key = `${String(x.instrument)}:${String(x.side).toLowerCase()}`;
-        const lp = live.get(key);
-        const entry = Number(x.entry_px);
-        const mark = lp?.mark ?? entry;
-        return {
-          ...x,
-          mark_px: lp?.mark ?? null, upl: lp?.upl ?? null,
-          live_r: lp ? rMultiple(entry, Number(x.stop_px), mark, String(x.side)) : null,
-          live_pct: lp && entry > 0 ? Math.round(((mark - entry) * (String(x.side) === "LONG" ? 1 : -1) / entry) * 10000) / 100 : null,
-          live_dur_s: lp ? Math.max(0, Math.round((Date.now() - Date.parse(String(x.entry_ts ?? ""))) / 1000)) : null,
-        };
-      }));
+      const rows = store.db.prepare("SELECT trade_id,instrument,side,strategy,strategy_core_version,strategy_version,regime,entry_px,initial_stop_px,stop_px,take_profit_px,exit_px,result_r,pnl,duration_s,exit_reason,exit_ts,status,calibrated_confidence,contracts,entry_ts,leverage,mfe,mae,planned_risk_pct FROM trades ORDER BY COALESCE(exit_ts,entry_ts) DESC LIMIT 100").all() as Array<Record<string, unknown>>;
+      const exchange = await exchangeSnapshot();
+      return send(200, rows.map(t => projectTrade(t, exchange.positions, finite(exchange.balance?.details.find(d => d.ccy === "USDT")?.eq))));
     }
     if (method === "GET" && p.startsWith("/api/trades/")) {
       const tradeId = decodeURIComponent(p.slice("/api/trades/".length));
@@ -197,8 +174,9 @@ export function startDashboard(cfg: DashboardConfig): DashboardServer {
       const start = Date.parse(String(trade.entry_ts ?? ""));
       const end = Date.parse(String(trade.exit_ts ?? "")) || Date.now();
       const candles = Number.isFinite(start) ? store.db.prepare(`SELECT ts,o,h,l,c,vol FROM candles
-        WHERE instId=? AND ts BETWEEN ? AND ? ORDER BY ts`).all(trade.instrument, start - 12 * 15 * 60_000, end) : [];
-      return send(200, { trade, decision, orders, fills, review, candles });
+        WHERE instId=? AND bar=? AND confirm='1' AND ts BETWEEN ? AND ? ORDER BY ts LIMIT 400`).all(trade.instrument, trade.timeframe === "scalp" ? "1m" : trade.timeframe, start - 12 * 15 * 60_000, end) : [];
+      const exchange = await exchangeSnapshot();
+      return send(200, { trade: projectTrade(trade, exchange.positions, finite(exchange.balance?.details.find(d => d.ccy === "USDT")?.eq)), decision, orders, fills, review, candles });
     }
     if (p === "/api/reviews") {
       const rows = store.db.prepare("SELECT trade_id,outcome,result_r,observations,lesson_candidates,ts FROM trade_reviews ORDER BY ts DESC LIMIT 20").all();
@@ -234,15 +212,53 @@ export function startDashboard(cfg: DashboardConfig): DashboardServer {
       return send(200, rows); // §84 risk events & §85 logs
     }
     if (p === "/api/candles") {
-      const limit = Math.min(Number(url.searchParams.get("limit") ?? 200), 400);
+      const requested = Number(url.searchParams.get("limit") ?? 200);
+      if (!Number.isInteger(requested) || requested < 2 || requested > 400) return send(400, { error: "Candle limit must be between 2 and 400." });
+      const limit = requested;
       const inst = url.searchParams.get("instId") ?? cfg.trading.instrument.id;
+      const bar = url.searchParams.get("bar") ?? cfg.trading.timeframe;
+      if (!["1m", "5m", "15m", "1H"].includes(bar) || !cfg.deps().watchlist.includes(inst)) return send(400, { error: "Unsupported instrument or timeframe." });
+      const tradeId = url.searchParams.get("tradeId");
+      if (tradeId) {
+        const trade = store.db.prepare("SELECT instrument,entry_ts,exit_ts,status FROM trades WHERE trade_id=?").get(tradeId) as { instrument: string; entry_ts: string; exit_ts: string | null; status: string } | undefined;
+        if (!trade || trade.instrument !== inst) return send(404, { error: "Trade not found for this instrument." });
+        const start = Date.parse(trade.entry_ts), end = trade.exit_ts ? Date.parse(trade.exit_ts) : Date.now();
+        if (!Number.isFinite(start) || !Number.isFinite(end)) return send(503, { error: "Stored trade timestamps unavailable." });
+        const ms = { "1m": 60_000, "5m": 300_000, "15m": 900_000, "1H": 3_600_000 }[bar]!;
+        // Replay only persisted candles; a current exchange window must never
+        // masquerade as this trade's historical market context.
+        const replay = store.db.prepare("SELECT ts,o,h,l,c,vol FROM candles WHERE instId=? AND bar=? AND confirm='1' AND ts BETWEEN ? AND ? ORDER BY ts LIMIT ?")
+          .all(inst, bar, start - 12 * ms, end + ms, limit);
+        return send(200, replay);
+      }
       const rows = store.db.prepare(
-        "SELECT ts,o,h,l,c,vol FROM candles WHERE confirm='1' AND instId=? ORDER BY ts DESC LIMIT ?",
-      ).all(inst, limit) as Array<Record<string, unknown>>;
+        "SELECT ts,o,h,l,c,vol FROM candles WHERE confirm='1' AND instId=? AND bar=? ORDER BY ts DESC LIMIT ?",
+      ).all(inst, bar, limit) as Array<Record<string, unknown>>;
+      const key = `${inst}:${bar}:${limit}`;
+      const cached = candleCache.get(key);
+      if (cached && Date.now() - cached.at < 30_000) return send(200, cached.rows);
+      if (rows.length < 2 || Number(rows[0]?.ts) < Date.now() - 2 * ({ "1m": 60_000, "5m": 300_000, "15m": 900_000, "1H": 3_600_000 }[bar] ?? 900_000)) {
+        try {
+          let request = candleRequests.get(key);
+          if (!request) {
+            request = getCandles(cfg.deps().client, inst, bar as Bar, Math.min(limit, 300))
+              .then(candles => candles.filter(c => c.confirm === "1").sort((a, b) => a.ts - b.ts))
+              .catch(error => { if (!rows.length) throw error; return [...rows].reverse(); })
+              .then(fresh => {
+                if (candleCache.size >= 64) candleCache.delete(candleCache.keys().next().value!);
+                candleCache.set(key, { at: Date.now(), rows: fresh });
+                return fresh;
+              }).finally(() => candleRequests.delete(key));
+            candleRequests.set(key, request);
+          }
+          const fresh = await request;
+          return send(200, fresh);
+        } catch { if (!rows.length) return send(503, { error: "Market candles unavailable. Retry after the exchange feed recovers." }); }
+      }
       return send(200, rows.reverse()); // chronological for the chart
     }
     if (p === "/api/scan") {
-      return send(200, cfg.getScan()); // multi-coin scanner rows (§67)
+      return send(200, scannerProjection(store, cfg.getScan() as ScanRow[], cfg.getLastTick()?.at ?? null));
     }
     if (p === "/api/market") {
       const tick = cfg.getLastTick();
@@ -252,14 +268,14 @@ export function startDashboard(cfg: DashboardConfig): DashboardServer {
         : undefined;
       const weights = getWeights(store, "SWING_15M", { strategyCoreVersion: cfg.strategyCoreVersion ?? 1 });
       return send(200, { snapshot: tick?.features ?? null, regime: tick?.regime ?? "UNKNOWN", updatedAt: tick?.at ?? null,
-        weights, ...(weightsByFamily ? { weightsByFamily } : {}), scan: cfg.getScan() });
+        weights, ...(weightsByFamily ? { weightsByFamily } : {}), scan: scannerProjection(store, cfg.getScan() as ScanRow[], cfg.getLastTick()?.at ?? null) });
     }
     if (p === "/api/evolution") {
       const strategies = store.db.prepare("SELECT name,version,parent_version,params,status,hypothesis,created_ts FROM strategy_versions ORDER BY name,version").all();
       const events = store.db.prepare(`SELECT ts,kind,payload FROM system_events WHERE kind IN
         ('EVOLUTION_TRIGGERED','EVOLUTION_NO_CHANGE','EVOLUTION_PROPOSAL_REJECTED','CHALLENGER_CREATED',
          'CHALLENGER_HISTORICAL_PASS','CHALLENGER_HISTORICAL_FAIL','CHALLENGER_SHADOW_STARTED',
-         'CHALLENGER_SHADOW_PROGRESS','PROMOTION','PROMOTION_REJECTED','WEIGHTS','EVOLUTION_FROZEN','EVOLUTION_RESUMED')
+         'CHALLENGER_SHADOW_PROGRESS','PROMOTION','PROMOTION_REJECTED','WEIGHTS','EVOLUTION_FROZEN','EVOLUTION_RESUMED','CRITIC_REVIEW')
         ORDER BY id DESC LIMIT 120`).all();
       const comparisons = store.db.prepare("SELECT ts,champion,challenger,promoted,reasons,champion_metrics,challenger_metrics FROM evolution_comparisons ORDER BY id DESC LIMIT 40").all();
       const v2Evaluations = store.db.prepare(`SELECT ts,strategy,champion_version,challenger_version,stage,metrics
@@ -267,7 +283,17 @@ export function startDashboard(cfg: DashboardConfig): DashboardServer {
       const v2Strategies = listV2Versions(store);
       const shadowTrades = store.db.prepare("SELECT * FROM shadow_trades ORDER BY signal_ts DESC LIMIT 500").all();
       return send(200, { strategyCore: { version: cfg.strategyCoreVersion ?? 1, baselineMode: cfg.baselineMode ?? false },
-        strategies, v2Strategies, shadowTrades, events, comparisons, v2Evaluations });
+        families: cfg.strategyCoreVersion === 2 ? evolutionFamilies(store, cfg.evolution.minSample, cfg.evolution.strategyInterval) : [],
+        evolutionEnabled: cfg.evolution.enabled ?? null, cadence: cfg.evolution, strategies, v2Strategies, shadowTrades, events, comparisons, v2Evaluations });
+    }
+    if (p === "/api/risk") {
+      if (!cfg.runtimeRisk) return send(503, { error: "Runtime risk settings unavailable." });
+      if (method === "GET") return send(200, { ...cfg.runtimeRisk.snapshot(), audit: store.db.prepare("SELECT ts,kind,payload FROM system_events WHERE kind='RISK_LIMIT_CHANGED' ORDER BY id DESC LIMIT 30").all() });
+      if (method === "PUT") {
+        try { return send(200, cfg.runtimeRisk.update(await readJson(req))); }
+        catch (error) { return send(error instanceof RuntimeRiskError ? error.status : 500, { error: error instanceof RuntimeRiskError ? error.message : "Risk settings could not be saved." }); }
+      }
+      return send(405, { error: "Method not allowed." });
     }
     if (p === "/api/decisions") {
       const rows = store.db.prepare("SELECT * FROM decisions ORDER BY ts DESC LIMIT 60").all();
@@ -340,8 +366,7 @@ export function startDashboard(cfg: DashboardConfig): DashboardServer {
         },
         learning: cfg.evolution,
         controlsLocked: [
-          "environment", "max leverage", "risk per trade", "daily loss", "drawdown",
-          "allowed symbols", "max positions", "promotion criteria", "kill switch", // §48/§88
+          "environment", "absolute safety ceilings", "allowed symbols", "promotion criteria", "kill switch",
         ],
       });
     }
@@ -367,7 +392,12 @@ export function startDashboard(cfg: DashboardConfig): DashboardServer {
 
   async function readJson(req2: IncomingMessage): Promise<Record<string, unknown>> {
     const chunks: Buffer[] = [];
-    for await (const c of req2) chunks.push(c as Buffer);
+    let size = 0;
+    for await (const c of req2) {
+      size += (c as Buffer).length;
+      if (size > 65_536) throw new Error("Request body exceeds 64 KiB");
+      chunks.push(c as Buffer);
+    }
     try { return JSON.parse(Buffer.concat(chunks).toString("utf8")) as Record<string, unknown>; } catch { return {}; }
   }
   async function listKiosModels(env: Record<string, string>): Promise<string[]> {
@@ -398,6 +428,12 @@ export function startDashboard(cfg: DashboardConfig): DashboardServer {
       res.writeHead(401, { "www-authenticate": 'Basic realm="EvoQuant console"', "content-type": "text/plain" });
       res.end("authentication required");
       return;
+    }
+    if (!["GET", "HEAD", "OPTIONS"].includes(req.method ?? "GET")) {
+      const origin = req.headers.origin;
+      let trusted = req.headers["sec-fetch-site"] !== "cross-site";
+      if (origin) { try { trusted = trusted && new URL(origin).host === req.headers.host; } catch { trusted = false; } }
+      if (!trusted) { res.writeHead(403, { "content-type": "application/json" }).end(JSON.stringify({ error: "Cross-origin control requests are not permitted." })); return; }
     }
     try {
       const url = new URL(req.url ?? "/", "http://localhost");

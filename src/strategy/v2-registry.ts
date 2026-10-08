@@ -122,8 +122,8 @@ export function createV2Challenger(store: Store, input: {
 
 export function transitionV2Version(store: Store, strategy: StrategyV2Id, version: number,
   status: V2VersionStatus, reason: string, evidence?: unknown): void {
-  const current = store.db.prepare("SELECT status FROM strategy_v2_versions WHERE strategy=? AND version=?")
-    .get(strategy, version) as { status: V2VersionStatus } | undefined;
+  const current = store.db.prepare("SELECT status,evidence FROM strategy_v2_versions WHERE strategy=? AND version=?")
+    .get(strategy, version) as { status: V2VersionStatus; evidence: string | null } | undefined;
   if (!current) throw new Error(`unknown V2 version ${strategy} v${version}`);
   const allowed: Record<V2VersionStatus, readonly V2VersionStatus[]> = {
     CHAMPION: ["SUPERSEDED"], CHALLENGER: ["SHADOW", "REJECTED"], SHADOW: ["PROMOTED", "REJECTED"],
@@ -131,13 +131,19 @@ export function transitionV2Version(store: Store, strategy: StrategyV2Id, versio
   };
   if (current.status === status) return;
   if (!allowed[current.status].includes(status)) throw new Error(`invalid V2 lifecycle transition ${current.status} -> ${status}`);
+  // Proposal evidence fixes the historical cutoff and records the model/Critic
+  // provenance. Validation must never replace that immutable proposal context.
+  const proposal = current.evidence ? JSON.parse(current.evidence) as unknown : {};
+  const context = proposal && typeof proposal === "object" && !Array.isArray(proposal)
+    ? proposal as Record<string, unknown> : { proposal };
+  const updatedEvidence = evidence === undefined ? null : JSON.stringify({ ...context, validation: evidence });
   const update = store.db.prepare(`UPDATE strategy_v2_versions SET status=?,status_reason=?,evidence=COALESCE(?,evidence),updated_ts=?
     ,shadow_started_ts=CASE WHEN ?='SHADOW' THEN COALESCE(shadow_started_ts,?) ELSE shadow_started_ts END
     WHERE strategy=? AND version=? AND status=?`);
   if (status === "PROMOTED") {
     const promote = store.db.transaction(() => {
       update.run("SUPERSEDED", "replaced by validated Challenger", null, new Date().toISOString(), "SUPERSEDED", new Date().toISOString(), strategy, inputParentVersion(store, strategy, version), "CHAMPION");
-      update.run("PROMOTED", reason, evidence === undefined ? null : JSON.stringify(evidence), new Date().toISOString(), "PROMOTED", new Date().toISOString(), strategy, version, current.status);
+      update.run("PROMOTED", reason, updatedEvidence, new Date().toISOString(), "PROMOTED", new Date().toISOString(), strategy, version, current.status);
       store.db.prepare("UPDATE strategy_v2_versions SET status='CHAMPION',status_reason=?,updated_ts=? WHERE strategy=? AND version=? AND status='PROMOTED'")
         .run(reason, new Date().toISOString(), strategy, version);
     });
@@ -145,7 +151,7 @@ export function transitionV2Version(store: Store, strategy: StrategyV2Id, versio
     return;
   }
   const now = new Date().toISOString();
-  update.run(status, reason, evidence === undefined ? null : JSON.stringify(evidence), now, status, now, strategy, version, current.status);
+  update.run(status, reason, updatedEvidence, now, status, now, strategy, version, current.status);
 }
 
 function inputParentVersion(store: Store, strategy: StrategyV2Id, version: number): number {
