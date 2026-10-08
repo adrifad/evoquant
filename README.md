@@ -11,12 +11,15 @@ Milestone brief: [`docs/TASK-M1.md`](docs/TASK-M1.md) · Agent rules: [`AGENTS.m
 | Milestone | Scope | Status |
 |---|---|---|
 | M1 — OKX Demo Adapter | auth, client, market, account, orders, sizing, smoke tests | ✅ implemented & unit-tested |
-| M2 — Deterministic core | scheduler, indicators, regime, risk engine, sizing math, PnL | ⏳ |
-| M3 — Decision Agent | LONG/SHORT/HOLD structured JSON | ⏳ |
-| M4 — Trade Reviewer | hypothesis-only post-trade review | ⏳ |
-| M5 — Learning memory | lessons, regime/strategy/signal stats | ⏳ |
-| M6 — Evolution | weights, calibration, challengers | ⏳ |
-| M7 — Champion vs Challenger | backtest, walk-forward, promotion | ⏳ |
+| M2 — Deterministic core | scheduler, indicators, regime, risk engine, sizing math, PnL | implemented & unit-tested |
+| M3 — Strategy and Gate | deterministic V2 candidates; AI ALLOW/DENY context | implemented & unit-tested |
+| M4 — Trade Reviewer | hypothesis-only post-trade review | implemented & unit-tested |
+| M5 — Learning memory | lessons, regime/strategy/signal stats | implemented & unit-tested |
+| M6 — Evolution | bounded proposals, Critic, calibration, challengers | implemented & unit-tested |
+| M7 — Champion vs Challenger | historical/OOS/rolling validation, matched shadow, promotion | implemented & unit-tested |
+
+Implementation and unit-test status do not imply profitability or a passing
+credentialed exchange integration run.
 
 ## Safety invariants (enforced in code, not comments)
 
@@ -62,6 +65,18 @@ LLM calls are routed through independent Gate, Scalp, Reviewer, Evolution, and
 Critic role configurations. Defaults, environment variables, budgets, failure
 policies, key handling, and Critic revision flow are documented in
 [`docs/ROLE_BASED_AI.md`](docs/ROLE_BASED_AI.md).
+
+## Trading workstation
+
+The console provides Dashboard, Trading, Markets, Trades, Evolution, Risk,
+AI, Logs and Settings. Risk edits are bounded server-side by immutable safety
+limits, persisted with an audit trail, and applied to new entries. Capital
+views distinguish exchange values, supported contract estimates and unavailable
+data. Chart tabs show confirmed 1m, 5m, 15m and 1h candles; closed trades replay
+persisted historical candles. V2 evolution evidence remains separate by family.
+
+See [`docs/WORKSTATION_V2_REVIEW.md`](docs/WORKSTATION_V2_REVIEW.md) for the
+architecture review, implementation, verification and remaining limitations.
 
 ## Setup
 

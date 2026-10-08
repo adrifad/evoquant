@@ -145,6 +145,6 @@ test("llm run ledger migration exists and contains no secret column", () => {
   const f = fixture({}, async () => successResponse());
   try {
     const columns = (f.store.db.prepare("PRAGMA table_info(llm_runs)").all() as Array<{ name: string }>).map((column) => column.name);
-    assert.deepEqual(columns, ["id", "ts", "role", "provider", "model", "status", "latency_ms", "input_tokens", "output_tokens", "error_class", "context_ref"]);
+    assert.deepEqual(columns, ["id", "ts", "role", "provider", "model", "status", "latency_ms", "input_tokens", "output_tokens", "error_class", "context_ref", "provider_requests"]);
   } finally { f.close(); }
 });

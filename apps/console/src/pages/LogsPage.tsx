@@ -6,7 +6,7 @@ import { asRows, asText, type Row } from "../lib/types";
 import { DataState, DataTable, PageHeading, Panel, StatusBadge } from "../components/Primitives";
 import { summarizeEvent } from "./RiskPage";
 
-const filters = ["ALL", "RISK", "TRADE", "ERROR", "PROMOTION", "AI", "EXCHANGE"] as const;
+const filters = ["ALL", "TRADING", "RISK", "AI", "EVOLUTION", "SYSTEM", "ERRORS"] as const;
 type LogFilter = typeof filters[number];
 
 export function LogsPage() {
@@ -50,9 +50,9 @@ function matchesFilter(event: Row, filter: LogFilter): boolean {
   if (filter === "ALL") return true;
   const kind = String(event.kind ?? "").toUpperCase();
   if (filter === "RISK") return kind.includes("RISK") || kind === "STATE";
-  if (filter === "TRADE") return kind.includes("TRADE") || kind.includes("ORDER") || kind.includes("FILL");
-  if (filter === "ERROR") return kind.includes("ERROR") || kind.includes("FAIL");
-  if (filter === "PROMOTION") return kind.includes("PROMOTION") || kind.includes("REJECT") || kind.includes("EVOLUTION");
-  if (filter === "AI") return kind.includes("DECISION") || kind.includes("REVIEW") || kind.includes("EVOLUTION");
-  return kind.includes("EXCHANGE") || kind.includes("ORDER") || kind.includes("FILL") || kind.includes("RECONCILE");
+  if (filter === "TRADING") return /TRADE|ORDER|FILL|CANDIDATE|STRATEGY_|DECISION/.test(kind);
+  if (filter === "ERRORS") return /ERROR|FAIL|TIMEOUT|EXHAUSTED/.test(kind);
+  if (filter === "EVOLUTION") return /PROMOTION|EVOLUTION|CRITIC|CHALLENGER|SHADOW|WEIGHTS/.test(kind);
+  if (filter === "AI") return /LLM|REVIEW|CRITIC/.test(kind);
+  return /STATE|SYSTEM|START|ERROR|RECONCILE|HALT/.test(kind);
 }

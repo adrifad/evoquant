@@ -8,11 +8,12 @@
 // endpoint rejects, we fall back to the bot-side SL/TP monitor (Layer B is
 // always active) and log a RISK_EVENT — protection is never left off.
 
+import { randomBytes } from "node:crypto";
 import type { OkxClient } from "../exchange/okx/client.ts";
-import type { InstrumentInfo, Position } from "../exchange/okx/types.ts";
+import type { InstrumentInfo, Position, OrderRequest } from "../exchange/okx/types.ts";
 import { getCandles, getTicker, latestClosedCandle } from "../exchange/okx/market.ts";
 import { getBalance, getPositions, setLeverage } from "../exchange/okx/account.ts";
-import { closePosition, getOrder, getFills, getPendingOrders, placeOrder, prepareOrderSize, requireFilledOrder, waitForOrderTerminal } from "../exchange/okx/orders.ts";
+import { closePosition, getOrder, getFills, getPendingOrders, placeOrder, OrderRejectedError, prepareOrderSize, requireFilledOrder, waitForOrderTerminal } from "../exchange/okx/orders.ts";
 import { placeConditionalProtection, cancelAlgo } from "../exchange/okx/algo.ts";
 import { getServerTime } from "../exchange/okx/market.ts";
 import type { RiskConfig, TradingConfig } from "../core/config.ts";
@@ -40,6 +41,8 @@ import type { CandidateGate } from "../agents/decision-agent.ts";
 import { serializeTradeMutation } from "./trade-mutation.ts";
 import { msForBar } from "../core/scheduler.ts";
 import { isTradeOwnedBy } from "../memory/engines.ts";
+import { riskFingerprint, selectedEntryLeverage, serializeRiskEntry, reserveEntry, releaseEntry, unresolvedEntry } from "../core/runtime-risk.ts";
+import { persistEntryCapital } from "../core/capital.ts";
 
 const log = createLogger("executor");
 
@@ -74,6 +77,7 @@ function nextTradeId(): string {
 export async function startupSafetySequence(d: ExecutorDeps): Promise<boolean> {
   const { client, trading, risk, store, watchlist } = d;
   const steps: Array<[string, () => Promise<void>]> = [
+    ["unresolved-entry", async () => { await reconcileEntryReservation(d); }],
     ["server-time", async () => {
       const t = await getServerTime(client);
       const drift = Date.now() - t;
@@ -102,23 +106,6 @@ export async function startupSafetySequence(d: ExecutorDeps): Promise<boolean> {
       }
       await client.post("/api/v5/account/set-position-mode", { posMode: trading.account.position_mode }, true);
     }],
-    ["leverage", async () => {
-      // §7.10/§43: both posSides per symbol — paced + retried for OKX rate limits
-      for (const sym of watchlist) {
-        let attempt = 0;
-        for (;;) {
-          try {
-            await setLeverage(client, sym, trading.leverage.default, risk.hard_limits.max_leverage);
-            break;
-          } catch (e) {
-            attempt += 1;
-            if (attempt >= 4 || !String((e as Error).message).includes("50011")) throw e;
-            await new Promise((res) => setTimeout(res, 1_500 * attempt)); // backoff
-          }
-        }
-        await new Promise((res) => setTimeout(res, 350)); // ~20 req/2s safety
-      }
-    }],
   ];
   for (const [name, fn] of steps) {
     try { await fn(); log.info({ event: `startup:${name}`, result: "ok" }); }
@@ -129,6 +116,61 @@ export async function startupSafetySequence(d: ExecutorDeps): Promise<boolean> {
     }
   }
   return true;
+}
+
+// Only new entries may synchronize leverage. Startup/reloads never touch open positions.
+export async function synchronizeEntryLeverage(d: Pick<ExecutorDeps, "client" | "trading" | "risk" | "store">, instId: string): Promise<number> {
+  await reconcileEntryReservation(d);
+  const positions = await getPositions(d.client);
+  if (positions.some((p) => p.instId === instId && Number(p.pos) !== 0)
+    || (getOpenTrades(d.store) as Array<Record<string, unknown>>).some((p) => p.instrument === instId)) {
+    throw new Error("entry leverage: instrument already occupied");
+  }
+  // A timed-out submission may still be resting at the exchange.
+  if ((await getPendingOrders(d.client)).length) throw new Error("entry leverage: pending orders require reconciliation");
+  const leverage = selectedEntryLeverage(d.trading, d.risk);
+  const actual = await setLeverage(d.client, instId, leverage, Math.min(d.risk.hard_limits.max_leverage, d.trading.leverage.hard_max));
+  if (Number(actual.long.lever) !== leverage || Number(actual.short.lever) !== leverage) {
+    throw new Error("entry leverage: exchange did not confirm selected leverage");
+  }
+  return leverage;
+}
+
+/** An empty positions/pending-orders response cannot prove that a timed-out POST was rejected. */
+export async function reconcileEntryReservation(d: Pick<ExecutorDeps, "client" | "store">): Promise<void> {
+  const entry = unresolvedEntry(d.store);
+  if (!entry) return;
+  const message = "STATE_UNCERTAIN: unresolved entry requires reconciliation";
+  let orders: Array<Record<string, string>>;
+  try {
+    orders = await d.client.get<Array<Record<string, string>>>("/api/v5/trade/order",
+      { instId: entry.instId, clOrdId: entry.clOrdId }, true);
+  } catch { throw new Error(message); }
+  const order = orders.find((o) => o.clOrdId === entry.clOrdId && o.instId === entry.instId && o.posSide === entry.posSide);
+  if (!order || !order.ordId) throw new Error(message);
+  const filled = order.accFillSz !== undefined && order.accFillSz !== "" ? Number(order.accFillSz) : NaN;
+  const tracked = d.store.db.prepare("SELECT trade_id FROM trades WHERE cl_open_id=? AND ord_open_id=? AND instrument=? AND lower(side)=?")
+    .get(entry.clOrdId, order.ordId, entry.instId, entry.posSide);
+  // A partial/untracked fill needs explicit position recovery. Never retry the order.
+  if (!(order.state === "canceled" && filled === 0) && !(order.state === "filled" && filled > 0 && tracked)) {
+    throw new Error(message);
+  }
+  releaseEntry(d.store, entry.clOrdId);
+}
+
+/** Only proven POST rejection releases the durable entry intent; later failures stay reserved (§45). */
+export async function submitReservedEntry(d: Pick<ExecutorDeps, "client" | "store">, order: OrderRequest & { clOrdId: string }) {
+  reserveEntry(d.store, { clOrdId: order.clOrdId, instId: order.instId, posSide: order.posSide });
+  try { return await placeOrder(d.client, order); }
+  catch (error) {
+    if (error instanceof OrderRejectedError && error.definitive) releaseEntry(d.store, order.clOrdId);
+    throw error;
+  }
+}
+
+export function confirmedFillLeverage(fill: { lever?: string }, selected: number): number {
+  const actual = Number(fill.lever);
+  return Number.isFinite(actual) && actual > 0 ? actual : selected;
 }
 
 // §45 — reconcile local open trades against exchange positions (all symbols).
@@ -376,7 +418,7 @@ export async function runTick(d: ExecutorDeps, ctx: TickContext, symbol: TickSym
   let sz;
   try {
     sz = sizePosition(
-      { equity: eq, entryPrice: f.price, stopPrice: stopPx, leverage: trading.leverage.default, instrument: meta },
+      { equity: eq, entryPrice: f.price, stopPrice: stopPx, leverage: selectedEntryLeverage(trading, risk), instrument: meta },
       risk,
       trading.sizing,
     );
@@ -384,118 +426,131 @@ export async function runTick(d: ExecutorDeps, ctx: TickContext, symbol: TickSym
     logSystemEvent(store, "RISK_EVENT", { sizing_rejected: szErr instanceof Error ? szErr.message : String(szErr), instId, mode: trading.sizing.mode });
     return { kill };
   }
-  // RACE GUARD: decision took ~60-90s; re-check slots before placing (§23)
-  const freshPoss = (await getPositions(client)).filter((p) => p.pos !== "0");
-  const freshBal = await getBalance(client);
-  const freshEq = usdtEquity(freshBal);
-  const freshBase = baseline(store, freshEq);
-  const freshLocal = (getOpenTrades(store) as Array<Record<string, unknown>>);
-  const freshKeys = new Set(freshPoss.map((p) => `${p.instId}:${p.posSide}`));
-  const localKeys = new Set(freshLocal.filter((x) => String(x.status) === "OPEN")
-    .map((x) => `${String(x.instrument)}:${String(x.side).toLowerCase()}`));
-  const freshKill = evaluateKillSwitch({
-    apiOk: true, positionMismatch: [...freshKeys].some((k) => !localKeys.has(k)) || [...localKeys].some((k) => !freshKeys.has(k)),
-    orderFailuresRecent: consecutiveOrderFailures, clockDriftMs: Date.now() - await getServerTime(client), dbOk: true,
-    instrumentMetaOk: Number(meta.ctVal) > 0, unexpectedPosition: freshPoss.length > risk.hard_limits.max_concurrent_positions,
-    dailyLossPct: freshBase.dayStartEquity > 0 ? ((freshBase.dayStartEquity - freshEq) / freshBase.dayStartEquity) * 100 : 0,
-    drawdownPct: freshBase.peakEquity > 0 ? ((freshBase.peakEquity - freshEq) / freshBase.peakEquity) * 100 : 0,
-  }, risk, store);
-  const freshGate = evaluateGlobalEntryGate({
-    killSwitchActive: freshKill, botState: getBotState(store), openPositions: freshPoss.length,
-    instrument: instId, instrumentOccupied: freshPoss.some((p) => p.instId === instId) || localKeys.size > 0 && [...localKeys].some((k) => k.startsWith(`${instId}:`)),
-  }, risk);
-  const freshRisk = evaluateEntry({
-    action: decision.decision, strategy: decision.strategy ?? undefined, confidence: calConf,
-    regime: ctx.regime, instrument: instId,
-    stopDistancePct: ctx.candidate ? Math.abs(ctx.candidate.entryPrice - ctx.candidate.stopPrice) / ctx.candidate.entryPrice
-      : Number.isFinite(f.atr14) && f.price ? (decision.suggested_stop_atr * f.atr14) / f.price : undefined,
-  }, { equity: freshEq, dayStartEquity: freshBase.dayStartEquity, peakEquity: freshBase.peakEquity,
-    openPositions: freshPoss.length, killSwitchActive: freshKill }, trading, risk);
-  if (!freshGate.allowed || !freshRisk.approved) {
-    logSystemEvent(store, "RISK_EVENT", { race_guard: "entry skipped after refreshed global risk check", instId,
-      reason: freshGate.allowed ? freshRisk.reason : freshGate.reason });
-    return { kill };
-  }
-  // Re-size from refreshed equity so a concurrent account loss cannot leave a stale oversized order.
-  try {
-    sz = sizePosition({ equity: freshEq, entryPrice: f.price, stopPrice: stopPx,
-      leverage: trading.leverage.default, instrument: meta }, risk, trading.sizing);
-  } catch (szErr) {
-    logSystemEvent(store, "RISK_EVENT", { sizing_rejected_after_refresh: szErr instanceof Error ? szErr.message : String(szErr), instId });
-    return { kill };
-  }
-  const clOpen = clId(side, "OPEN", instId);
-  try {
-    const placed = await placeOrder(client, {
-      instId, tdMode: "isolated", side: side === "LONG" ? "buy" : "sell",
-      posSide: side.toLowerCase() as "long" | "short",
-      ordType: "market", sz: sz.contracts, clOrdId: clOpen,
-    });
-    const filled = await waitForOrderTerminal(client, instId, placed.ordId, { timeoutMs: 30_000 });
-    if (filled.state !== "filled") throw new Error(`entry not filled: ${filled.state}`);
-    consecutiveOrderFailures = 0;
-    persistOrder(store, { ordId: placed.ordId, clOrdId: clOpen, instId, side: side === "LONG" ? "buy" : "sell",
-      posSide: side.toLowerCase(), ordType: "market", sz: sz.contracts, state: filled.state,
-      avgPx: filled.avgPx, cTime: filled.cTime, uTime: filled.uTime, tradeId: "", kind: "OPEN" });
-    const entryPx = Number(filled.avgPx) || f.price;
-    const tradeId = nextTradeId();
-    openTrade(store, {
-      tradeId, engine: "SWING_15M", instrument: instId, timeframe: trading.timeframe, side,
-      strategy: candidateIdentity ? candidateIdentity.family : strat.name,
-      strategyVersion: candidateIdentity ? candidateIdentity.strategyVersion : strat.version,
-      ...(candidateIdentity ? { identity: candidateIdentity } : {}),
-      regime: ctx.regime,
-      ...(ctx.candidate ? { regimeAxes: ctx.candidate.regime } : {}),
-      ...(ctx.candidate ? { entryConditions: ctx.candidate.conditions } : {}),
-      contracts: sz.contracts, entryPx, entryTs: new Date().toISOString(),
-      stopPx: ctx.candidate
-        ? entryPx + (side === "LONG" ? -1 : 1) * Math.abs(ctx.candidate.entryPrice - ctx.candidate.stopPrice)
-        : stopPriceFor(entryPx, f.atr14, decision.suggested_stop_atr, side),
-      takeProfitPx: ctx.candidate
-        ? entryPx + (side === "LONG" ? 1 : -1) * Math.abs(ctx.candidate.entryPrice - ctx.candidate.stopPrice) * ctx.candidate.targetR
-        : takeProfitPriceFor(entryPx, f.atr14, decision.suggested_take_profit_atr, side),
-      clOpenId: clOpen, ordOpenId: placed.ordId,
-      decisionId,
-      rawConfidence: decision.confidence, calibratedConfidence: calConf,
-      plannedRiskPct: trading.sizing.mode === "percent_of_equity" ? trading.sizing.position_pct : risk.hard_limits.risk_per_trade_pct,
-      leverage: trading.leverage.default,
-      ...(ctx.candidate ? { maxHoldBars: ctx.candidate.maxHoldBars } : {}),
-      entryFeatures: f,
-    });
-    // §16 Layer A — exchange-native conditional (SL+TP) algo orders.
-    // Best-effort: on failure Layer B (monitor) still holds; flag it.
+  return serializeRiskEntry(store, async () => {
+    const riskAtPreparation = riskFingerprint(risk);
+    let leverage: number;
+    try { leverage = await synchronizeEntryLeverage(d, instId); }
+    catch (error) {
+      logSystemEvent(store, "RISK_EVENT", { entry_preparation_rejected: String(error), instId });
+      return { kill };
+    }
+    // RACE GUARD: decision took ~60-90s; re-check slots before placing (§23)
+    const freshPoss = (await getPositions(client)).filter((p) => p.pos !== "0");
+    const freshBal = await getBalance(client);
+    const freshEq = usdtEquity(freshBal);
+    const freshBase = baseline(store, freshEq);
+    const freshLocal = (getOpenTrades(store) as Array<Record<string, unknown>>);
+    const freshKeys = new Set(freshPoss.map((p) => `${p.instId}:${p.posSide}`));
+    const localKeys = new Set(freshLocal.filter((x) => String(x.status) === "OPEN")
+      .map((x) => `${String(x.instrument)}:${String(x.side).toLowerCase()}`));
+    const freshKill = evaluateKillSwitch({
+      apiOk: true, positionMismatch: [...freshKeys].some((k) => !localKeys.has(k)) || [...localKeys].some((k) => !freshKeys.has(k)),
+      orderFailuresRecent: consecutiveOrderFailures, clockDriftMs: Date.now() - await getServerTime(client), dbOk: true,
+      instrumentMetaOk: Number(meta.ctVal) > 0, unexpectedPosition: freshPoss.length > risk.hard_limits.max_concurrent_positions,
+      dailyLossPct: freshBase.dayStartEquity > 0 ? ((freshBase.dayStartEquity - freshEq) / freshBase.dayStartEquity) * 100 : 0,
+      drawdownPct: freshBase.peakEquity > 0 ? ((freshBase.peakEquity - freshEq) / freshBase.peakEquity) * 100 : 0,
+    }, risk, store);
+    const freshGate = evaluateGlobalEntryGate({
+      killSwitchActive: freshKill, botState: getBotState(store), openPositions: freshPoss.length,
+      instrument: instId, instrumentOccupied: freshPoss.some((p) => p.instId === instId) || localKeys.size > 0 && [...localKeys].some((k) => k.startsWith(`${instId}:`)),
+    }, risk);
+    const freshRisk = evaluateEntry({
+      action: decision.decision, strategy: decision.strategy ?? undefined, confidence: calConf,
+      regime: ctx.regime, instrument: instId,
+      stopDistancePct: ctx.candidate ? Math.abs(ctx.candidate.entryPrice - ctx.candidate.stopPrice) / ctx.candidate.entryPrice
+        : Number.isFinite(f.atr14) && f.price ? (decision.suggested_stop_atr * f.atr14) / f.price : undefined,
+    }, { equity: freshEq, dayStartEquity: freshBase.dayStartEquity, peakEquity: freshBase.peakEquity,
+      openPositions: freshPoss.length, killSwitchActive: freshKill }, trading, risk);
+    if (!freshGate.allowed || !freshRisk.approved || riskFingerprint(risk) !== riskAtPreparation) {
+      logSystemEvent(store, "RISK_EVENT", { race_guard: "entry skipped after refreshed global risk check", instId,
+        reason: riskFingerprint(risk) !== riskAtPreparation ? "RISK_SETTINGS_CHANGED" : freshGate.allowed ? freshRisk.reason : freshGate.reason });
+      return { kill };
+    }
+    // Re-size from refreshed equity so a concurrent account loss cannot leave a stale oversized order.
     try {
-      const algo = await placeConditionalProtection(client, {
-        instId,
-        posSide: side === "LONG" ? "long" : "short",
-        contracts: sz.contracts,
-        stopPrice: ctx.candidate
+      sz = sizePosition({ equity: freshEq, entryPrice: f.price, stopPrice: stopPx,
+        leverage, instrument: meta }, risk, trading.sizing);
+    } catch (szErr) {
+      logSystemEvent(store, "RISK_EVENT", { sizing_rejected_after_refresh: szErr instanceof Error ? szErr.message : String(szErr), instId });
+      return { kill };
+    }
+      const clOpen = clId(side, "OPEN", instId);
+      try {
+        const placed = await submitReservedEntry(d, {
+        instId, tdMode: "isolated", side: side === "LONG" ? "buy" : "sell",
+        posSide: side.toLowerCase() as "long" | "short",
+        ordType: "market", sz: sz.contracts, clOrdId: clOpen,
+      });
+      const filled = await waitForOrderTerminal(client, instId, placed.ordId, { timeoutMs: 30_000 });
+      if (filled.state !== "filled") throw new Error(`entry not filled: ${filled.state}`);
+      consecutiveOrderFailures = 0;
+      persistOrder(store, { ordId: placed.ordId, clOrdId: clOpen, instId, side: side === "LONG" ? "buy" : "sell",
+        posSide: side.toLowerCase(), ordType: "market", sz: sz.contracts, state: filled.state,
+        avgPx: filled.avgPx, cTime: filled.cTime, uTime: filled.uTime, tradeId: "", kind: "OPEN" });
+        const entryPx = Number(filled.avgPx) || f.price;
+        const executedStopPx = ctx.candidate
           ? entryPx + (side === "LONG" ? -1 : 1) * Math.abs(ctx.candidate.entryPrice - ctx.candidate.stopPrice)
-          : stopPriceFor(entryPx, f.atr14, decision.suggested_stop_atr, side),
-        takeProfitPrice: ctx.candidate
+          : stopPriceFor(entryPx, f.atr14, decision.suggested_stop_atr, side);
+      const tradeId = nextTradeId();
+      const entryPosition = (await getPositions(client, instId).catch(() => []))
+        .find((p) => p.instId === instId && p.posSide === side.toLowerCase() && Number(p.pos) !== 0);
+      openTrade(store, {
+        tradeId, engine: "SWING_15M", instrument: instId, timeframe: trading.timeframe, side,
+        strategy: candidateIdentity ? candidateIdentity.family : strat.name,
+        strategyVersion: candidateIdentity ? candidateIdentity.strategyVersion : strat.version,
+        ...(candidateIdentity ? { identity: candidateIdentity } : {}),
+        regime: ctx.regime,
+        ...(ctx.candidate ? { regimeAxes: ctx.candidate.regime } : {}),
+        ...(ctx.candidate ? { entryConditions: ctx.candidate.conditions } : {}),
+        contracts: sz.contracts, entryPx, entryTs: new Date().toISOString(),
+          stopPx: executedStopPx,
+        takeProfitPx: ctx.candidate
           ? entryPx + (side === "LONG" ? 1 : -1) * Math.abs(ctx.candidate.entryPrice - ctx.candidate.stopPrice) * ctx.candidate.targetR
           : takeProfitPriceFor(entryPx, f.atr14, decision.suggested_take_profit_atr, side),
-        clAlgoId: clId(side, "ALGO", instId),
+        clOpenId: clOpen, ordOpenId: placed.ordId,
+        decisionId,
+        rawConfidence: decision.confidence, calibratedConfidence: calConf,
+          plannedRiskPct: Number(sz.contracts) * Number(meta.ctVal) * Math.abs(entryPx - executedStopPx) / freshEq * 100,
+        leverage: confirmedFillLeverage(entryPosition ?? filled, confirmedFillLeverage(filled, leverage)),
+        ...(ctx.candidate ? { maxHoldBars: ctx.candidate.maxHoldBars } : {}),
+        entryFeatures: f,
       });
-      store.db.prepare("UPDATE trades SET algo_id=? WHERE trade_id=?").run(algo.algoId, tradeId);
-      log.info({ event: "protection:algo_placed", tradeId, algoId: algo.algoId });
-    } catch (algoErr) {
-      logSystemEvent(store, "RISK_EVENT", { protection_degraded: algoErr instanceof Error ? algoErr.message : String(algoErr) });
-      log.warn({ event: "protection:algo_failed", fallback: "Layer B bot monitor" });
+      // §16 Layer A — exchange-native conditional (SL+TP) algo orders.
+      // Best-effort: on failure Layer B (monitor) still holds; flag it.
+      try {
+        const algo = await placeConditionalProtection(client, {
+          instId,
+          posSide: side === "LONG" ? "long" : "short",
+          contracts: sz.contracts,
+            stopPrice: executedStopPx,
+          takeProfitPrice: ctx.candidate
+            ? entryPx + (side === "LONG" ? 1 : -1) * Math.abs(ctx.candidate.entryPrice - ctx.candidate.stopPrice) * ctx.candidate.targetR
+            : takeProfitPriceFor(entryPx, f.atr14, decision.suggested_take_profit_atr, side),
+          clAlgoId: clId(side, "ALGO", instId),
+        });
+        store.db.prepare("UPDATE trades SET algo_id=? WHERE trade_id=?").run(algo.algoId, tradeId);
+        log.info({ event: "protection:algo_placed", tradeId, algoId: algo.algoId });
+        } catch (algoErr) {
+        logSystemEvent(store, "RISK_EVENT", { protection_degraded: algoErr instanceof Error ? algoErr.message : String(algoErr) });
+          log.warn({ event: "protection:algo_failed", fallback: "Layer B bot monitor" });
+        }
+        releaseEntry(store, clOpen);
+        try { persistEntryCapital(store, tradeId, entryPosition, meta, freshEq, leverage); }
+        catch { log.warn({ event: "entry_capital_persistence_failed", tradeId }); }
+      store.db.prepare("UPDATE orders SET trade_id=? WHERE ordId=?").run(tradeId, placed.ordId);
+      const entryFills = await getFills(client, instId, placed.ordId).catch(() => []);
+      persistFills(store, entryFills.map((f2) => ({ tradeId: f2.tradeId, ordId: f2.ordId, clOrdId: f2.clOrdId,
+        instId: f2.instId, fillPx: f2.fillPx, fillSz: f2.fillSz, fee: f2.fee, feeCcy: f2.feeCcy,
+        side: f2.side, posSide: f2.posSide, ts: f2.ts })));
+      logSystemEvent(store, "TRADE_OPEN", { tradeId, instId, side, contracts: sz.contracts, entryPx });
+      log.info({ event: "trade:opened", tradeId, instId, entryPx, contracts: sz.contracts });
+      } catch (e) {
+      consecutiveOrderFailures += 1;
+      logSystemEvent(store, "ERROR", { place_entry_fail: e instanceof Error ? e.message : String(e), consecutive: consecutiveOrderFailures });
+      log.error({ event: "trade:open_failed", error: e instanceof Error ? e.message : String(e) });
     }
-    store.db.prepare("UPDATE orders SET trade_id=? WHERE ordId=?").run(tradeId, placed.ordId);
-    const entryFills = await getFills(client, instId, placed.ordId).catch(() => []);
-    persistFills(store, entryFills.map((f2) => ({ tradeId: f2.tradeId, ordId: f2.ordId, clOrdId: f2.clOrdId,
-      instId: f2.instId, fillPx: f2.fillPx, fillSz: f2.fillSz, fee: f2.fee, feeCcy: f2.feeCcy,
-      side: f2.side, posSide: f2.posSide, ts: f2.ts })));
-    logSystemEvent(store, "TRADE_OPEN", { tradeId, instId, side, contracts: sz.contracts, entryPx });
-    log.info({ event: "trade:opened", tradeId, instId, entryPx, contracts: sz.contracts });
-  } catch (e) {
-    consecutiveOrderFailures += 1;
-    logSystemEvent(store, "ERROR", { place_entry_fail: e instanceof Error ? e.message : String(e), consecutive: consecutiveOrderFailures });
-    log.error({ event: "trade:open_failed", error: e instanceof Error ? e.message : String(e) });
-  }
-  return { kill };
+    return { kill };
+  });
 }
 
 // Deterministic SL/TP price trigger (§25 Layer B core) — pure fn shared by
@@ -518,7 +573,7 @@ export function shouldUseAiPositionExit(trade: Record<string, unknown>): boolean
 export function clId(side: string, kind: "OPEN" | "CLOSE" | "ALGO", instId: string): string {
   const base = instId.split("-")[0] ?? "X";
   const day = new Date().toISOString().slice(0, 10).replaceAll("-", "");
-  const rand = String(Date.now() % 1000000).padStart(6, "0");
+  const rand = randomBytes(6).toString("hex");
   return `EVQ${base}${side === "LONG" ? "L" : "S"}${kind}${day}${rand}`.slice(0, 32);
 }
 

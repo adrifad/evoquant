@@ -52,7 +52,7 @@ LLM_REVIEWER_MODEL=glm-5.3
 
 The same setting names are available for `SCALP`, `REVIEWER`, `EVOLUTION`, and
 `CRITIC`. Budget names are `MAX_CALLS_PER_HOUR` and `MAX_CALLS_PER_DAY`;
-Critic additionally accepts `MAX_REVISION_ROUNDS` (0 or 1). The Settings page
+Critic additionally accepts `MAX_REVISION_ROUNDS` (0 or 1). The AI page
 can configure every role independently. Saved role settings are persisted in
 server-local `.env` with mode `0600` and hot-reloaded for the next request.
 Existing open trades are not closed and Strategy Core is not restarted.
@@ -85,14 +85,23 @@ prompts, or raw provider errors. The connection test uses only the selected
 role's draft URL/key/model and returns sanitized status/latency.
 
 Default internal request budgets are Gate 30/hour, Scalp 12/hour, Reviewer
-10/hour, Evolution 8/day, and Critic 8/day. They count requests and retries as
-one logical call. Exhaustion is fail-safe: Gate denies, Scalp skips, Reviewer
+10/hour, Evolution 8/day, and Critic 8/day. Each actual provider HTTP attempt,
+including retries, reserves one budget unit transactionally before dispatch.
+Concurrent calls cannot reserve the same remaining unit. Logical calls are
+reported separately from provider requests and retries. Exhaustion is fail-safe: Gate denies, Scalp skips, Reviewer
 defers, Evolution proposes nothing, and Critic permits no Challenger. Budgets
 are operational safeguards, not provider billing estimates. Retries are
-bounded to the configured 0–3 attempts and use short bounded backoff.
+bounded to the configured 0–3 retries and use short bounded backoff.
+
+The dispatch ledger survives restart and includes requests interrupted before
+a logical run completed. Older logical runs without request accounting retain
+conservative budget charges, displayed separately from actual provider requests.
+Token totals are unavailable when usage is missing, retry usage is incomplete,
+or dispatched requests lack completed accounting; missing tokens are never zero.
 
 The dashboard reports each role's enabled/configured state, provider/model,
-base URL hostname, status, recent success/failure/latency, and request counts.
+base URL hostname, status, recent success/failure/latency, logical calls,
+provider requests, retries, token availability and budget consumption.
 It does not display the key. Role settings endpoints are additive and do not
 change existing trading or risk APIs.
 

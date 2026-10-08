@@ -1,24 +1,45 @@
+import { useState } from "react";
 import { useApi } from "../hooks/useApi";
 import { formatNumber, formatPrice, formatTimestamp, toneFor } from "../lib/format";
 import { asRow, asRows, asText, type ApiState, type Row } from "../lib/types";
 import { DataState, DataTable, DividerLabel, Field, PageHeading, Panel, StatusBadge } from "../components/Primitives";
-import { MarketChart } from "../components/MarketChart";
+import { InstrumentChart } from "../components/InstrumentChart";
 
 export function MarketsPage({ status }: { status: ApiState<Row> }) {
   const market = useApi<unknown>("/api/market");
-  const candles = useApi<unknown>(`/api/candles?limit=120&instId=${encodeURIComponent(asText(status.data?.instrument, "BTC-USDT-SWAP"))}`);
+  const [selected, setSelected] = useState("");
   const d = asRow(market.data);
   const snapshot = asRow(d?.snapshot);
   const scanner = asRows(d?.scan);
   const weights = asRow(d?.weights) ?? {};
+  const instrument = selected || asText(status.data?.instrument);
+  const selectedRow = scanner.find(row => row.instrument === instrument);
 
   return <div className="page">
     <PageHeading title="Markets" description="Inspect the market inputs and regime used by the current decision cycle." detail={<span className="muted-small">Updated {formatTimestamp(d?.updatedAt)}</span>}/>
-    <Panel title="Market chart" subtitle={`${asText(status.data?.instrument)} | ${asText(status.data?.timeframe)}`} className="chart-panel">
-      <DataState loading={candles.loading} error={candles.error} empty={asRows(candles.data).length < 2} hasData={candles.data !== null} emptyTitle="Waiting for confirmed candles" emptyDetail="Market data is stored after each confirmed exchange candle.">
-        <MarketChart candles={asRows(candles.data)} markers={asRow(status.data?.openPosition) ?? {}}/>
+    <Panel title="Market scanner" subtitle="Select an instrument; setup, context veto and risk retain separate states">
+      <DataState loading={market.loading} error={market.error} empty={!scanner.length} hasData={market.data !== null} emptyTitle="Scanner is waiting for a confirmed market cycle">
+        <DataTable rows={scanner} rowKey={r => String(r.instrument)} onRowClick={r => setSelected(String(r.instrument))} minWidth={1050} columns={[
+          { key: "symbol", label: "Instrument", render: r => asText(r.instrument) },
+          { key: "price", label: "Price", numeric: true, render: r => formatPrice(r.price) },
+          { key: "regime", label: "Regime", render: r => asText(r.regime) },
+          { key: "strategy", label: "Strategy", render: r => asText(r.strategy, "No candidate") },
+          { key: "side", label: "Side", render: r => asText(asRow(r.candidate)?.side, "None") },
+          { key: "score", label: "Setup score", numeric: true, render: r => formatNumber(asRow(r.candidate)?.setupScore) },
+          { key: "gate", label: "Gate", render: r => asText(r.gate) },
+          { key: "risk", label: "Risk", render: r => asText(r.risk) },
+          { key: "state", label: "Candidate state", render: r => <StatusBadge value={r.state}/> },
+          { key: "signal", label: "Last signal", render: r => formatTimestamp(r.lastSignal) },
+        ]}/>
       </DataState>
     </Panel>
+    <Panel title="Market chart" subtitle={`${instrument} | confirmed exchange candles`} className="chart-panel">
+      <InstrumentChart key={instrument} instrument={instrument} markers={asRows(status.data?.openPositions).find(p => p.instrument === instrument) ?? {}}/>
+    </Panel>
+    {selectedRow ? <Panel title={`${instrument} decision trace`} subtitle="Failures are deterministic setup conditions; unselected candidates have no Gate or risk result">
+      <div className="trace-list"><div className="trace-step"><strong>Setup</strong><span>{selectedRow.tradable ? `PASS · ${asText(asRow(selectedRow.candidate)?.side)} · ${asText(selectedRow.strategy)}` : asText(selectedRow.state)}</span></div><div className="trace-step"><strong>Gate</strong><span>{asText(selectedRow.gate)}</span></div><div className="trace-step"><strong>Risk</strong><span>{asText(selectedRow.risk)}</span></div><div className="trace-step"><strong>Execution</strong><span>{selectedRow.position ? "OPEN POSITION" : "No open position recorded"}</span></div>
+      {Array.isArray(selectedRow.reason) ? selectedRow.reason.slice(0,12).map((r,i) => <div className="trace-step" key={i}><strong>{i === 0 ? "Reasons" : ""}</strong><span>{String(r)}</span></div>) : null}</div>
+    </Panel> : null}
     <DataState loading={market.loading} error={market.error} empty={!d} hasData={market.data !== null} emptyTitle="Market snapshot is not available" emptyDetail="The feature snapshot appears after the bot completes a market evaluation.">
       <div className="market-analysis-grid">
         <Panel title="Feature snapshot" subtitle="Values from the latest feature build">
@@ -43,18 +64,6 @@ export function MarketsPage({ status }: { status: ApiState<Row> }) {
             { key: "score", label: "Raw score", numeric: true, render: () => <span className="muted-small">Not supplied by API</span> },
             { key: "contribution", label: "Contribution", numeric: true, render: () => <span className="muted-small">Not supplied by API</span> },
           ]}/> : <div className="empty-state"><strong>No signal weights recorded</strong></div>}
-        </Panel>
-        <Panel title="Watchlist scanner" subtitle="Current instrument evaluations">
-          <DataState loading={market.loading} error={market.error} empty={!scanner.length} hasData={market.data !== null} emptyTitle="Scanner is waiting for a market tick">
-            <DataTable caption="Watchlist scanner" rows={scanner} rowKey={(row, index) => asText(row.instrument, String(index))} minWidth={640} columns={[
-              { key: "instrument", label: "Instrument", render: row => asText(row.instrument) },
-              { key: "regime", label: "Regime", render: row => <StatusBadge value={row.regime}/> },
-              { key: "price", label: "Price", numeric: true, render: row => formatPrice(row.price) },
-              { key: "score", label: "Score", numeric: true, render: row => <span className={toneFor(row.score)}>{formatNumber(row.score)}</span> },
-              { key: "strategy", label: "Strategy", render: row => asText(row.strategy) },
-              { key: "tradable", label: "Tradable", render: row => <StatusBadge value={row.tradable ? "YES" : "NO"}/> },
-            ]}/>
-          </DataState>
         </Panel>
       </div>
     </DataState>

@@ -4,7 +4,7 @@ import { Badge, Field, Panel } from "./Primitives";
 import { parseVerdict } from "./PositionCard";
 
 export function DecisionPanel({ decision }: { decision: Row | null }) {
-  if (!decision) return <Panel title="Latest decision" subtitle="AI proposal and deterministic gate">
+  if (!decision) return <Panel title="Latest decision" subtitle="Recorded strategy action and deterministic risk">
     <div className="empty-state"><strong>Waiting for a recorded decision</strong><span>The first decision appears after the next evaluation cycle.</span></div>
   </Panel>;
   const action = asText(decision.decision, "UNKNOWN").toUpperCase();
@@ -16,10 +16,10 @@ export function DecisionPanel({ decision }: { decision: Row | null }) {
   const rawConfidence = asNumber(decision.raw_confidence);
   const calibratedConfidence = asNumber(decision.calibrated_confidence);
 
-  return <Panel title="Latest decision" subtitle="AI proposes. Risk Engine decides." className="decision-panel">
+  return <Panel title="Latest decision" subtitle="Strategy Core determines the V2 direction. AI provides a context veto." className="decision-panel">
     <div className="decision-split">
-      <section className="ai-decision" aria-label="AI decision">
-        <div className="decision-label">AI decision</div>
+      <section className="ai-decision" aria-label="Recorded action">
+        <div className="decision-label">Recorded action</div>
         <strong className={`decision-action ${tone}`}>{action}</strong>
         <div className="confidence-pair">
           <div><span>Raw confidence</span><strong className="mono">{formatPercent(rawConfidence === null ? null : rawConfidence * 100, 0)}</strong></div>
@@ -31,7 +31,7 @@ export function DecisionPanel({ decision }: { decision: Row | null }) {
         </div>
       </section>
       <section className={`risk-verdict ${approved ? "verdict-approved" : "verdict-rejected"}`} aria-label="Risk Engine decision">
-        <div className="verdict-head"><span>Risk Engine</span><Badge tone={approved ? "positive" : "critical"}>{approved ? "APPROVED" : "REJECTED"}</Badge></div>
+        <div className="verdict-head"><span>Risk Engine</span><Badge tone={action === "HOLD" ? "neutral" : approved ? "positive" : "critical"}>{action === "HOLD" ? "NO ENTRY" : approved ? "APPROVED" : "REJECTED"}</Badge></div>
         <strong>{asText(verdict.reason, approved ? "Approved by deterministic checks" : "Reason not supplied")}</strong>
         <span className="verdict-note">Deterministic risk controls have final authority.</span>
       </section>

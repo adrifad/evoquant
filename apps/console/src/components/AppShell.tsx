@@ -1,22 +1,22 @@
 import { useEffect, useState, type ReactNode } from "react";
 import {
   Activity, ArrowLeftRight, BrainCircuit, CandlestickChart, FlaskConical,
-  LayoutDashboard, ListTree, Menu, Network, ScrollText, Settings, ShieldAlert, X, ZapOff,
+  LayoutDashboard, Menu, Network, ScrollText, Settings, ShieldAlert, X, ZapOff,
 } from "lucide-react";
 import type { ApiState, Row } from "../lib/types";
 import { asText } from "../lib/types";
 import { Badge, StatusBadge } from "./Primitives";
 
-export type PageId = "dashboard" | "markets" | "trades" | "strategies" | "evolution" | "memory" | "risk" | "logs" | "settings";
+export type PageId = "dashboard" | "trading" | "markets" | "trades" | "strategies" | "evolution" | "memory" | "risk" | "ai" | "logs" | "settings";
 
 const navigation = [
   { id: "dashboard", label: "Dashboard", Icon: LayoutDashboard },
+  { id: "trading", label: "Trading", Icon: Activity },
   { id: "markets", label: "Markets", Icon: CandlestickChart },
   { id: "trades", label: "Trades", Icon: ArrowLeftRight },
-  { id: "strategies", label: "Strategies", Icon: ListTree },
   { id: "evolution", label: "Evolution", Icon: FlaskConical },
-  { id: "memory", label: "Memory", Icon: BrainCircuit },
   { id: "risk", label: "Risk", Icon: ShieldAlert },
+  { id: "ai", label: "AI", Icon: BrainCircuit },
   { id: "logs", label: "Logs", Icon: ScrollText },
   { id: "settings", label: "Settings", Icon: Settings },
 ] as const;
@@ -32,7 +32,7 @@ export function AppShell({ page, setPage, status, socketConnected, children }: {
   const [notice, setNotice] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const s = status.data;
-  const botState = asText(s?.botState, "CONNECTING");
+  const botState = s?.emergencyHalted || s?.killReason ? "HALTED" : asText(s?.botState, "CONNECTING");
 
   useEffect(() => {
     if (!menuOpen) return;

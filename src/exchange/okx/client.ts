@@ -23,12 +23,14 @@ export class OkxApiError extends Error {
   readonly code: string;
   readonly msg: string;
   readonly httpStatus: number | undefined;
+  readonly data: unknown;
 
-  constructor(code: string, msg: string, httpStatus?: number) {
+  constructor(code: string, msg: string, httpStatus?: number, data?: unknown) {
     super(`OKX API error ${code}: ${msg || "(no message)"}`);
     this.name = "OkxApiError";
     this.code = code;
     this.msg = msg;
+    this.data = data;
     if (httpStatus !== undefined) this.httpStatus = httpStatus;
   }
 }
@@ -180,9 +182,9 @@ export class OkxClient {
     // Spec §8/§14 — code !== "0" is an error, never a completed trade.
     // For batch-style endpoints (trade/order) the REAL reason sits in
     // data[].sCode/sMsg even when top-level code is "0" or "1" — surface it.
-    if (json.code !== "0") {
+    if (json.code !== "0" || !res.ok) {
       const detail = Array.isArray(json.data) ? JSON.stringify(json.data).slice(0, 300) : "";
-      throw new OkxApiError(json.code, `${json.msg}${detail ? ` | ${detail}` : ""}`, res.status);
+      throw new OkxApiError(json.code, `${json.msg}${detail ? ` | ${detail}` : ""}`, res.status, json.data);
     }
     return json.data;
   }

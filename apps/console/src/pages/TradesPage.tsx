@@ -1,9 +1,10 @@
 import { useEffect, useRef, useState } from "react";
 import { useApi } from "../hooks/useApi";
-import { formatDuration, formatMoney, formatNumber, formatPercent, formatPrice, formatR, formatTimestamp, toneFor } from "../lib/format";
+import { formatAmount, formatDuration, formatLeverage, formatMoney, formatNumber, formatPercent, formatPrice, formatR, formatTimestamp, toneFor } from "../lib/format";
 import { asNumber, asRow, asRows, asText, parseJson, type Row } from "../lib/types";
 import { Badge, DataState, DataTable, Evidence, Field, PageHeading, Panel, StatusBadge } from "../components/Primitives";
 import { MarketChart } from "../components/MarketChart";
+import { InstrumentChart } from "../components/InstrumentChart";
 import { X } from "lucide-react";
 
 export function TradesPage() {
@@ -41,12 +42,17 @@ export function TradesPage() {
           { key: "strategy", label: "Strategy", render: row => `${asText(row.strategy)} V${asText(row.strategy_version)}` },
           { key: "regime", label: "Regime", render: row => asText(row.regime).replaceAll("_", " ") },
           { key: "entry", label: "Entry", numeric: true, render: row => formatPrice(row.entry_px) },
+          { key: "leverage", label: "Leverage", numeric: true, render: row => formatLeverage(row.status === "OPEN" ? row.actual_leverage : asRow(row.entry_capital)?.actual_leverage ?? row.leverage) },
+          { key: "margin", label: "Margin used", numeric: true, render: row => <>{formatAmount(row.status === "OPEN" ? row.margin_used : asRow(row.entry_capital)?.margin_used)}<small className="source-note">{asText(row.status === "OPEN" ? row.margin_source : asRow(row.entry_capital)?.margin_source, "UNAVAILABLE")}</small></> },
+          { key: "notional", label: "Notional", numeric: true, render: row => formatAmount(row.status === "OPEN" ? row.notional : asRow(row.entry_capital)?.notional, asText(row.status === "OPEN" ? row.notional_currency : asRow(row.entry_capital)?.notional_currency, "")) },
           { key: "exit", label: "Exit / mark", numeric: true, render: row => row.status === "OPEN" ? formatPrice(row.mark_px) : formatPrice(row.exit_px) },
           { key: "r", label: "R", numeric: true, render: row => <span className={toneFor(row.status === "OPEN" ? row.live_r : row.result_r)}>{formatR(row.status === "OPEN" ? row.live_r : row.result_r)}</span> },
           { key: "pnl", label: "PnL", numeric: true, render: row => <span className={toneFor(row.status === "OPEN" ? row.upl : row.pnl)}>{formatMoney(row.status === "OPEN" ? row.upl : row.pnl)}</span> },
           { key: "duration", label: "Duration", numeric: true, render: row => formatDuration(row.status === "OPEN" ? row.live_dur_s : row.duration_s) },
           { key: "result", label: "Result", render: row => <StatusBadge value={row.status === "OPEN" ? "OPEN" : row.pnl === null || row.pnl === undefined || !Number.isFinite(Number(row.pnl)) ? "UNKNOWN" : Number(row.pnl) > 0 ? "WIN" : Number(row.pnl) < 0 ? "LOSS" : "FLAT"}/> },
           { key: "review", label: "Review record", render: row => <StatusBadge value={reviewedTrades.has(asText(row.trade_id, "")) ? "RECENT REVIEW" : "CHECK DETAIL"}/> },
+          { key: "mfe", label: "MFE / MAE (price)", render: row => `${formatPrice(row.mfe)} / ${formatPrice(row.mae)}` },
+          { key: "reason", label: "Exit reason", render: row => asText(row.exit_reason) },
         ]}/>
       </DataState>
     </Panel>
@@ -54,7 +60,7 @@ export function TradesPage() {
   </div>;
 }
 
-function TradeDetailDialog({ tradeId, onClose }: { tradeId: string; onClose: () => void }) {
+export function TradeDetailDialog({ tradeId, onClose }: { tradeId: string; onClose: () => void }) {
   const api = useApi<unknown>(`/api/trades/${encodeURIComponent(tradeId)}`, 15_000);
   const dialog = useRef<HTMLDialogElement>(null);
   const data = asRow(api.data);
@@ -77,6 +83,7 @@ function TradeDetailDialog({ tradeId, onClose }: { tradeId: string; onClose: () 
   const riskVerdict = decision ? parseJson<Row>(decision.risk_verdict, {}) : {};
   const rawConfidence = decision && decision.raw_confidence !== null && decision.raw_confidence !== undefined ? Number(decision.raw_confidence) : null;
   const calibratedConfidence = decision && decision.calibrated_confidence !== null && decision.calibrated_confidence !== undefined ? Number(decision.calibrated_confidence) : null;
+  const capital = trade?.status === "OPEN" ? trade : asRow(trade?.entry_capital);
 
   return <dialog ref={dialog} className="trade-dialog" aria-labelledby="trade-detail-title" onClose={onClose} onClick={event => { if (event.target === event.currentTarget) close(); }}>
     <div className="dialog-header">
@@ -92,14 +99,27 @@ function TradeDetailDialog({ tradeId, onClose }: { tradeId: string; onClose: () 
         <div><span>Entry time</span><strong>{formatTimestamp(trade.entry_ts)}</strong></div>
       </div>
       <div className="trade-detail-content">
+        <Panel title="Capital and risk" subtitle={trade.status === "OPEN" ? "Actual exchange state where available; estimates are labeled" : "Entry snapshot; legacy records may not have financial snapshots"}>
+          <div className="position-financials">
+            <Field label="Margin used · USDT" value={formatAmount(capital?.margin_used)} detail={asText(capital?.margin_source, "UNAVAILABLE")}/>
+            <Field label="Notional" value={formatAmount(capital?.notional, asText(capital?.notional_currency, ""))} detail={asText(capital?.notional_source)}/>
+            <Field label="Actual leverage" value={formatLeverage(capital?.actual_leverage)} detail={capital?.leverage_mismatch ? "Differs from configured entry leverage" : asText(capital?.margin_mode).toUpperCase()}/>
+            <Field label="Initial price risk" value={formatAmount(capital?.initial_risk)}/>
+            <Field label="Risk at active stop" value={formatAmount(capital?.risk_at_stop)} detail="Estimated, excludes execution costs"/>
+            <Field label="Unrealized / realized PnL" value={formatMoney(trade.status === "OPEN" ? trade.upl : trade.pnl)}/>
+            <Field label="Exit timestamp" value={formatTimestamp(trade.exit_ts)}/>
+            <Field label="Cross IMR · USD" value={formatAmount(capital?.cross_imr_usd, "USD")} detail="Margin requirement, not allocated collateral"/>
+          </div>
+        </Panel>
+        {trade.status === "OPEN" ? <Panel title="Live market" subtitle="Inspect current market conditions around the active trade"><InstrumentChart instrument={String(trade.instrument)} markers={trade} initialTimeframe={trade.timeframe === "scalp" ? "1m" : String(trade.timeframe)}/></Panel> : null}
         <Panel title="Trade replay" subtitle="Stored confirmed candles and persisted trade levels" className="chart-panel">
-          <DataState loading={api.loading} error={api.error} empty={!candles.length} hasData={Boolean(data)} emptyTitle="No replay candles available" emptyDetail="This trade has no candle history stored for the selected replay window.">
+          {trade.status === "CLOSED" ? <InstrumentChart key={tradeId} tradeId={tradeId} instrument={asText(trade.instrument)} markers={trade} initialTimeframe={trade.timeframe === "scalp" ? "1m" : String(trade.timeframe)}/> : <DataState loading={api.loading} error={api.error} empty={!candles.length} hasData={Boolean(data)} emptyTitle="No replay candles available" emptyDetail="This trade has no candle history stored for the selected replay window.">
             <MarketChart candles={candles} markers={trade} title="Trade replay"/>
-          </DataState>
+          </DataState>}
           <div className="replay-excursions"><Field label="Maximum favorable excursion" value={trade.mfe === null || trade.mfe === undefined ? "Not recorded" : formatPrice(trade.mfe)}/><Field label="Maximum adverse excursion" value={trade.mae === null || trade.mae === undefined ? "Not recorded" : formatPrice(trade.mae)}/><span className="data-footnote">Excursion magnitudes are stored; their exact candle locations are not provided by the API.</span></div>
         </Panel>
         <div className="trade-detail-grid">
-          <Panel title="Decision snapshot" subtitle="AI proposal and deterministic Risk Engine verdict">
+          <Panel title="Decision snapshot" subtitle="Strategy Core action, context and deterministic Risk Engine verdict">
             {decision ? <><div className="decision-snapshot"><StatusBadge value={decision.decision}/><span className="muted-small">Decision ID {asText(decision.decision_id)}</span></div><Field label="Raw confidence" value={formatPercent(rawConfidence !== null && Number.isFinite(rawConfidence) ? rawConfidence * 100 : null, 0)}/><Field label="Calibrated confidence" value={formatPercent(calibratedConfidence !== null && Number.isFinite(calibratedConfidence) ? calibratedConfidence * 100 : null, 0)}/><Field label="Strategy" value={asText(decision.strategy)} mono={false}/><Field label="Regime" value={asText(decision.regime).replaceAll("_", " ")} mono={false}/><Field label="Risk result" value={<StatusBadge value={asRow(riskVerdict)?.approved === true ? "APPROVED" : "REJECTED"}/>}/><Field label="Risk reason" value={asText(asRow(riskVerdict)?.reason)} mono={false}/><div className="review-copy">{renderThesis(decision.thesis)}</div></> : <div className="empty-state"><strong>No linked decision record</strong></div>}
           </Panel>
           <Panel title="Execution" subtitle="Exchange order and fill records">
@@ -114,6 +134,7 @@ function TradeDetailDialog({ tradeId, onClose }: { tradeId: string; onClose: () 
             {features ? <div className="snapshot-fields">{[["Price", features.price], ["EMA20", features.ema20], ["EMA50", features.ema50], ["EMA spread", features.emaSpreadPct], ["RSI14", features.rsi14], ["ADX14", features.adx14], ["ATR14", features.atr14], ["ATR %", features.atrPct], ["Volume ratio", features.volumeRatio]].map(([label, value]) => <Field key={String(label)} label={String(label)} value={formatNumber(value)} />)}</div> : <div className="empty-state"><strong>Entry feature snapshot unavailable</strong></div>}
           </Panel>
         </div>
+        <Panel title="Setup conditions" subtitle="Deterministic conditions captured at entry"><div className="trace-list">{asRows(parseJson(trade.entry_conditions, [])).map((condition,i) => <div className="trace-step" key={i}><StatusBadge value={condition.passed ? "PASS" : "FAIL"}/><span>{asText(condition.name)} · {asText(condition.detail, "")}</span></div>)}{!asRows(parseJson(trade.entry_conditions, [])).length ? <p>No structured setup conditions stored for this trade.</p> : null}</div></Panel>
         <Panel title="Post-trade review" subtitle={review ? `${asText(review.outcome)} | reviewed ${formatTimestamp(review.ts)}` : "No review has been recorded for this trade"}>
           {review ? <>
             <div className="review-observations">{observations.length ? observations.map((observation, index) => <article className="observation-row" key={`${asText(observation.factor)}-${index}`}><div><strong>{asText(observation.factor, "Observation")}</strong><StatusBadge value={observation.effect}/></div><p>{asText(observation.evidence)}</p></article>) : <div className="empty-state"><strong>No structured observations recorded</strong></div>}</div>
