@@ -30,7 +30,7 @@ Energy 1, rhythm 2, motion 1. Navy `#12213f` navigation, workspace `#f3f5f7`, wh
 - [x] API projections: bounded candle timeframe API, correlated market decisions, V2 family evidence/cadence/comparisons, lifecycle events, account freshness, position/trade metadata and discrepancies.
 - [x] Console: light workstation shell, Trading workspace and details, shared timeframe chart with candle/volume and entry/exit/SL/TP overlays, compact capital summary, editable Risk, V2 Evolution, AI role overview/settings, meaningful scanner states and filtered logs. Retain existing Memory/Strategies access as secondary tabs.
 - [x] Verification: core typecheck/tests, console typecheck/build, isolated console preview without trading, visual and interaction checks at 1440/1280/768/390, empty/error/stale and long content checks, independent specification and quality review.
-- [ ] Delivery: intentional files only; commit and push `feat/trading-workstation-v2`; inspect CI for exact pushed SHA; record remaining issues honestly.
+- [x] Delivery: intentional files only; commit and push `feat/trading-workstation-v2`; inspect CI for exact pushed SHA; record remaining issues honestly.
 
 ## Test strategy
 

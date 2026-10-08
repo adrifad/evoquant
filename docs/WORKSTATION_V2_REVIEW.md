@@ -170,6 +170,7 @@ Additions are idempotent and backward compatible; tests cover reopen/migration.
 | `npm test` | PASS — 163 tests, 0 failures, 0 skipped |
 | `npm --prefix apps/console run typecheck` | PASS |
 | `npm --prefix apps/console run build` | PASS |
+| GitHub CI, implementation SHA `6bb803c52e56851b5e4cffa26b0c6e49d0d9faef` | [PASS](https://github.com/adrifad/evoquant/actions/runs/37731344789) |
 
 New tests cover risk ceilings/confirmation/audit/rollback/restart/revisions,
 shared hot limits and in-flight entries, actual leverage, unresolved orders,
@@ -185,6 +186,8 @@ and 390 pixels: 36 combinations without page overflow or unhandled browser error
 Twenty-five interaction checks cover risk saving/confirmation/audit, four live
 and replay timeframes, trade dialogs, mobile navigation/forms, protected keys,
 family isolation, log filters and chart/position error or empty states.
+Eleven additional checks passed for error feedback across seven pages, stale
+status, loading/recovery and absence of unhandled browser errors.
 Independent backend and frontend source reviews passed after their findings were
 fixed. Local checks do not prove exchange integration or strategy profitability.
 
@@ -199,5 +202,6 @@ fixed. Local checks do not prove exchange integration or strategy profitability.
   cannot recover missing entry capital. Missing provider usage remains unavailable.
 - **P3:** No known unresolved finding from this review.
 
-Delivery SHA, remote synchronization and CI outcome belong in the final report
-after committing and pushing; this document records verified local outcomes.
+The implementation was pushed to `feat/trading-workstation-v2`; the remote SHA
+matches the implementation SHA above and its CI passed. Master was not merged.
+The final report identifies the branch head including this verification record.
