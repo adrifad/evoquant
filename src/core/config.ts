@@ -94,7 +94,8 @@ const TradingSchema = z.object({
     version: z.union([z.literal(1), z.literal(2)]).default(2),
     enabled_families: z.array(z.enum(["TREND_FOLLOWING", "BREAKOUT", "MEAN_REVERSION"])).min(1)
       .default(["TREND_FOLLOWING", "BREAKOUT", "MEAN_REVERSION"]),
-  }).default({ version: 2, enabled_families: ["TREND_FOLLOWING", "BREAKOUT", "MEAN_REVERSION"] }),
+    max_candidate_attempts_per_cycle: z.number().int().min(1).max(5).default(3),
+  }).default({ version: 2, enabled_families: ["TREND_FOLLOWING", "BREAKOUT", "MEAN_REVERSION"], max_candidate_attempts_per_cycle: 3 }),
   validation: z.object({ baseline_mode: z.boolean().default(false) }).default({ baseline_mode: false }),
 });
 

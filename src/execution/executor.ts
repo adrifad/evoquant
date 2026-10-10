@@ -45,6 +45,7 @@ import { selectedEntryLeverage, serializeRiskEntry, reserveEntry, releaseEntry, 
 import { entrySettingsFingerprint } from "../core/runtime-trading.ts";
 import { persistEntryCapital } from "../core/capital.ts";
 import { candidateStopRiskPct, portfolioOpenRisk } from "../risk/portfolio-open-risk.ts";
+import { recordOpportunityMetric } from "../market/opportunity-funnel.ts";
 
 const log = createLogger("executor");
 
@@ -328,7 +329,11 @@ function usdtEquity(bal: Awaited<ReturnType<typeof getBalance>>): number {
   return usdt ? Number(usdt.eq) || Number(usdt.availEq) || Number(usdt.availBal) || 0 : 0;
 }
 
-export async function runTick(d: ExecutorDeps, ctx: TickContext, symbol: TickSymbol): Promise<{ kill: string | null }> {
+export type SwingCandidateOutcome = "OPENED" | "GATE_DENY" | "GATE_ERROR" | "CANDIDATE_REJECT" | "GLOBAL_STOP";
+export async function runTick(d: ExecutorDeps, ctx: TickContext, symbol: TickSymbol): Promise<{
+  kill: string | null; candidateOutcome?: SwingCandidateOutcome; candidateReason?: string;
+  candidateGateResult?: "ALLOW" | "DENY" | "ERROR"; candidateRiskResult?: string;
+}> {
   const { trading, risk, store, client } = d;
   const instId = symbol.instId;
   const meta = symbol.meta;
@@ -395,13 +400,29 @@ export async function runTick(d: ExecutorDeps, ctx: TickContext, symbol: TickSym
     instrument: instId, instrumentOccupied: localOpenSym.length > 0 || possSym.length > 0,
   }, risk);
   if (!globalGate.allowed) {
+    if (ctx.candidate) recordOpportunityMetric(store, "SWING_15M", "RISK_REJECT", globalGate.reason);
     log.info({ event: "entry_global_gate_deny", instId, engine: "SWING_15M", reason: globalGate.reason });
-    return { kill };
+    return ctx.candidate ? { kill, candidateOutcome: isGlobalStopReason(globalGate.reason) ? "GLOBAL_STOP" : "CANDIDATE_REJECT",
+      candidateReason: globalGate.reason, candidateRiskResult: globalGate.reason } : { kill };
   }
 
   const f = ctx.features;
   const hasPosition = false;
-  const gate = ctx.candidate ? await ctx.gateCandidateFn?.(ctx.candidate) : null;
+  let gate: CandidateGate | null = null;
+  let gateErrored = false;
+  if (ctx.candidate) {
+    try { gate = await ctx.gateCandidateFn?.(ctx.candidate) ?? null; }
+    catch { gateErrored = true; }
+    if (!gate || gateErrored) {
+      const latestRun = store.db.prepare(`SELECT status FROM llm_runs WHERE role='gate' AND context_ref='candidate_gate'
+        ORDER BY id DESC LIMIT 1`).get() as { status?: string } | undefined;
+      const reason = latestRun?.status === "BUDGET_EXHAUSTED" ? "LLM_BUDGET_EXHAUSTED" : "LLM_ROLE_UNAVAILABLE_OR_INVALID";
+      recordOpportunityMetric(store, "SWING_15M", "GATE_ERROR", reason);
+      if (reason === "LLM_BUDGET_EXHAUSTED") recordOpportunityMetric(store, "SWING_15M", "BUDGET_EXHAUSTED");
+      return { kill, candidateOutcome: "GATE_ERROR", candidateReason: reason, candidateGateResult: "ERROR" };
+    }
+    recordOpportunityMetric(store, "SWING_15M", gate.verdict === "ALLOW" ? "GATE_ALLOW" : "GATE_DENY");
+  }
   const candidateAllowed = !ctx.candidate || gate?.verdict === "ALLOW";
   const decision: Decision = ctx.candidate
     ? {
@@ -448,9 +469,17 @@ export async function runTick(d: ExecutorDeps, ctx: TickContext, symbol: TickSym
     instrument: instId, strategy: ctx.candidate.strategy, side: ctx.candidate.side,
     setupScore: ctx.candidate.setupScore, reasoning: gate?.reasoning ?? [], riskFlags: gate?.risk_flags ?? [],
   });
+  if (ctx.candidate && !candidateAllowed) return { kill, candidateOutcome: "GATE_DENY", candidateReason: "GATE_DENIED", candidateGateResult: "DENY" };
+  if (ctx.candidate && candidateAllowed && calConf < trading.decision.minimum_confidence) {
+    recordOpportunityMetric(store, "SWING_15M", "CONFIDENCE_BELOW_MIN");
+  }
+  if (ctx.candidate && !verdict.approved) recordOpportunityMetric(store, "SWING_15M", "RISK_REJECT", String(verdict.reason));
   log.info({ event: "decision", instId, action: decision.decision, strategy: decision.strategy, raw: decision.confidence, calibrated: calConf, approved: verdict.approved, reason: verdict.reason });
 
-  if (!verdict.approved || decision.decision === "HOLD") return { kill };
+  if (!verdict.approved || decision.decision === "HOLD") return ctx.candidate
+    ? { kill, candidateOutcome: verdict.reason === "KILL_SWITCH_ACTIVE" || isGlobalStopReason(String(verdict.reason)) ? "GLOBAL_STOP" : "CANDIDATE_REJECT",
+      candidateReason: String(verdict.reason), candidateGateResult: "ALLOW", candidateRiskResult: String(verdict.reason) }
+    : { kill };
 
   // §24 sizing from strategy params
   const strat = ctx.candidate
@@ -467,7 +496,8 @@ export async function runTick(d: ExecutorDeps, ctx: TickContext, symbol: TickSym
     );
   } catch (szErr) {
     logSystemEvent(store, "RISK_EVENT", { sizing_rejected: szErr instanceof Error ? szErr.message : String(szErr), instId, mode: trading.sizing.mode });
-    return { kill };
+    if (ctx.candidate) recordOpportunityMetric(store, "SWING_15M", "RISK_REJECT", "SIZING_REJECTED");
+    return ctx.candidate ? { kill, candidateOutcome: "CANDIDATE_REJECT", candidateReason: "SIZING_REJECTED", candidateGateResult: "ALLOW", candidateRiskResult: "SIZING_REJECTED" } : { kill };
   }
   return serializeRiskEntry(store, async () => {
     const settingsAtPreparation = entrySettingsFingerprint(trading, risk);
@@ -475,7 +505,7 @@ export async function runTick(d: ExecutorDeps, ctx: TickContext, symbol: TickSym
     try { leverage = await synchronizeEntryLeverage(d, instId); }
     catch (error) {
       logSystemEvent(store, "RISK_EVENT", { entry_preparation_rejected: String(error), instId });
-      return { kill };
+      return ctx.candidate ? { kill, candidateOutcome: "GLOBAL_STOP", candidateReason: "ENTRY_PREPARATION_FAILED", candidateGateResult: "ALLOW", candidateRiskResult: "PASS" } : { kill };
     }
     // RACE GUARD: decision took ~60-90s; re-check slots before placing (§23)
     const freshPoss = (await getPositions(client)).filter((p) => p.pos !== "0");
@@ -484,8 +514,9 @@ export async function runTick(d: ExecutorDeps, ctx: TickContext, symbol: TickSym
     const freshBase = baseline(store, freshEq);
     const freshLocal = (getOpenTrades(store) as Array<Record<string, unknown>>);
     if (freshLocal.some((trade) => String(trade.status) === "RECONCILIATION_PENDING")) {
+      if (ctx.candidate) recordOpportunityMetric(store, "SWING_15M", "RISK_REJECT", "RECONCILIATION_PENDING");
       logSystemEvent(store, "RISK_REJECT", { engine: "SWING_15M", instId, reason: "RECONCILIATION_PENDING" });
-      return { kill };
+      return ctx.candidate ? { kill, candidateOutcome: "GLOBAL_STOP", candidateReason: "RECONCILIATION_PENDING", candidateGateResult: "ALLOW", candidateRiskResult: "RECONCILIATION_PENDING" } : { kill };
     }
     const freshKeys = new Set(freshPoss.map((p) => `${p.instId}:${p.posSide}`));
     const localKeys = new Set(freshLocal.map((x) => `${String(x.instrument)}:${String(x.side).toLowerCase()}`));
@@ -504,9 +535,14 @@ export async function runTick(d: ExecutorDeps, ctx: TickContext, symbol: TickSym
     }, { equity: freshEq, dayStartEquity: freshBase.dayStartEquity, peakEquity: freshBase.peakEquity,
       openPositions: freshPoss.length, killSwitchActive: freshKill }, trading, risk);
     if (!freshRisk.approved || entrySettingsFingerprint(trading, risk) !== settingsAtPreparation) {
+      if (ctx.candidate && !freshRisk.approved) recordOpportunityMetric(store, "SWING_15M", "RISK_REJECT", String(freshRisk.reason));
       logSystemEvent(store, "RISK_EVENT", { race_guard: "entry skipped after refreshed global risk check", instId,
         reason: entrySettingsFingerprint(trading, risk) !== settingsAtPreparation ? "ENTRY_SETTINGS_CHANGED" : freshRisk.reason });
-      return { kill };
+      return ctx.candidate
+        ? { kill, candidateOutcome: entrySettingsFingerprint(trading, risk) !== settingsAtPreparation || isGlobalStopReason(String(freshRisk.reason)) ? "GLOBAL_STOP" : "CANDIDATE_REJECT",
+          candidateReason: entrySettingsFingerprint(trading, risk) !== settingsAtPreparation ? "ENTRY_SETTINGS_CHANGED" : String(freshRisk.reason),
+          candidateGateResult: "ALLOW", candidateRiskResult: entrySettingsFingerprint(trading, risk) !== settingsAtPreparation ? "ENTRY_SETTINGS_CHANGED" : String(freshRisk.reason) }
+        : { kill };
     }
     // Re-size from refreshed equity so a concurrent account loss cannot leave a stale oversized order.
     try {
@@ -514,7 +550,8 @@ export async function runTick(d: ExecutorDeps, ctx: TickContext, symbol: TickSym
         leverage, instrument: meta }, risk, trading.sizing);
     } catch (szErr) {
       logSystemEvent(store, "RISK_EVENT", { sizing_rejected_after_refresh: szErr instanceof Error ? szErr.message : String(szErr), instId });
-      return { kill };
+      if (ctx.candidate) recordOpportunityMetric(store, "SWING_15M", "RISK_REJECT", "SIZING_REJECTED");
+      return ctx.candidate ? { kill, candidateOutcome: "CANDIDATE_REJECT", candidateReason: "SIZING_REJECTED", candidateGateResult: "ALLOW", candidateRiskResult: "SIZING_REJECTED" } : { kill };
     }
     const portfolio = portfolioOpenRisk({ equity: freshEq, positions: freshPoss, trades: freshLocal, instruments: d.instruments });
     const candidateRisk = candidateStopRiskPct(Number(sz.contracts) * Number(meta.ctVal) * Math.abs(f.price - stopPx), freshEq);
@@ -524,10 +561,15 @@ export async function runTick(d: ExecutorDeps, ctx: TickContext, symbol: TickSym
       portfolioOpenRiskPct: portfolio.riskPct, candidateRiskPct: candidateRisk,
     }, risk);
     if (!freshGate.allowed) {
+      if (ctx.candidate) recordOpportunityMetric(store, "SWING_15M", "RISK_REJECT", freshGate.reason);
       logSystemEvent(store, "RISK_REJECT", { engine: "SWING_15M", instId, reason: freshGate.reason, checks: freshGate.checks,
         portfolioOpenRiskPct: portfolio.riskPct, candidateRiskPct: candidateRisk });
-      return { kill };
+      return ctx.candidate
+        ? { kill, candidateOutcome: isGlobalStopReason(freshGate.reason) ? "GLOBAL_STOP" : "CANDIDATE_REJECT",
+          candidateReason: freshGate.reason, candidateGateResult: "ALLOW", candidateRiskResult: freshGate.reason }
+        : { kill };
     }
+    if (ctx.candidate) recordOpportunityMetric(store, "SWING_15M", "RISK_PASS");
       const clOpen = clId(side, "OPEN", instId);
       try {
         const placed = await submitReservedEntry(d, {
@@ -535,6 +577,7 @@ export async function runTick(d: ExecutorDeps, ctx: TickContext, symbol: TickSym
         posSide: side.toLowerCase() as "long" | "short",
         ordType: "market", sz: sz.contracts, clOrdId: clOpen,
       });
+      if (ctx.candidate) recordOpportunityMetric(store, "SWING_15M", "ORDER_SUBMITTED");
       const filled = await waitForOrderTerminal(client, instId, placed.ordId, { timeoutMs: 30_000 });
       if (filled.state !== "filled") throw new Error(`entry not filled: ${filled.state}`);
       consecutiveOrderFailures = 0;
@@ -597,14 +640,21 @@ export async function runTick(d: ExecutorDeps, ctx: TickContext, symbol: TickSym
         instId: f2.instId, fillPx: f2.fillPx, fillSz: f2.fillSz, fee: f2.fee, feeCcy: f2.feeCcy,
         side: f2.side, posSide: f2.posSide, ts: f2.ts })));
       logSystemEvent(store, "TRADE_OPEN", { tradeId, instId, side, contracts: sz.contracts, entryPx });
+      if (ctx.candidate) recordOpportunityMetric(store, "SWING_15M", "POSITION_OPENED");
       log.info({ event: "trade:opened", tradeId, instId, entryPx, contracts: sz.contracts });
       } catch (e) {
       consecutiveOrderFailures += 1;
       logSystemEvent(store, "ERROR", { place_entry_fail: e instanceof Error ? e.message : String(e), consecutive: consecutiveOrderFailures });
       log.error({ event: "trade:open_failed", error: e instanceof Error ? e.message : String(e) });
+      return ctx.candidate ? { kill, candidateOutcome: "GLOBAL_STOP", candidateReason: "EXCHANGE_ORDER_FAILURE",
+        candidateGateResult: "ALLOW", candidateRiskResult: "PASS" } : { kill };
     }
-    return { kill };
+    return ctx.candidate ? { kill, candidateOutcome: "OPENED", candidateGateResult: "ALLOW", candidateRiskResult: "PASS" } : { kill };
   });
+}
+
+export function isGlobalStopReason(reason: string): boolean {
+  return /^(KILL_SWITCH|BOT_|MAX_CONCURRENT|MAX_DAILY_LOSS|.*DRAWDOWN|PORTFOLIO_OPEN_RISK|RECONCILIATION_PENDING|STATE_UNCERTAIN|LLM_BUDGET_EXHAUSTED|EXCHANGE_)/.test(reason);
 }
 
 // Deterministic SL/TP price trigger (§25 Layer B core) — pure fn shared by

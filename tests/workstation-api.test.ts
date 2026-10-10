@@ -15,6 +15,7 @@ import type { ScanRow } from "../src/strategy/scanner.ts";
 import type { ExecutorDeps } from "../src/execution/executor.ts";
 import { DynamicWatchlistError, type WatchlistProjection } from "../src/market/dynamic-watchlist.ts";
 import { recordScanState } from "../src/market/scan-state.ts";
+import { recordOpportunityMetric } from "../src/market/opportunity-funnel.ts";
 
 const symbol = "BTC-USDT-SWAP";
 const json = <T>(response: Response): Promise<T> => response.json() as Promise<T>;
@@ -48,6 +49,21 @@ test("watchlist API reports a persisted projection and manual refresh remains sa
   assert.equal((await f.request("/api/watchlist", { method: "POST", headers: { origin: "https://external.invalid" } })).status, 403);
   assert.equal((await f.request("/api/watchlist", { method: "POST" })).status, 200);
   assert.equal(manual, 1);
+});
+
+test("opportunity funnel API exposes persisted 24h/7d engine aggregates", async t => {
+  const f = await fixture(t);
+  const at = new Date();
+  recordOpportunityMetric(f.store, "SWING_15M", "SYMBOLS_EVALUATED", "", at);
+  recordOpportunityMetric(f.store, "SWING_15M", "GATE_ALLOW", "", at);
+  recordOpportunityMetric(f.store, "SCALP_5M", "MARKET_DATA_FAILED", "", at);
+  const day = await json<{ windowHours: number; engines: Record<string, { totals: Record<string, number> }> }>(await f.request("/api/opportunity-funnel?hours=24"));
+  assert.equal(day.windowHours, 24);
+  assert.equal(day.engines.SWING_15M!.totals.SYMBOLS_EVALUATED, 1);
+  assert.equal(day.engines.SWING_15M!.totals.GATE_ALLOW, 1);
+  assert.equal(day.engines.SCALP_5M!.totals.MARKET_DATA_FAILED, 1);
+  const week = await json<{ windowHours: number }>(await f.request("/api/opportunity-funnel?hours=168"));
+  assert.equal(week.windowHours, 168);
 });
 
 test("manual watchlist failures stay non-successful and disclose preserved stale state", async t => {

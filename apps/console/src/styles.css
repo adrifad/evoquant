@@ -257,6 +257,14 @@ th.numeric, td.numeric { text-align: right; font-variant-numeric: tabular-nums; 
 .market-lower-grid { grid-template-columns: minmax(0, .9fr) minmax(0, 1.1fr); }
 .feature-groups { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px 20px; padding: 13px 16px 16px; }
 .feature-groups section { min-width: 0; }
+.opportunity-funnel-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 18px; padding: 14px 16px 16px; }
+.opportunity-funnel-engine { min-width: 0; }
+.opportunity-funnel-engine h3 { margin: 0 0 10px; color: var(--ink); font-size: 13px; font-weight: 650; }
+.opportunity-funnel-metrics { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); border-top: 1px solid var(--line); }
+.opportunity-funnel-metric { min-width: 0; display: flex; align-items: baseline; justify-content: space-between; gap: 8px; padding: 7px 9px; border-bottom: 1px solid var(--line); color: var(--muted); font-size: 12px; }
+.opportunity-funnel-metric strong, .opportunity-funnel-blocker strong { color: var(--ink); font-variant-numeric: tabular-nums; }
+.opportunity-funnel-blockers { display: grid; gap: 5px; padding-top: 10px; }
+.opportunity-funnel-blocker { display: flex; justify-content: space-between; gap: 12px; color: var(--muted); font-size: 11px; }
 .divider-label { margin: 0 0 2px; padding-bottom: 5px; border-bottom: 1px solid var(--line); color: var(--accent); font-size: 10px; font-weight: 600; }
 .regime-panel { align-self: stretch; }
 .regime-panel > .badge { margin: 16px; min-height: 28px; font-size: 11px; }
@@ -547,6 +555,8 @@ th.numeric, td.numeric { text-align: right; font-variant-numeric: tabular-nums; 
   .limit-list { padding-inline: 12px; }
   .locked-note { margin-inline: 12px; font-size: 9px; }
   .feature-groups { grid-template-columns: minmax(0, 1fr); gap: 10px; padding: 11px 12px; }
+  .opportunity-funnel-grid { grid-template-columns: minmax(0, 1fr); gap: 15px; padding: 12px; }
+  .opportunity-funnel-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .regime-panel > .badge { margin: 12px; }
   .regime-copy { margin-inline: 12px !important; }
   .regime-last { margin-inline: 12px; }

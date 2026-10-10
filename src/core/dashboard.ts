@@ -35,6 +35,7 @@ import type { ScanRow } from "../strategy/scanner.ts";
 import { getCandles, type Bar } from "../exchange/okx/market.ts";
 import { portfolioOpenRisk } from "../risk/portfolio-open-risk.ts";
 import { DynamicWatchlistError, type WatchlistProjection } from "../market/dynamic-watchlist.ts";
+import { getOpportunityFunnel, getRecentCandidateAttempts } from "../market/opportunity-funnel.ts";
 
 const log = createLogger("dashboard");
 const REPO_ROOT = path.resolve(import.meta.dirname, "../..");
@@ -274,6 +275,11 @@ export function startDashboard(cfg: DashboardConfig): DashboardServer {
     }
     if (p === "/api/scan") {
       return send(200, scannerProjection(store, cfg.getScan() as ScanRow[], cfg.getLastTick()?.at ?? null, cfg.deps().watchlist));
+    }
+    if (p === "/api/opportunity-funnel") {
+      const requested = Number(url.searchParams.get("hours") ?? 24);
+      const hours = requested === 168 ? 168 : 24;
+      return send(200, { ...getOpportunityFunnel(store, hours), recentAttempts: getRecentCandidateAttempts(store, 100) });
     }
     if (p === "/api/market") {
       const tick = cfg.getLastTick();

@@ -8,6 +8,7 @@ import { InstrumentChart } from "../components/InstrumentChart";
 export function MarketsPage({ status }: { status: ApiState<Row> }) {
   const market = useApi<unknown>("/api/market");
   const watchlist = useApi<unknown>("/api/watchlist", 60_000);
+  const funnel = useApi<unknown>("/api/opportunity-funnel?hours=24", 60_000);
   const [selected, setSelected] = useState("");
   const d = asRow(market.data);
   const snapshot = asRow(d?.snapshot);
@@ -54,6 +55,18 @@ export function MarketsPage({ status }: { status: ApiState<Row> }) {
       </DataState>
       {asText(wl?.status) === "DISABLED" && historicalDynamic.length ? <p className="muted-small">Historical selection: {historicalDynamic.map(row => asText(row.symbol)).join(", ")}</p> : null}
       <p className="muted-small">Core symbols are always monitored. A selected dynamic market still must pass Strategy Core, Gate, Risk, and Execution; trending is not an entry signal.</p>
+    </Panel>
+    <Panel title="Opportunity funnel" subtitle="Persisted scanner and entry outcomes · rolling 24 hours">
+      <DataState loading={funnel.loading} error={funnel.error} empty={!hasFunnelData(funnel.data)} hasData={funnel.data !== null}
+        emptyTitle="Opportunity telemetry is accumulating" emptyDetail="Counts appear after Swing and Scalp complete their next market evaluations.">
+        <div className="opportunity-funnel-grid">
+          <OpportunityFunnelEngine title="Swing 15m" engine={asRow(asRow(funnel.data)?.engines)?.SWING_15M} />
+          <OpportunityFunnelEngine title="Scalp 5m" engine={asRow(asRow(funnel.data)?.engines)?.SCALP_5M} />
+        </div>
+        {Number(asRow(funnel.data)?.confidenceBelowMinimum && asRow(asRow(funnel.data)?.confidenceBelowMinimum)?.count) > 0
+          ? <p className="muted-small">Gate-allowed candidates later rejected solely by calibrated minimum confidence: {formatNumber(asRow(asRow(funnel.data)?.confidenceBelowMinimum)?.count, 0)} ({formatNumber(asRow(asRow(funnel.data)?.confidenceBelowMinimum)?.pct, 1)}% of Gate allows).</p>
+          : null}
+      </DataState>
     </Panel>
     <Panel title="Market scanner" subtitle="Select an instrument; setup, context veto and risk retain separate states">
       <DataState loading={market.loading} error={market.error} empty={!scanner.length} hasData={market.data !== null} emptyTitle="Scanner is waiting for a confirmed market cycle">
@@ -112,6 +125,37 @@ export function MarketsPage({ status }: { status: ApiState<Row> }) {
       </div>
     </DataState>
   </div>;
+}
+
+function hasFunnelData(value: unknown): boolean {
+  const engines = asRow(asRow(value)?.engines);
+  return ["SWING_15M", "SCALP_5M"].some(key => Object.keys(asRow(asRow(engines?.[key])?.totals) ?? {}).length > 0);
+}
+
+function OpportunityFunnelEngine({ title, engine }: { title: string; engine: unknown }) {
+  const projected = asRow(engine);
+  const totals = asRow(projected?.totals) ?? {};
+  const metricLabels: Array<[string, string]> = [
+    ["SYMBOLS_EVALUATED", "Symbols evaluated"], ["MARKET_DATA_FAILED", "Market data failed"],
+    ["INSUFFICIENT_DATA", "Insufficient data"], ["NO_SETUP", "No setup"],
+    ["CANDIDATE_GENERATED", "Candidates"], ["STANCE_REJECT", "Stance rejected"],
+    ["GATE_ALLOW", "Gate allow"], ["GATE_DENY", "Gate deny"], ["GATE_ERROR", "Gate error"],
+    ["RISK_PASS", "Risk pass"], ["RISK_REJECT", "Risk reject"],
+    ["ORDER_SUBMITTED", "Order submitted"], ["POSITION_OPENED", "Positions opened"],
+  ];
+  const present = metricLabels.filter(([key]) => typeof totals[key] === "number");
+  const blockers = asRows(projected?.blockers).slice(0, 5);
+  return <section className="opportunity-funnel-engine">
+    <h3>{title}</h3>
+    <div className="opportunity-funnel-metrics">
+      {present.map(([key, label]) => <div className="opportunity-funnel-metric" key={key}><span>{label}</span><strong>{formatNumber(totals[key], 0)}</strong></div>)}
+    </div>
+    {blockers.length ? <div className="opportunity-funnel-blockers"><span className="muted-small">Top deterministic blockers</span>
+      {blockers.map((row, index) => <div className="opportunity-funnel-blocker" key={`${asText(row.strategy)}:${asText(row.condition)}:${index}`}>
+        <span>{asText(row.strategy)} · {asText(row.condition)}</span><strong>{formatNumber(row.count, 0)}</strong>
+      </div>)}
+    </div> : <p className="muted-small">No blocker counts persisted in this window.</p>}
+  </section>;
 }
 
 function ScanActivityDetails({ engine, activity, staleAfterMs }: { engine: string; activity: Row | null; staleAfterMs: number }) {

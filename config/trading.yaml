@@ -76,6 +76,7 @@ strategy_core:
     - TREND_FOLLOWING
     - BREAKOUT
     - MEAN_REVERSION
+  max_candidate_attempts_per_cycle: 3
 
 validation:
   baseline_mode: false

@@ -41,6 +41,30 @@ CREATE TABLE IF NOT EXISTS market_scan_state (
   CHECK((engine='SWING_15M' AND result IN ('CANDIDATE','NO_SETUP','FETCH_FAILED','SKIPPED'))
     OR (engine='SCALP_5M' AND result IN ('SIGNAL','NO_SETUP','FETCH_FAILED','SKIPPED')))
 );
+CREATE TABLE IF NOT EXISTS opportunity_funnel_hourly (
+  bucket_start TEXT NOT NULL,
+  engine TEXT NOT NULL CHECK(engine IN ('SWING_15M','SCALP_5M')),
+  metric TEXT NOT NULL,
+  dimension TEXT NOT NULL DEFAULT '',
+  count INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY(bucket_start,engine,metric,dimension)
+);
+CREATE INDEX IF NOT EXISTS idx_opportunity_funnel_bucket ON opportunity_funnel_hourly(bucket_start,engine);
+CREATE TABLE IF NOT EXISTS opportunity_candidate_attempts (
+  cycle_id TEXT NOT NULL,
+  engine TEXT NOT NULL CHECK(engine IN ('SWING_15M','SCALP_5M')),
+  candidate_rank INTEGER NOT NULL,
+  instrument TEXT NOT NULL,
+  strategy TEXT NOT NULL,
+  setup_score REAL NOT NULL,
+  gate_result TEXT,
+  risk_result TEXT,
+  final_result TEXT NOT NULL,
+  reason TEXT,
+  created_at TEXT NOT NULL,
+  PRIMARY KEY(cycle_id,engine,candidate_rank)
+);
+CREATE INDEX IF NOT EXISTS idx_opportunity_attempts_created ON opportunity_candidate_attempts(created_at DESC);
 CREATE TABLE IF NOT EXISTS trades (
   trade_id TEXT PRIMARY KEY,
   engine TEXT NOT NULL DEFAULT 'SWING_15M', -- SWING_15M | SCALP_5M; legacy rows backfilled below

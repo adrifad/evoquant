@@ -10,6 +10,7 @@ import { buildFeatures, type FeatureSnapshot } from "../market/features.ts";
 import { classifyRegime, type Regime } from "../market/regime.ts";
 import { loadStrategies, type StrategyDef } from "../strategy/library.ts";
 import { scanInstruments, scanCoreV2, pickEntry, type ScanRow } from "../strategy/scanner.ts";
+import { attemptRankedCandidates } from "../strategy/candidate-queue.ts";
 import { type TradeCandidate, parseStrategyV2Params, type StrategyV2Id, type StrategyV2Params } from "../strategy/core-v2.ts";
 import { ensureV2Registry, getV2ChampionParams, getV2ChampionVersions, getV2Champions } from "../strategy/v2-registry.ts";
 import { startupSafetySequence, runTick, emergencyStop, getLastKillReason, persistCandles, priceTrigger } from "../execution/executor.ts";
@@ -44,6 +45,7 @@ import { createLogger } from "./logger.ts";
 import { startDashboard } from "./dashboard.ts";
 import { CORE_WATCHLIST, DynamicWatchlistService } from "../market/dynamic-watchlist.ts";
 import { recordScanState, recordSwingScanResults } from "../market/scan-state.ts";
+import { recordCandidateAttempt, recordOpportunityMetric, pruneOpportunityTelemetry } from "../market/opportunity-funnel.ts";
 import YAML from "yaml";
 import { readFileSync } from "node:fs";
 import path from "node:path";
@@ -224,10 +226,11 @@ async function main(): Promise<void> {
           snaps.push({ instrument: sym, features: feats, regime: classifyRegime(feats) });
         } catch (e) {
           log.warn({ event: "symbol_fetch_failed", instId: sym, error: e instanceof Error ? e.message : String(e) });
-          if (entrySymbols.has(sym)) recordScanState(store, {
-            engine: "SWING_15M", instrument: sym, scannedAt: new Date().toISOString(),
-            result: "FETCH_FAILED", reason: "market_data_fetch_failed",
-          });
+          if (entrySymbols.has(sym)) {
+            recordScanState(store, { engine: "SWING_15M", instrument: sym, scannedAt: new Date().toISOString(),
+              result: "FETCH_FAILED", reason: "market_data_fetch_failed" });
+            recordOpportunityMetric(store, "SWING_15M", "MARKET_DATA_FAILED");
+          }
         }
       }
       const anchorSnap = snaps.find((s) => s.instrument === trading.instrument.id) ?? snaps[0];
@@ -241,6 +244,22 @@ async function main(): Promise<void> {
         : scanInstruments(entrySnaps, trading.strategies_enabled
           ? strategies.filter((strategy) => trading.strategies_enabled!.includes(`${strategy.name}_V${strategy.version}`))
           : strategies, getWeights(store, "SWING_15M", { strategyCoreVersion: 1 }));
+      for (const row of rows) {
+        recordOpportunityMetric(store, "SWING_15M", "SYMBOLS_EVALUATED");
+        const allConditions = row.conditions?.flatMap(evaluation => evaluation.conditions) ?? [];
+        if (!row.conditions && !entrySnaps.find(snapshot => snapshot.instrument === row.instrument)?.features.sufficientData) {
+          recordOpportunityMetric(store, "SWING_15M", "INSUFFICIENT_DATA");
+        }
+        for (const evaluation of row.conditions ?? []) {
+          for (const failed of evaluation.conditions.filter(condition => !condition.passed)) {
+            recordOpportunityMetric(store, "SWING_15M", "HARD_CONDITION_FAILED", `${evaluation.strategy}:${failed.name}`);
+          }
+        }
+        if (row.candidate) recordOpportunityMetric(store, "SWING_15M", "CANDIDATE_GENERATED");
+        else if (!allConditions.some(condition => condition.name === "sufficient_data" && !condition.passed)) {
+          recordOpportunityMetric(store, "SWING_15M", "NO_SETUP");
+        } else recordOpportunityMetric(store, "SWING_15M", "INSUFFICIENT_DATA");
+      }
       recordSwingScanResults(store, rows, new Map(entrySnaps.map((snap) => [snap.instrument, snap.features.ts])), undefined, trading.timeframe);
       lastScan = rows;
       for (const row of rows) {
@@ -261,19 +280,54 @@ async function main(): Promise<void> {
         if (snap && meta) { lastKill = (await runTick(deps, ctxFor(sym, snap.features, snap.regime, strategies), { instId: sym, meta })).kill ?? lastKill; }
       }
       // 4) entry hunt continues while slots remain (§23 max_concurrent, 1/symbol)
-      const entryCandidate = pickEntry(rows.filter((rw) => !openSyms.includes(rw.instrument)));
-      if (entryCandidate) logSystemEvent(store, "CANDIDATE_SELECTED", {
-        engine: "SWING_15M", instrument: entryCandidate.instrument, strategy: entryCandidate.strategy,
-        score: entryCandidate.candidate?.setupScore ?? Math.abs(entryCandidate.score),
-      });
+      const occupiedSymbols = new Set(openSyms);
       if (openSyms.length < risk.hard_limits.max_concurrent_positions) {
-        const target = entryCandidate ? snaps.find((s) => s.instrument === entryCandidate.instrument) : (openSyms.length === 0 ? anchorSnap : null);
-        if (target && instruments[target.instrument]) {
-          const ctx = ctxFor(target.instrument, target.features, target.regime, strategies, entryCandidate?.candidate ?? undefined);
-          if (!entryCandidate && openSyms.length === 0) ctx.decideFn = async (): Promise<Decision> => holdBecause("scanner: no tradable setup on watchlist (LLM skipped to save budget)");
-          lastKill = (await runTick(deps, ctx, { instId: target.instrument, meta: instruments[target.instrument]! })).kill ?? lastKill;
+        if (strategyCoreVersion === 2) {
+          const cycleId = `SWING_15M:${Math.max(0, ...snaps.map(snapshot => snapshot.features.ts))}`;
+          const queue = await attemptRankedCandidates(rows, {
+            entrySymbols, occupiedSymbols, metadataSymbols: new Set(Object.entries(instruments)
+              .filter(([symbol, meta]) => meta.instId === symbol && Number(meta.ctVal) > 0 && Number(meta.lotSz) > 0 && Number(meta.tickSz) > 0)
+              .map(([symbol]) => symbol)),
+            maxAttempts: trading.strategy_core.max_candidate_attempts_per_cycle,
+          }, async (candidate) => {
+            const target = snaps.find(snapshot => snapshot.instrument === candidate.instrument);
+            const meta = instruments[candidate.instrument];
+            if (!target || !meta || meta.instId !== candidate.instrument || !(Number(meta.ctVal) > 0)) {
+              return { disposition: "CANDIDATE_REJECT" as const, reason: "EXACT_INSTRUMENT_METADATA_UNAVAILABLE" };
+            }
+            const result = await runTick(deps, ctxFor(target.instrument, target.features, target.regime, strategies, candidate),
+              { instId: target.instrument, meta });
+            const disposition = result.candidateOutcome === "OPENED" ? "OPENED"
+              : result.candidateOutcome === "GATE_DENY" ? "GATE_DENY"
+              : result.candidateOutcome === "GATE_ERROR" ? "GATE_ERROR"
+              : result.candidateOutcome === "GLOBAL_STOP" ? "GLOBAL_STOP"
+              : "CANDIDATE_REJECT";
+            return { disposition, ...(result.candidateReason ? { reason: result.candidateReason } : {}),
+              ...(result.candidateGateResult ? { gateResult: result.candidateGateResult } : {}),
+              ...(result.candidateRiskResult ? { riskResult: result.candidateRiskResult } : {}) };
+          });
+          for (const item of queue.attempted) {
+            lastKill = getLastKillReason() ?? lastKill;
+            recordCandidateAttempt(store, {
+              cycleId, engine: "SWING_15M", rank: item.rank, instrument: item.candidate.instrument,
+              strategy: item.candidate.strategy, setupScore: item.candidate.setupScore,
+              gateResult: item.result.gateResult ?? null,
+              riskResult: item.result.riskResult ?? null,
+              finalResult: item.result.disposition, ...(item.result.reason ? { reason: item.result.reason } : {}),
+            });
+          }
+        } else {
+          const entryCandidate = pickEntry(rows.filter(row => !occupiedSymbols.has(row.instrument)));
+          const target = entryCandidate ? snaps.find(snapshot => snapshot.instrument === entryCandidate.instrument)
+            : (openSyms.length === 0 ? anchorSnap : null);
+          if (target && instruments[target.instrument]) {
+            const ctx = ctxFor(target.instrument, target.features, target.regime, strategies, entryCandidate?.candidate ?? undefined);
+            if (!entryCandidate && openSyms.length === 0) ctx.decideFn = async (): Promise<Decision> => holdBecause("scanner: no tradable setup on watchlist (LLM skipped to save budget)");
+            lastKill = (await runTick(deps, ctx, { instId: target.instrument, meta: instruments[target.instrument]! })).kill ?? lastKill;
+          }
         }
       }
+      pruneOpportunityTelemetry(store);
       // Resolve delayed exchange accounting and confirmed-candle coverage before
       // an LLM ever sees the trade as learning evidence.
       await finalizePendingEvidence({ client, store, instruments, trading });

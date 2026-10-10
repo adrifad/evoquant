@@ -42,6 +42,8 @@ import type { Position } from "../exchange/okx/types.ts";
 import { isTradeOwnedBy } from "../memory/engines.ts";
 import { candidateStopRiskPct, portfolioOpenRisk } from "../risk/portfolio-open-risk.ts";
 import { recordScanState, recordScalpScanResult } from "../market/scan-state.ts";
+import { recordOpportunityMetric } from "../market/opportunity-funnel.ts";
+import { scanSymbolsIsolated } from "../market/isolated-scan.ts";
 
 const log = createLogger("scalp");
 const TF_TAG = "scalp";
@@ -116,32 +118,41 @@ export class ScalpRunner {
   // ---------- shared context fetch ----------
 
   private async symbolContexts(recordScanFailures = false): Promise<Array<{ instrument: string; features: FeatureSnapshot; regime: Regime; closes1m: import("../exchange/okx/types.ts").Candle[]; last5m: { close: number } | null }>> {
-    const out = [];
-    for (const sym of this.d.entryUniverse?.() ?? this.d.trading.instruments?.watchlist ?? []) {
+    const symbols = this.d.entryUniverse?.() ?? this.d.trading.instruments?.watchlist ?? [];
+    const fetchableSymbols = symbols.filter(sym => Boolean(this.d.instruments[sym]));
+    const scan = await scanSymbolsIsolated(symbols, async sym => {
       if (!this.d.instruments[sym]) {
         if (recordScanFailures) recordScanState(this.d.store, { engine: "SCALP_5M", instrument: sym,
           scannedAt: new Date().toISOString(), result: "SKIPPED", reason: "instrument_metadata_unavailable" });
-        continue;
+        return null;
       }
-      try {
-        const c15 = (await getCandles(this.d.client, sym, "15m", 80)).filter((c) => c.confirm === "1").sort((a, b) => a.ts - b.ts);
-        const c5 = (await getCandles(this.d.client, sym, this.d.cfg.signal_tf, 8)).filter((c) => c.confirm === "1").sort((a, b) => a.ts - b.ts);
-        const c1 = (await getCandles(this.d.client, sym, this.d.cfg.base_tf, 140)).filter((c) => c.confirm === "1").sort((a, b) => a.ts - b.ts);
-        if (c15.length < 60 || c1.length < 60) {
-          if (recordScanFailures) recordScanState(this.d.store, { engine: "SCALP_5M", instrument: sym,
-            scannedAt: new Date().toISOString(), result: "SKIPPED", reason: "insufficient_confirmed_candles" });
-          continue;
-        }
-        const features = buildFeatures(sym, [...c15].reverse());
-        out.push({ instrument: sym, features, regime: classifyRegime(features),
-          closes1m: c1, last5m: c5.length >= 2 ? { close: c5[c5.length - 2]!.c } : null });
-      } catch (error) {
+      const c15 = (await getCandles(this.d.client, sym, "15m", 80)).filter((c) => c.confirm === "1").sort((a, b) => a.ts - b.ts);
+      const c5 = (await getCandles(this.d.client, sym, this.d.cfg.signal_tf, 8)).filter((c) => c.confirm === "1").sort((a, b) => a.ts - b.ts);
+      const c1 = (await getCandles(this.d.client, sym, this.d.cfg.base_tf, 140)).filter((c) => c.confirm === "1").sort((a, b) => a.ts - b.ts);
+      if (c15.length < 60 || c1.length < 60) {
+        if (recordScanFailures) recordOpportunityMetric(this.d.store, "SCALP_5M", "INSUFFICIENT_DATA");
         if (recordScanFailures) recordScanState(this.d.store, { engine: "SCALP_5M", instrument: sym,
-          scannedAt: new Date().toISOString(), result: "FETCH_FAILED", reason: "market_data_fetch_failed" });
-        throw error;
+          scannedAt: new Date().toISOString(), result: "SKIPPED", reason: "insufficient_confirmed_candles" });
+        return null;
       }
+      const features = buildFeatures(sym, [...c15].reverse());
+      return { instrument: sym, features, regime: classifyRegime(features),
+        closes1m: c1, last5m: c5.length >= 2 ? { close: c5[c5.length - 2]!.c } : null };
+    }, (sym, error) => {
+      if (recordScanFailures) recordScanState(this.d.store, { engine: "SCALP_5M", instrument: sym,
+        scannedAt: new Date().toISOString(), result: "FETCH_FAILED", reason: "market_data_fetch_failed" });
+      if (recordScanFailures) {
+        recordOpportunityMetric(this.d.store, "SCALP_5M", "MARKET_DATA_FAILED");
+        log.warn({ event: "scalp_symbol_fetch_failed", instrument: sym,
+          error: error instanceof Error ? error.message : String(error) });
+      }
+    });
+    // A failure for every fetchable symbol is the only available strong signal
+    // of a shared feed outage. Isolated failures do not cancel the cycle.
+    if (recordScanFailures && fetchableSymbols.length > 0 && scan.failures.length === fetchableSymbols.length) {
+      throw new Error("SCALP_MARKET_DATA_GLOBAL_FAILURE");
     }
-    return out;
+    return scan.values;
   }
 
   // ---------- main 5m tick ----------
@@ -153,7 +164,7 @@ export class ScalpRunner {
     try {
       const nowS = Math.floor(Date.now() / 1000);
       await this.ensureStance(nowS);
-      if (this.stance === "DEFENSIVE") { log.info({ event: "scalp_skip_defensive" }); return; }
+      if (this.stance === "DEFENSIVE") { recordOpportunityMetric(this.d.store, "SCALP_5M", "STANCE_REJECT"); log.info({ event: "scalp_skip_defensive" }); return; }
 
       const dayStart = dayStartIso();
       const today = (this.d.store.db.prepare(
@@ -167,6 +178,7 @@ export class ScalpRunner {
       const snaps = await this.symbolContexts(true);
       const signals: ScalpSignal[] = [];
       for (const s of snaps) {
+        recordOpportunityMetric(this.d.store, "SCALP_5M", "SYMBOLS_EVALUATED");
         const r = evaluateSignal(
           { instrument: s.instrument, closes1m: s.closes1m, last5m: s.last5m, regime: s.regime, features: s.features },
           this.d.cfg, nowS, this.lastExit);
@@ -178,7 +190,13 @@ export class ScalpRunner {
           candleTimeframe: this.d.cfg.base_tf,
           ...(signal ? { signal: { direction: signal.direction, score: signal.score } } : { veto: r.veto ?? "no_setup" }),
         });
-        if (r.signal) signals.push(r.signal);
+        if (r.signal) {
+          recordOpportunityMetric(this.d.store, "SCALP_5M", "CANDIDATE_GENERATED");
+          signals.push(r.signal);
+        } else {
+          recordOpportunityMetric(this.d.store, "SCALP_5M", "NO_SETUP");
+          recordOpportunityMetric(this.d.store, "SCALP_5M", "HARD_CONDITION_FAILED", scalpBlocker(r.veto));
+        }
       }
       signals.sort((a, b) => b.score - a.score);
 
@@ -194,7 +212,16 @@ export class ScalpRunner {
         const g = await gateSignal(this.d.llm, sig, this.d.cfg, {
           stance: this.stance, regime: snap.regime, atrPct15m: snap.features.atrPct, spreadOk: true,
         });
-        if (!g.allow) { log.info({ event: "scalp_llm_deny", inst: sig.instrument, reason: g.reason.slice(0, 120) }); continue; }
+        if (!g.allow) {
+          const error = g.reason.includes("fail-closed");
+          const latestRun = error ? this.d.store.db.prepare(`SELECT status FROM llm_runs WHERE role='scalp' AND context_ref='scalp_candidate_gate'
+            ORDER BY id DESC LIMIT 1`).get() as { status?: string } | undefined : undefined;
+          recordOpportunityMetric(this.d.store, "SCALP_5M", error ? "GATE_ERROR" : "GATE_DENY", latestRun?.status ?? "");
+          if (latestRun?.status === "BUDGET_EXHAUSTED") recordOpportunityMetric(this.d.store, "SCALP_5M", "BUDGET_EXHAUSTED");
+          log.info({ event: "scalp_llm_deny", inst: sig.instrument, reason: g.reason.slice(0, 120) });
+          continue;
+        }
+        recordOpportunityMetric(this.d.store, "SCALP_5M", "GATE_ALLOW");
         log.info({ event: "scalp_llm_allow", inst: sig.instrument, conf: g.confidence });
         await this.openScalp(sig, snaps.find((s) => s.instrument === sig.instrument)!.features);
         if (signals.length > 0) break; // ≤1 new scalp per candle
@@ -244,6 +271,7 @@ export class ScalpRunner {
           localOpen.some((t) => String(t.instrument) === sig.instrument),
       }, risk);
       if (!gate.allowed) {
+        recordOpportunityMetric(store, "SCALP_5M", "RISK_REJECT", gate.reason);
         log.info({ event: "scalp_global_risk_reject", inst: sig.instrument, reason: gate.reason });
         return;
       }
@@ -255,6 +283,7 @@ export class ScalpRunner {
           leverage: selectedEntryLeverage(this.d.trading, risk), instrument: meta }, risk,
         { mode: "percent_of_equity", position_pct: cfg.position_pct });
       } catch (e) {
+        recordOpportunityMetric(store, "SCALP_5M", "RISK_REJECT", "SIZING_REJECTED");
         log.info({ event: "scalp_sizing_reject", inst: sig.instrument, error: e instanceof Error ? e.message.slice(0, 80) : "" }); return;
       }
       const settingsAtPreparation = entrySettingsFingerprint(this.d.trading, risk);
@@ -268,6 +297,7 @@ export class ScalpRunner {
       const finalBase = baseline(store, finalEquity);
       const finalLocal = getOpenTrades(store) as Array<Record<string, unknown>>;
       if (finalLocal.some((trade) => String(trade.status) === "RECONCILIATION_PENDING")) {
+        recordOpportunityMetric(store, "SCALP_5M", "RISK_REJECT", "RECONCILIATION_PENDING");
         log.info({ event: "scalp_global_risk_reject", inst: sig.instrument, reason: "RECONCILIATION_PENDING", stage: "pre_order" });
         logSystemEvent(store, "RISK_REJECT", { engine: "SCALP_5M", instId: sig.instrument, reason: "RECONCILIATION_PENDING" });
         return;
@@ -304,16 +334,19 @@ export class ScalpRunner {
         portfolioOpenRiskPct: portfolio.riskPct, candidateRiskPct: candidateRisk,
       }, risk);
       if (!finalGate.allowed) {
+        recordOpportunityMetric(store, "SCALP_5M", "RISK_REJECT", finalGate.reason);
         log.info({ event: "scalp_global_risk_reject", inst: sig.instrument, reason: finalGate.reason, stage: "pre_order" });
         logSystemEvent(store, "RISK_REJECT", { engine: "SCALP_5M", instId: sig.instrument, reason: finalGate.reason,
           checks: finalGate.checks, portfolioOpenRiskPct: portfolio.riskPct, candidateRiskPct: candidateRisk });
         return;
       }
+      recordOpportunityMetric(store, "SCALP_5M", "RISK_PASS");
       const clOpen = clId(side, "OPEN", sig.instrument);
       const placed = await submitReservedEntry(this.d, {
         instId: sig.instrument, tdMode: "isolated", side: side === "LONG" ? "buy" : "sell",
         posSide: side.toLowerCase() as "long" | "short", ordType: "market", sz: sz.contracts, clOrdId: clOpen,
       });
+      recordOpportunityMetric(store, "SCALP_5M", "ORDER_SUBMITTED");
       this.consecutiveOrderFailures = 0;
       const filled = await waitForOrderTerminal(client, sig.instrument, placed.ordId, { timeoutMs: 20_000 });
       if (filled.state !== "filled") throw new Error(`scalp entry not filled: ${filled.state}`);
@@ -354,6 +387,7 @@ export class ScalpRunner {
       const fills = await getFills(client, sig.instrument, placed.ordId).catch(() => []);
       logSystemEvent(store, "TRADE_OPEN", { tradeId, instId: sig.instrument, side, scalpr: true,
         notional: Math.round(sz.notionalUsdt * 100) / 100 });
+      recordOpportunityMetric(store, "SCALP_5M", "POSITION_OPENED");
       log.info({ event: "scalp_open", tradeId, inst: sig.instrument, side, ct: sz.contracts,
         notional: Math.round(sz.notionalUsdt * 100) / 100, fills: fills.length });
     } catch (e) {
@@ -403,4 +437,10 @@ export class ScalpRunner {
     return { client: this.d.client, trading: this.d.trading, risk: this.d.risk, store: this.d.store,
       instruments: this.d.instruments, watchlist: Object.keys(this.d.instruments) };
   }
+}
+
+function scalpBlocker(reason: string | undefined): string {
+  if (!reason) return "no_setup";
+  const match = /^(regime|cooldown|bad-data|warmup|atr15|no-setup|score|stop-degenerate|fee-guard)/.exec(reason);
+  return match?.[1] ?? "other";
 }
