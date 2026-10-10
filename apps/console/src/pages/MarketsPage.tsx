@@ -67,6 +67,10 @@ export function MarketsPage({ status }: { status: ApiState<Row> }) {
           { key: "gate", label: "Gate", render: r => asText(r.gate) },
           { key: "risk", label: "Risk", render: r => asText(r.risk) },
           { key: "state", label: "Candidate state", render: r => <StatusBadge value={r.state}/> },
+          { key: "scanned", label: "Last scanned", render: r => {
+            const activity = asRow(asRow(r.scanActivity)?.swing);
+            return activity?.lastScanAt ? formatTimestamp(activity.lastScanAt) : "Never scanned";
+          } },
           { key: "signal", label: "Last signal", render: r => formatTimestamp(r.lastSignal) },
         ]}/>
       </DataState>
@@ -76,6 +80,8 @@ export function MarketsPage({ status }: { status: ApiState<Row> }) {
     </Panel>
     {selectedRow ? <Panel title={`${instrument} decision trace`} subtitle="Failures are deterministic setup conditions; unselected candidates have no Gate or risk result">
       <div className="trace-list"><div className="trace-step"><strong>Setup</strong><span>{selectedRow.tradable ? `PASS · ${asText(asRow(selectedRow.candidate)?.side)} · ${asText(selectedRow.strategy)}` : asText(selectedRow.state)}</span></div><div className="trace-step"><strong>Gate</strong><span>{asText(selectedRow.gate)}</span></div><div className="trace-step"><strong>Risk</strong><span>{asText(selectedRow.risk)}</span></div><div className="trace-step"><strong>Execution</strong><span>{selectedRow.position ? "OPEN POSITION" : "No open position recorded"}</span></div>
+      <ScanActivityDetails engine="Swing scanner" activity={asRow(asRow(selectedRow.scanActivity)?.swing)} staleAfterMs={35 * 60_000}/>
+      <ScanActivityDetails engine="Scalp scanner" activity={asRow(asRow(selectedRow.scanActivity)?.scalp)} staleAfterMs={12 * 60_000}/>
       {Array.isArray(selectedRow.reason) ? selectedRow.reason.slice(0,12).map((r,i) => <div className="trace-step" key={i}><strong>{i === 0 ? "Reasons" : ""}</strong><span>{String(r)}</span></div>) : null}</div>
     </Panel> : null}
     <DataState loading={market.loading} error={market.error} empty={!d} hasData={market.data !== null} emptyTitle="Market snapshot is not available" emptyDetail="The feature snapshot appears after the bot completes a market evaluation.">
@@ -106,4 +112,18 @@ export function MarketsPage({ status }: { status: ApiState<Row> }) {
       </div>
     </DataState>
   </div>;
+}
+
+function ScanActivityDetails({ engine, activity, staleAfterMs }: { engine: string; activity: Row | null; staleAfterMs: number }) {
+  if (!activity) return <div className="trace-step"><strong>{engine}</strong><span>Never scanned</span></div>;
+  const lastSuccess = asText(activity.lastSuccessfulScanAt, "");
+  const ageMs = lastSuccess ? Date.now() - new Date(lastSuccess).getTime() : null;
+  const stale = ageMs !== null && Number.isFinite(ageMs) && ageMs > staleAfterMs;
+  return <>
+    <div className="trace-step"><strong>{engine}</strong><span>Last scanned {formatTimestamp(activity.lastScanAt)}</span></div>
+    <div className="trace-step"><strong>Last successful</strong><span>{lastSuccess ? formatTimestamp(lastSuccess) : "None yet"}{stale ? " · STALE" : lastSuccess ? " · FRESH" : ""}</span></div>
+    <div className="trace-step"><strong>Confirmed {asText(activity.candleTimeframe, "market")} candle</strong><span>{formatTimestamp(activity.candleTs)}</span></div>
+    <div className="trace-step"><strong>Scan result</strong><span>{asText(activity.result)}</span></div>
+    {activity.reason ? <div className="trace-step"><strong>Scan reason</strong><span>{asText(activity.reason)}</span></div> : null}
+  </>;
 }

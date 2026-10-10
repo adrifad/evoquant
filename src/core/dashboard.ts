@@ -158,7 +158,7 @@ export function startDashboard(cfg: DashboardConfig): DashboardServer {
         criticalEvents: store.db.prepare("SELECT ts,kind,payload FROM system_events WHERE kind IN ('ERROR','RISK_EVENT','LLM_TIMEOUT','LLM_AUTH_FAILURE','STATE') ORDER BY id DESC LIMIT 4").all(),
         reconciliationWarnings: store.db.prepare("SELECT trade_id,instrument,side,entry_ts,exit_reason FROM trades WHERE status='RECONCILIATION_PENDING' ORDER BY entry_ts DESC").all(),
         aiRoles: cfg.llmRoles?.settings() ?? [],
-        scan: scannerProjection(store, cfg.getScan() as ScanRow[], cfg.getLastTick()?.at ?? null),
+        scan: scannerProjection(store, cfg.getScan() as ScanRow[], cfg.getLastTick()?.at ?? null, cfg.deps().watchlist),
         evolution: { enabled: cfg.evolution.enabled ?? null, active: listV2Versions(store).filter(v => v.status === "CHALLENGER" || v.status === "SHADOW").map(v => ({ strategy: v.strategy, version: v.version, status: v.status })) },
         latestDecision: store.db.prepare("SELECT * FROM decisions ORDER BY ts DESC LIMIT 1").get() ?? null, // §66
         latestExecution: store.db.prepare("SELECT ts,kind,payload FROM system_events WHERE kind IN ('TRADE_OPEN','TRADE_CLOSED') ORDER BY id DESC LIMIT 1").get() ?? null,
@@ -273,7 +273,7 @@ export function startDashboard(cfg: DashboardConfig): DashboardServer {
       return send(200, rows.reverse()); // chronological for the chart
     }
     if (p === "/api/scan") {
-      return send(200, scannerProjection(store, cfg.getScan() as ScanRow[], cfg.getLastTick()?.at ?? null));
+      return send(200, scannerProjection(store, cfg.getScan() as ScanRow[], cfg.getLastTick()?.at ?? null, cfg.deps().watchlist));
     }
     if (p === "/api/market") {
       const tick = cfg.getLastTick();
@@ -283,7 +283,7 @@ export function startDashboard(cfg: DashboardConfig): DashboardServer {
         : undefined;
       const weights = getWeights(store, "SWING_15M", { strategyCoreVersion: cfg.strategyCoreVersion ?? 1 });
       return send(200, { snapshot: tick?.features ?? null, regime: tick?.regime ?? "UNKNOWN", updatedAt: tick?.at ?? null,
-        weights, ...(weightsByFamily ? { weightsByFamily } : {}), scan: scannerProjection(store, cfg.getScan() as ScanRow[], cfg.getLastTick()?.at ?? null) });
+        weights, ...(weightsByFamily ? { weightsByFamily } : {}), scan: scannerProjection(store, cfg.getScan() as ScanRow[], cfg.getLastTick()?.at ?? null, cfg.deps().watchlist) });
     }
     if (p === "/api/watchlist") {
       if (!cfg.dynamicWatchlist) return send(503, { error: "Dynamic watchlist unavailable." });

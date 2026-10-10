@@ -43,6 +43,7 @@ import { RoleLlmService } from "./llm-role-service.ts";
 import { createLogger } from "./logger.ts";
 import { startDashboard } from "./dashboard.ts";
 import { CORE_WATCHLIST, DynamicWatchlistService } from "../market/dynamic-watchlist.ts";
+import { recordScanState, recordSwingScanResults } from "../market/scan-state.ts";
 import YAML from "yaml";
 import { readFileSync } from "node:fs";
 import path from "node:path";
@@ -206,6 +207,7 @@ async function main(): Promise<void> {
       };
       // 1) refresh all watchlist candles + snapshots (§17 pipeline)
       const snaps: Array<{ instrument: string; features: FeatureSnapshot; regime: Regime }> = [];
+      const entrySymbols = new Set(dynamicWatchlist.currentEntryUniverse());
       for (const sym of watchlist) {
         try {
           const cs = (await getCandles(client, sym, trading.timeframe, 300)).filter((c) => c.confirm === "1").sort((a, b) => a.ts - b.ts);
@@ -222,6 +224,10 @@ async function main(): Promise<void> {
           snaps.push({ instrument: sym, features: feats, regime: classifyRegime(feats) });
         } catch (e) {
           log.warn({ event: "symbol_fetch_failed", instId: sym, error: e instanceof Error ? e.message : String(e) });
+          if (entrySymbols.has(sym)) recordScanState(store, {
+            engine: "SWING_15M", instrument: sym, scannedAt: new Date().toISOString(),
+            result: "FETCH_FAILED", reason: "market_data_fetch_failed",
+          });
         }
       }
       const anchorSnap = snaps.find((s) => s.instrument === trading.instrument.id) ?? snaps[0];
@@ -229,21 +235,18 @@ async function main(): Promise<void> {
       for (const snap of snaps) persistMarketSnapshot(store, snapshotTs, snap.instrument, snap.features);
       if (anchorSnap) lastTick = { features: anchorSnap.features, regime: anchorSnap.regime, at: snapshotTs };
       // 2) deterministic pre-rank (§37 opportunity agent as scanner)
-      const entrySnaps = snaps.filter((snap) => dynamicWatchlist.currentEntryUniverse().includes(snap.instrument));
+      const entrySnaps = snaps.filter((snap) => entrySymbols.has(snap.instrument));
       const rows = strategyCoreVersion === 2
         ? scanCoreV2(entrySnaps, histories, activeV2Params, activeV2Versions, v2Weights(store, activeV2Versions), trading.strategy_core.enabled_families)
         : scanInstruments(entrySnaps, trading.strategies_enabled
           ? strategies.filter((strategy) => trading.strategies_enabled!.includes(`${strategy.name}_V${strategy.version}`))
           : strategies, getWeights(store, "SWING_15M", { strategyCoreVersion: 1 }));
+      recordSwingScanResults(store, rows, new Map(entrySnaps.map((snap) => [snap.instrument, snap.features.ts])), undefined, trading.timeframe);
       lastScan = rows;
       for (const row of rows) {
         if (row.candidate) logSystemEvent(store, "STRATEGY_CANDIDATE", {
           engine: "SWING_15M", instrument: row.instrument, strategy: row.candidate.strategy,
           side: row.candidate.side, setupScore: row.candidate.setupScore, conditions: row.candidate.conditions,
-        });
-        else if (row.conditions?.length) logSystemEvent(store, "STRATEGY_REJECTED", {
-          engine: "SWING_15M", instrument: row.instrument,
-          evaluations: row.conditions.map((e) => ({ strategy: e.strategy, failed: e.conditions.filter((c) => !c.passed).map((c) => c.name) })),
         });
       }
 

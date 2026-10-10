@@ -14,6 +14,7 @@ import { scannerProjection, type evolutionFamilies } from "../src/core/workstati
 import type { ScanRow } from "../src/strategy/scanner.ts";
 import type { ExecutorDeps } from "../src/execution/executor.ts";
 import { DynamicWatchlistError, type WatchlistProjection } from "../src/market/dynamic-watchlist.ts";
+import { recordScanState } from "../src/market/scan-state.ts";
 
 const symbol = "BTC-USDT-SWAP";
 const json = <T>(response: Response): Promise<T> => response.json() as Promise<T>;
@@ -225,4 +226,33 @@ test("scanner separates deterministic setups, Gate denial and unevaluated candid
   assert.equal(final.state, "RISK_REJECTED");
   assert.equal(final.risk, "REJECTED");
   assert.deepEqual(final.reason, ["RISK_SETTINGS_CHANGED"]);
+});
+
+test("Markets projection exposes per-engine scan activity and a never-scanned active symbol", async t => {
+  const f = await fixture(t);
+  recordScanState(f.store, { engine: "SWING_15M", instrument: symbol, scannedAt: "2026-10-10T10:15:08.000Z",
+    candleTs: 1_791_612_000_000, candleTimeframe: "15m", result: "NO_SETUP", reason: "no_tradable_setup" });
+  recordScanState(f.store, { engine: "SCALP_5M", instrument: symbol, scannedAt: "2026-10-10T10:20:08.000Z",
+    candleTs: 1_791_612_300_000, candleTimeframe: "1m", result: "SIGNAL", strategy: "SCALP", side: "LONG", setupScore: 0.71 });
+  const response = await json<{ scan: Array<Record<string, unknown>> }>(await f.request("/api/market"));
+  const row = response.scan.find(item => item.instrument === symbol)!;
+  const activity = row.scanActivity as { swing: Record<string, unknown>; scalp: Record<string, unknown> };
+  assert.equal(row.state, "NO_SETUP");
+  assert.equal(activity.swing.lastScanAt, "2026-10-10T10:15:08.000Z");
+  assert.equal(activity.swing.lastSuccessfulScanAt, "2026-10-10T10:15:08.000Z");
+  assert.equal(activity.swing.candleTs, 1_791_612_000_000);
+  assert.equal(activity.swing.candleTimeframe, "15m");
+  assert.equal(activity.swing.result, "NO_SETUP");
+  assert.equal(activity.scalp.lastScanAt, "2026-10-10T10:20:08.000Z");
+  assert.equal(activity.scalp.result, "SIGNAL");
+  assert.equal(row.gate, "NOT_EVALUATED", "deterministic scan activity remains distinct from LLM Gate state");
+});
+
+test("active markets with no persisted scanner state show NOT_SCANNED without fake prices", async t => {
+  const f = await fixture(t);
+  const response = await json<Array<Record<string, unknown>>>(await f.request("/api/scan"));
+  const row = response.find(item => item.instrument === symbol)!;
+  assert.equal(row.state, "NOT_SCANNED");
+  assert.equal(row.price, null);
+  assert.equal((row.scanActivity as { swing: unknown }).swing, null);
 });

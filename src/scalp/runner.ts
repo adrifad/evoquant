@@ -41,6 +41,7 @@ import { evaluateGlobalEntryGate } from "../risk/global-entry-gate.ts";
 import type { Position } from "../exchange/okx/types.ts";
 import { isTradeOwnedBy } from "../memory/engines.ts";
 import { candidateStopRiskPct, portfolioOpenRisk } from "../risk/portfolio-open-risk.ts";
+import { recordScanState, recordScalpScanResult } from "../market/scan-state.ts";
 
 const log = createLogger("scalp");
 const TF_TAG = "scalp";
@@ -114,17 +115,31 @@ export class ScalpRunner {
 
   // ---------- shared context fetch ----------
 
-  private async symbolContexts(): Promise<Array<{ instrument: string; features: FeatureSnapshot; regime: Regime; closes1m: import("../exchange/okx/types.ts").Candle[]; last5m: { close: number } | null }>> {
+  private async symbolContexts(recordScanFailures = false): Promise<Array<{ instrument: string; features: FeatureSnapshot; regime: Regime; closes1m: import("../exchange/okx/types.ts").Candle[]; last5m: { close: number } | null }>> {
     const out = [];
     for (const sym of this.d.entryUniverse?.() ?? this.d.trading.instruments?.watchlist ?? []) {
-      if (!this.d.instruments[sym]) continue;
-      const c15 = (await getCandles(this.d.client, sym, "15m", 80)).filter((c) => c.confirm === "1").sort((a, b) => a.ts - b.ts);
-      const c5 = (await getCandles(this.d.client, sym, this.d.cfg.signal_tf, 8)).filter((c) => c.confirm === "1").sort((a, b) => a.ts - b.ts);
-      const c1 = (await getCandles(this.d.client, sym, this.d.cfg.base_tf, 140)).filter((c) => c.confirm === "1").sort((a, b) => a.ts - b.ts);
-      if (c15.length < 60 || c1.length < 60) continue;
-      const features = buildFeatures(sym, [...c15].reverse());
-      out.push({ instrument: sym, features, regime: classifyRegime(features),
-        closes1m: c1, last5m: c5.length >= 2 ? { close: c5[c5.length - 2]!.c } : null });
+      if (!this.d.instruments[sym]) {
+        if (recordScanFailures) recordScanState(this.d.store, { engine: "SCALP_5M", instrument: sym,
+          scannedAt: new Date().toISOString(), result: "SKIPPED", reason: "instrument_metadata_unavailable" });
+        continue;
+      }
+      try {
+        const c15 = (await getCandles(this.d.client, sym, "15m", 80)).filter((c) => c.confirm === "1").sort((a, b) => a.ts - b.ts);
+        const c5 = (await getCandles(this.d.client, sym, this.d.cfg.signal_tf, 8)).filter((c) => c.confirm === "1").sort((a, b) => a.ts - b.ts);
+        const c1 = (await getCandles(this.d.client, sym, this.d.cfg.base_tf, 140)).filter((c) => c.confirm === "1").sort((a, b) => a.ts - b.ts);
+        if (c15.length < 60 || c1.length < 60) {
+          if (recordScanFailures) recordScanState(this.d.store, { engine: "SCALP_5M", instrument: sym,
+            scannedAt: new Date().toISOString(), result: "SKIPPED", reason: "insufficient_confirmed_candles" });
+          continue;
+        }
+        const features = buildFeatures(sym, [...c15].reverse());
+        out.push({ instrument: sym, features, regime: classifyRegime(features),
+          closes1m: c1, last5m: c5.length >= 2 ? { close: c5[c5.length - 2]!.c } : null });
+      } catch (error) {
+        if (recordScanFailures) recordScanState(this.d.store, { engine: "SCALP_5M", instrument: sym,
+          scannedAt: new Date().toISOString(), result: "FETCH_FAILED", reason: "market_data_fetch_failed" });
+        throw error;
+      }
     }
     return out;
   }
@@ -149,12 +164,20 @@ export class ScalpRunner {
       const openAll = getOpenTrades(this.d.store) as Array<Record<string, unknown>>;
       if (openAll.length >= this.d.risk.hard_limits.max_concurrent_positions) return;
 
-      const snaps = await this.symbolContexts();
+      const snaps = await this.symbolContexts(true);
       const signals: ScalpSignal[] = [];
       for (const s of snaps) {
         const r = evaluateSignal(
           { instrument: s.instrument, closes1m: s.closes1m, last5m: s.last5m, regime: s.regime, features: s.features },
           this.d.cfg, nowS, this.lastExit);
+        const signal = r.signal;
+        recordScalpScanResult(this.d.store, {
+          instrument: s.instrument, scannedAt: new Date().toISOString(),
+          // evaluateSignal's price, indicators and setup checks consume confirmed 1m candles.
+          candleTs: s.closes1m.at(-1)?.ts ?? null,
+          candleTimeframe: this.d.cfg.base_tf,
+          ...(signal ? { signal: { direction: signal.direction, score: signal.score } } : { veto: r.veto ?? "no_setup" }),
+        });
         if (r.signal) signals.push(r.signal);
       }
       signals.sort((a, b) => b.score - a.score);

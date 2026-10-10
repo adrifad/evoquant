@@ -25,6 +25,22 @@ CREATE TABLE IF NOT EXISTS market_snapshots (
   features TEXT NOT NULL, -- JSON FeatureSnapshot
   PRIMARY KEY (ts, instrument)
 );
+CREATE TABLE IF NOT EXISTS market_scan_state (
+  engine TEXT NOT NULL CHECK(engine IN ('SWING_15M','SCALP_5M')),
+  instrument TEXT NOT NULL,
+  last_scan_at TEXT NOT NULL,
+  last_success_at TEXT,
+  candle_ts INTEGER,
+  candle_timeframe TEXT,
+  result TEXT NOT NULL CHECK(result IN ('CANDIDATE','NO_SETUP','FETCH_FAILED','SIGNAL','SKIPPED')),
+  strategy TEXT,
+  side TEXT CHECK(side IS NULL OR side IN ('LONG','SHORT')),
+  setup_score REAL,
+  reason TEXT,
+  PRIMARY KEY (engine, instrument),
+  CHECK((engine='SWING_15M' AND result IN ('CANDIDATE','NO_SETUP','FETCH_FAILED','SKIPPED'))
+    OR (engine='SCALP_5M' AND result IN ('SIGNAL','NO_SETUP','FETCH_FAILED','SKIPPED')))
+);
 CREATE TABLE IF NOT EXISTS trades (
   trade_id TEXT PRIMARY KEY,
   engine TEXT NOT NULL DEFAULT 'SWING_15M', -- SWING_15M | SCALP_5M; legacy rows backfilled below
@@ -292,6 +308,8 @@ export function openStore(root: string): Store {
   db.pragma("journal_mode = WAL");
   db.pragma("foreign_keys = ON");
   db.exec(SCHEMA);
+  const scanStateCols = new Set((db.prepare("PRAGMA table_info(market_scan_state)").all() as Array<{ name: string }>).map((c) => c.name));
+  if (!scanStateCols.has("candle_timeframe")) db.exec("ALTER TABLE market_scan_state ADD COLUMN candle_timeframe TEXT");
   // lightweight column migration for pre-existing DBs
   const cols = new Set((db.prepare("PRAGMA table_info(trades)").all() as Array<{ name: string }>).map((c) => c.name));
   const hadEngine = cols.has("engine");
