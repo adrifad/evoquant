@@ -32,6 +32,69 @@ interface ParsedCompletion {
   outputTokens?: number;
 }
 
+type CompletionMessage = { content?: unknown };
+
+/**
+ * Only explicit final `message.content` is trusted. Some OpenAI-compatible
+ * services encode that final text as typed content parts; private reasoning is
+ * deliberately absent from this normalizer and can never become an answer.
+ */
+function finalContent(content: unknown): string | null {
+  if (typeof content === "string") return content.trim() || null;
+  if (!Array.isArray(content) || content.length === 0) return null;
+  const fragments: string[] = [];
+  for (const part of content) {
+    if (!part || typeof part !== "object") return null;
+    const typed = part as { type?: unknown; text?: unknown };
+    if ((typed.type !== "text" && typed.type !== "output_text") || typeof typed.text !== "string") return null;
+    fragments.push(typed.text);
+  }
+  const joined = fragments.join("").trim();
+  return joined || null;
+}
+
+/** Return balanced JSON object candidates without being confused by braces in strings or prose. */
+function jsonObjectCandidates(text: string): string[] {
+  const candidates: string[] = [];
+  for (let start = 0; start < text.length; start++) {
+    if (text[start] !== "{") continue;
+    let depth = 0;
+    let inString = false;
+    let escaped = false;
+    for (let index = start; index < text.length; index++) {
+      const char = text[index]!;
+      if (inString) {
+        if (escaped) escaped = false;
+        else if (char === "\\") escaped = true;
+        else if (char === '"') inString = false;
+        continue;
+      }
+      if (char === '"') { inString = true; continue; }
+      if (char === "{") depth++;
+      else if (char === "}" && --depth === 0) {
+        candidates.push(text.slice(start, index + 1));
+        break;
+      }
+    }
+  }
+  return candidates;
+}
+
+function parseStructuredOutput<T>(text: string, schema: z.ZodType<T>): { value?: T; failureReason?: LlmFailureReason } {
+  const candidates = jsonObjectCandidates(text);
+  if (!candidates.length) return { failureReason: "INVALID_JSON" };
+  let parsedJson = false;
+  for (const candidate of candidates) {
+    try {
+      const parsed: unknown = JSON.parse(candidate);
+      parsedJson = true;
+      const result = schema.safeParse(parsed);
+      if (result.success) return { value: result.data };
+    } catch { /* Continue after prose braces or malformed candidate JSON. */ }
+  }
+  return { failureReason: parsedJson ? "SCHEMA_MISMATCH" : "INVALID_JSON" };
+}
+
 export async function llmJsonDetailed<T>(
   cfg: LlmConfig,
   system: string,
@@ -79,7 +142,7 @@ export async function llmJsonDetailed<T>(
       let parsed: ParsedCompletion;
       try {
         const data = JSON.parse(raw) as {
-          choices?: Array<{ finish_reason?: unknown; message?: { content?: unknown } }>;
+          choices?: Array<{ finish_reason?: unknown; message?: CompletionMessage }>;
           usage?: { prompt_tokens?: unknown; completion_tokens?: unknown };
         };
         const usage = data.usage;
@@ -91,9 +154,9 @@ export async function llmJsonDetailed<T>(
         const choice = data.choices?.[0];
         if (!choice?.message) return invalid("MALFORMED_COMPLETION", attempt + 1);
         if (choice.finish_reason === "length") return invalid("OUTPUT_LIMIT", attempt + 1);
-        const text = choice.message.content;
-        if (text === null || text === undefined || typeof text === "string" && !text.trim()) return invalid("EMPTY_CONTENT", attempt + 1);
-        if (typeof text !== "string") return invalid("MALFORMED_COMPLETION", attempt + 1);
+        const text = finalContent(choice.message.content);
+        if (text === null) return invalid(choice.message.content === null || choice.message.content === undefined || typeof choice.message.content === "string"
+          ? "EMPTY_CONTENT" : "MALFORMED_COMPLETION", attempt + 1);
         parsed = { text, ...(promptTokens !== undefined ? { inputTokens: promptTokens } : {}),
           ...(completionTokens !== undefined ? { outputTokens: completionTokens } : {}) };
       } catch {
@@ -105,17 +168,10 @@ export async function llmJsonDetailed<T>(
       // scrub it before any structured model output can reach persisted domain
       // records or system-event payloads.
       const safeText = cfg.apiKey ? parsed.text.replaceAll(cfg.apiKey, "[REDACTED]") : parsed.text;
-      const start = safeText.indexOf("{");
-      const end = safeText.lastIndexOf("}");
-      if (start < 0 || end <= start) return invalid("INVALID_JSON", attempt + 1);
-      try {
-        const result = schema.safeParse(JSON.parse(safeText.slice(start, end + 1)) as unknown);
-        if (!result.success) return invalid("SCHEMA_MISMATCH", attempt + 1);
-        return { value: result.data, status: "SUCCESS", attempts: attempt + 1, latencyMs: Date.now() - started,
-          ...(inputTokens !== undefined ? { inputTokens } : {}), ...(outputTokens !== undefined ? { outputTokens } : {}) };
-      } catch {
-        return invalid("INVALID_JSON", attempt + 1);
-      }
+      const decoded = parseStructuredOutput(safeText, schema);
+      if (decoded.value === undefined) return invalid(decoded.failureReason ?? "INVALID_JSON", attempt + 1);
+      return { value: decoded.value, status: "SUCCESS", attempts: attempt + 1, latencyMs: Date.now() - started,
+        ...(inputTokens !== undefined ? { inputTokens } : {}), ...(outputTokens !== undefined ? { outputTokens } : {}) };
     } catch (error) {
       lastStatus = error instanceof Error && error.name === "AbortError" ? "TIMEOUT" : "NETWORK_ERROR";
       if (attempt < retries) {

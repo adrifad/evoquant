@@ -24,7 +24,7 @@ position protection and bounded strategy evolution retain their authority.
 
 | Group | Editable fields | Boundaries |
 | --- | --- | --- |
-| Risk | Risk per trade, maximum positions, leverage cap, daily loss, drawdown | Absolute maxima: 10%, 3 positions, 10x, 5%, 20% respectively |
+| Risk | Risk per trade, maximum positions, portfolio open risk, leverage cap, daily loss, drawdown | Absolute maxima: 10%, 5 positions, 5% portfolio open risk, 10x, 10% daily loss and 10% drawdown |
 | Trading | Primary instrument, entry leverage, trading leverage cap, swing sizing mode, swing notional allocation | Instrument needs available metadata and risk permission; integer leverage 1-10; default <= cap; supported sizing modes; allocation 0.1-100% |
 
 Trading's primary instrument selects the watchlist anchor. It does not replace

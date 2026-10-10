@@ -137,6 +137,18 @@ test("provider output cannot echo a role API key into returned data or audit sto
   } finally { f.close(); }
 });
 
+test("role health preserves safe structured-output failure classes", async () => {
+  const f = fixture({ LLM_GATE_BASE_URL: "https://gate.test/v1", LLM_GATE_API_KEY: "fake-gate" }, async () =>
+    new Response(JSON.stringify({ choices: [{ message: { content: "" } }] })));
+  try {
+    assert.equal(await f.service.json("gate", "system", "{}", OkSchema, "empty_final"), null);
+    const run = f.store.db.prepare("SELECT status,error_class FROM llm_runs WHERE role='gate' ORDER BY id DESC LIMIT 1")
+      .get() as { status: string; error_class: string };
+    assert.deepEqual(run, { status: "INVALID_RESPONSE", error_class: "EMPTY_CONTENT" });
+    assert.equal(f.service.settings().find((entry) => entry.role === "gate")?.errorClass, "EMPTY_CONTENT");
+  } finally { f.close(); }
+});
+
 test("Scalp role outage returns DEFENSIVE and does not make a network request", async () => {
   let requests = 0;
   const f = fixture({}, async () => { requests++; return successResponse(); });

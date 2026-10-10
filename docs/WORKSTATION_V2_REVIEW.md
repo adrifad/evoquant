@@ -62,11 +62,11 @@ is bounded, aborts timed-out requests and ignores obsolete responses.
 
 ## Runtime risk and execution
 
-Supported controls are risk per trade, maximum concurrent positions, maximum
-leverage, daily loss limit and maximum drawdown. Existing absolute ceilings are
-10%, 3 positions, 10x, 5% and 20% respectively. The risk-per-trade ceiling was
-raised from 2% by explicit operator request on 2026-10-08; the shipped active
-default remains 2%. Invalid values are rejected with
+Supported controls are risk per trade, maximum concurrent positions, portfolio
+open risk, maximum leverage, daily loss limit and maximum drawdown. Absolute
+ceilings are 10%, 5 positions, 5% portfolio open risk, 10x, 10% daily loss and
+10% drawdown. The shipped active defaults remain 2% risk per trade, 3% daily
+loss, 10% drawdown and 5x leverage. Invalid values are rejected with
 an understandable error; they are not silently clamped. Baseline mode retains
 its one-position restriction.
 

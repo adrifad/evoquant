@@ -201,12 +201,12 @@ export class RoleLlmService {
     } catch {
       result = { value: null, status: "NETWORK_ERROR", attempts: 1, latencyMs: 0 };
     }
+    const errorClass = result.status === "SUCCESS" ? null : result.failureReason ?? result.status;
     this.recordRun(role, config, result.status, result.latencyMs, requests === 1 ? result.inputTokens ?? null : null,
-      requests === 1 ? result.outputTokens ?? null : null,
-      result.status === "SUCCESS" ? null : result.status, contextRef, requests);
+      requests === 1 ? result.outputTokens ?? null : null, errorClass, contextRef, requests);
     const payload = { role, provider: config.provider || "custom", model: config.model, latency_ms: result.latencyMs,
       attempt: result.attempts, success: result.status === "SUCCESS", ...(result.inputTokens !== undefined ? { input_tokens: result.inputTokens } : {}),
-      ...(result.outputTokens !== undefined ? { output_tokens: result.outputTokens } : {}), ...(result.status !== "SUCCESS" ? { error_class: result.status } : {}),
+      ...(result.outputTokens !== undefined ? { output_tokens: result.outputTokens } : {}), ...(errorClass ? { error_class: errorClass } : {}),
       ...(result.failureReason ? { failure_reason: result.failureReason } : {}), contextRef: safeContextRef(contextRef) };
     if (result.status === "SUCCESS") logSystemEvent(this.options.store, "LLM_SUCCESS", payload);
     else logSystemEvent(this.options.store, eventKind(result.status), payload);

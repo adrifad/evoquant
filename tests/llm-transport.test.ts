@@ -66,3 +66,26 @@ test("invalid completion diagnostics distinguish empty, malformed, JSON and sche
     assert.ok(!JSON.stringify(result).includes("fake-transport-key"));
   }
 });
+
+test("transport accepts explicit final JSON in fences, explanatory text, and OpenAI-style text content arrays", async () => {
+  const contents: unknown[] = [
+    "```json\n{\"ok\":true}\n```",
+    "Final answer follows. A non-JSON brace {is ignored}. {\"ok\":true} End.",
+    [{ type: "text", text: "{\"ok\":true}" }],
+    [{ type: "output_text", text: "```json\n{\"ok\":true}\n```" }],
+  ];
+  for (const content of contents) {
+    const result = await llmJsonDetailed({ baseUrl: "https://provider.test/v1", apiKey: "fake-transport-key", model: "model", retryCount: 0 }, "system", "user", schema,
+      async () => new Response(JSON.stringify({ choices: [{ message: { content } }] })));
+    assert.equal(result.status, "SUCCESS");
+    assert.deepEqual(result.value, { ok: true });
+  }
+});
+
+test("transport never treats reasoning content as a final answer", async () => {
+  const result = await llmJsonDetailed({ baseUrl: "https://provider.test/v1", apiKey: "fake-transport-key", model: "model", retryCount: 0 }, "system", "user", schema,
+    async () => new Response(JSON.stringify({ choices: [{ message: { content: null, reasoning_content: '{"ok":true}' } }] })));
+  assert.equal(result.status, "INVALID_RESPONSE");
+  assert.equal(result.failureReason, "EMPTY_CONTENT");
+  assert.equal(result.value, null);
+});

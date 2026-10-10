@@ -105,6 +105,9 @@ test("five shared slots and the portfolio stop-risk cap reject a sixth or excess
   assert.equal(evaluateGlobalEntryGate(input, risk).allowed, true);
   assert.equal(evaluateGlobalEntryGate({ ...input, openPositions: 5 }, risk).reason, "MAX_CONCURRENT_POSITIONS");
   assert.equal(evaluateGlobalEntryGate({ ...input, candidateRiskPct: 0.7 }, risk).reason, "PORTFOLIO_OPEN_RISK_LIMIT");
+  const tenPercentTradeRisk = { hard_limits: { allowed_symbols: [symbol], max_concurrent_positions: 5, max_portfolio_open_risk_pct: 5 } } as never;
+  assert.equal(evaluateGlobalEntryGate({ ...input, portfolioOpenRiskPct: 0, candidateRiskPct: 8 }, tenPercentTradeRisk).reason,
+    "PORTFOLIO_OPEN_RISK_LIMIT", "a valid 10% per-trade ceiling never overrides the 5% portfolio cap");
   assert.equal(evaluateGlobalEntryGate({ ...input, instrumentOccupied: true }, risk).reason, "INSTRUMENT_ALREADY_OCCUPIED");
   const snapshot = portfolioOpenRisk({ equity: 1_000, positions: [{ posId: "P", instId: symbol, posSide: "long", pos: "2", avgPx: "100", markPx: "100", lever: "3", upl: "0", mgnMode: "isolated" }],
     trades: [{ instrument: symbol, side: "LONG", stop_px: 83 }], instruments: { [symbol]: instrument } });

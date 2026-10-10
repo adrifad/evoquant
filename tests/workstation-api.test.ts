@@ -72,7 +72,7 @@ test("risk API rejects ceilings, cross-origin writes and stale revisions; commit
     headers: { "content-type": "application/json", ...(origin ? { origin } : {}) }, body: JSON.stringify(body) });
   const invalid = await put({ revision: initial.revision, limits: { ...initial.limits, max_leverage: 25 }, confirmRiskIncrease: true });
   assert.equal(invalid.status, 400);
-  assert.equal((await json<{ error: string }>(invalid)).error, "Maximum allowed leverage is 5x.");
+  assert.equal((await json<{ error: string }>(invalid)).error, "Maximum allowed leverage is 10x.");
   const limits = { ...initial.limits, max_leverage: 2, max_concurrent_positions: 1 };
   assert.equal((await put({ revision: 0, limits }, "https://external.invalid")).status, 403);
   assert.equal((await put({ revision: 0, limits }, f.base)).status, 200);
@@ -86,26 +86,31 @@ test("risk API rejects ceilings, cross-origin writes and stale revisions; commit
   assert.equal(f.exchangeRequests(), 0, "risk changes must not resize positions or call exchange");
 });
 
-test("risk API enforces 2 percent trade and 5 percent portfolio ceilings", async t => {
+test("risk API exposes 10 percent trade/daily-loss/drawdown and 10x leverage ceilings without changing active limits", async t => {
   const f = await fixture(t);
   const initial = await json<RiskResponse>(await f.request("/api/risk"));
-  assert.equal(initial.ceilings.risk_per_trade_pct, 2);
+  assert.equal(initial.ceilings.risk_per_trade_pct, 10);
+  assert.equal(initial.ceilings.max_daily_loss_pct, 10);
+  assert.equal(initial.ceilings.max_drawdown_pct, 10);
+  assert.equal(initial.ceilings.max_leverage, 10);
   assert.equal(initial.ceilings.max_portfolio_open_risk_pct, 5);
   assert.equal(initial.limits.risk_per_trade_pct, 2, "raising the ceiling never raises active risk automatically");
   const put = (limits: Record<string, unknown>, confirmRiskIncrease = false, revision = 0) => f.request("/api/risk", {
     method: "PUT", headers: { "content-type": "application/json" },
     body: JSON.stringify({ revision, limits, confirmRiskIncrease }),
   });
-  const overTrade = await put({ ...initial.limits, risk_per_trade_pct: 2.01 }, true);
+  const acceptedTrade = await put({ ...initial.limits, risk_per_trade_pct: 10 }, true);
+  assert.equal(acceptedTrade.status, 200);
+  const overTrade = await put({ ...initial.limits, risk_per_trade_pct: 10.01 }, true, 1);
   assert.equal(overTrade.status, 400);
-  assert.equal((await json<{ error: string }>(overTrade)).error, "Maximum allowed risk per trade is 2%.");
-  const atPortfolioCeiling = { ...initial.limits, max_portfolio_open_risk_pct: 5 };
-  assert.equal((await put(atPortfolioCeiling)).status, 400, "loosening portfolio risk requires confirmation");
-  assert.equal((await put(atPortfolioCeiling, true)).status, 200);
-  const overPortfolio = await put({ ...atPortfolioCeiling, max_portfolio_open_risk_pct: 5.01 }, true, 1);
+  assert.equal((await json<{ error: string }>(overTrade)).error, "Maximum allowed risk per trade is 10%.");
+  const atPortfolioCeiling = { ...initial.limits, risk_per_trade_pct: 10, max_portfolio_open_risk_pct: 5 };
+  assert.equal((await put(atPortfolioCeiling, false, 1)).status, 400, "loosening portfolio risk requires confirmation");
+  assert.equal((await put(atPortfolioCeiling, true, 1)).status, 200);
+  const overPortfolio = await put({ ...atPortfolioCeiling, max_portfolio_open_risk_pct: 5.01 }, true, 2);
   assert.equal(overPortfolio.status, 400);
   assert.equal((await json<{ error: string }>(overPortfolio)).error, "Maximum allowed portfolio open risk is 5%.");
-  assert.equal(f.risk.hard_limits.risk_per_trade_pct, 2);
+  assert.equal(f.risk.hard_limits.risk_per_trade_pct, 10);
   assert.equal(f.risk.hard_limits.max_portfolio_open_risk_pct, 5);
   assert.equal(f.exchangeRequests(), 0);
 });

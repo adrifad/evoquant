@@ -13,9 +13,9 @@ const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..")
 
 // spec §48 — these may NEVER be relaxed via config/evolution; outside = refuse.
 export const ABSOLUTE_MAX = {
-  leverage: 5,
-  riskPerTradePct: 2.0,
-  maxDailyLossPct: 3.0,
+  leverage: 10,
+  riskPerTradePct: 10.0,
+  maxDailyLossPct: 10.0,
   maxDrawdownPct: 10.0,
   maxConcurrentPositions: 5,
   maxPortfolioOpenRiskPct: 5.0,
