@@ -116,7 +116,7 @@ test("test connection uses only its role and failures never persist provider bod
 test("schema probes use each production role schema without mutating domain records", async () => {
   const payloads: Record<string, unknown> = {
     gate: { verdict: "ALLOW", confidence: 0.8, reasoning: [], risk_flags: [] },
-    scalp_stance: { stance: "NEUTRAL", confidence: 0.8, reason: "diagnostic" },
+    scalp_stance: { stance: "NEUTRAL", confidence: 0.8, reason: "d".repeat(350) },
     scalp_gate: { verdict: "ALLOW", confidence: 0.8, reason: "diagnostic" },
     reviewer: { observations: [], assumptions_check: {}, lesson_candidates: [] },
     evolution: { proposals: [], no_change_reason: "diagnostic" },
@@ -253,6 +253,38 @@ test("Scalp role outage returns DEFENSIVE and does not make a network request", 
     const result = await fetchStance(f.service, { regimes: {}, atrPcts: {}, sessionPnlR: 0, tradesToday: 0 });
     assert.equal(result.stance, "DEFENSIVE");
     assert.equal(requests, 0);
+  } finally { f.close(); }
+});
+
+test("fetchStance accepts a 350-character valid neutral stance reason", async () => {
+  const reason = "r".repeat(350);
+  let systemPrompt = "";
+  const f = fixture({ LLM_SCALP_BASE_URL: "https://scalp.test/v1", LLM_SCALP_API_KEY: "scalp-key" }, async (_url, init) => {
+    const body = JSON.parse(String(init?.body)) as { messages: Array<{ role: string; content: string }> };
+    systemPrompt = body.messages.find(message => message.role === "system")?.content ?? "";
+    return new Response(JSON.stringify({ choices: [{ message: { content: JSON.stringify({ stance: "NEUTRAL", confidence: 0.75, reason }) } }] }));
+  });
+  try {
+    const result = await fetchStance(f.service, { regimes: {}, atrPcts: {}, sessionPnlR: 0, tradesToday: 0 });
+    assert.deepEqual(result, { stance: "NEUTRAL", confidence: 0.75, reason });
+    assert.match(systemPrompt, /reason must be concise and no more than 250 characters/i);
+  } finally { f.close(); }
+});
+
+test("fetchStance fails closed for a 501-character reason and records a safe schema diagnostic", async () => {
+  const rawResponse = "r".repeat(501);
+  const f = fixture({ LLM_SCALP_BASE_URL: "https://scalp.test/v1", LLM_SCALP_API_KEY: "scalp-key" }, async () =>
+    new Response(JSON.stringify({ choices: [{ message: { content: JSON.stringify({ stance: "NEUTRAL", confidence: 0.75, reason: rawResponse }) } }] })));
+  try {
+    const result = await fetchStance(f.service, { regimes: {}, atrPcts: {}, sessionPnlR: 0, tradesToday: 0 });
+    assert.equal(result.stance, "DEFENSIVE");
+    assert.equal(result.confidence, 0);
+    const run = f.store.db.prepare("SELECT role,context_ref,status,failure_reason FROM llm_runs WHERE role='scalp' ORDER BY id DESC LIMIT 1")
+      .get() as { role: string; context_ref: string; status: string; failure_reason: string };
+    assert.deepEqual(run, { role: "scalp", context_ref: "scalp_stance", status: "INVALID_RESPONSE", failure_reason: "SCHEMA_MISMATCH" });
+    const persisted = JSON.stringify(f.store.db.prepare("SELECT error_class,failure_reason FROM llm_runs WHERE role='scalp'").all());
+    assert.equal(persisted.includes(rawResponse), false);
+    assert.equal(persisted.includes("scalp-key"), false);
   } finally { f.close(); }
 });
 

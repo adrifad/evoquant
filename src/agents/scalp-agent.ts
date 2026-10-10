@@ -14,7 +14,7 @@ const log = createLogger("scalp-llm");
 export const StanceSchema = z.object({
   stance: z.enum(["AGGRESSIVE", "NEUTRAL", "DEFENSIVE"]),
   confidence: z.number().min(0).max(1),
-  reason: z.string().max(300),
+  reason: z.string().max(500),
 }).strict();
 
 export const ScalpCandidateGateSchema = z.object({
@@ -30,10 +30,21 @@ export async function fetchStance(roles: RoleLlmService, ctx: {
 }): Promise<{ stance: Stance; confidence: number; reason: string }> {
   const sys = `You are the risk supervisor of an automated crypto FUTURES SCALPER (1-5m, OKX demo).
 Decide ONE stance for the next 15 minutes:
-- AGGRESSIVE: trending & clean momentum, entries encouraged (min setup score 0.55)
-- NEUTRAL: mixed; only strong setups (min score 0.72)
-- DEFENSIVE: choppy/false-breakout regime or drawdown stress; NO new scalps
-Judge from the facts. Do not invent data. Reply JSON {"stance","confidence","reason"}.`;
+- AGGRESSIVE: trending and clean momentum; entries encouraged, minimum setup score 0.55
+- NEUTRAL: mixed conditions; only strong setups, minimum setup score 0.72
+- DEFENSIVE: choppy / false-breakout regime or drawdown stress; no new scalps
+
+Use only the provided facts. Do not invent market data.
+
+OUTPUT RULES:
+- Return exactly one JSON object, with no markdown, code fences, or text before or after it.
+- Use exactly these fields: stance, confidence, reason.
+- stance must be AGGRESSIVE, NEUTRAL, or DEFENSIVE.
+- confidence must be between 0 and 1.
+- reason must be concise and no more than 250 characters.
+
+Return:
+{"stance":"AGGRESSIVE|NEUTRAL|DEFENSIVE","confidence":0.0,"reason":"<=250 characters"}`;
   const user = JSON.stringify(ctx);
   const out = await roles.json("scalp", sys, user, StanceSchema, "scalp_stance");
   if (!out) { log.warn({ event: "stance_fail_closed" }); return { stance: "DEFENSIVE", confidence: 0, reason: "LLM unavailable → scalp skipped" }; }

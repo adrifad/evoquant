@@ -7,8 +7,19 @@ import type { ScalpCfg } from "../src/scalp/signals.ts";
 import type { Candle } from "../src/exchange/okx/types.ts";
 import type { FeatureSnapshot } from "../src/market/features.ts";
 import { backtestScalp } from "../src/scalp/backtest.ts";
+import { StanceSchema } from "../src/agents/scalp-agent.ts";
 
 const cfg: ScalpCfg = { ...SCALP_DEFAULTS, watchlist: ["BTC-USDT-SWAP"] };
+
+test("Scalp stance schema tolerates concise and mildly verbose reasons up to 500 chars", () => {
+  for (const length of [100, 250, 300, 499, 500]) {
+    assert.equal(StanceSchema.safeParse({ stance: "NEUTRAL", confidence: 0.75, reason: "r".repeat(length) }).success, true, `length ${length}`);
+  }
+  assert.equal(StanceSchema.safeParse({ stance: "NEUTRAL", confidence: 0.75, reason: "r".repeat(501) }).success, false);
+  assert.equal(StanceSchema.safeParse({ stance: "BULLISH", confidence: 0.75, reason: "ok" }).success, false);
+  assert.equal(StanceSchema.safeParse({ stance: "NEUTRAL", confidence: 1.01, reason: "ok" }).success, false);
+  assert.equal(StanceSchema.safeParse({ stance: "NEUTRAL", confidence: 0.75, reason: "ok", trade_now: true }).success, false);
+});
 
 // zigzag with controlled up/down amplitudes → realistic RSI7 (not 100/0)
 function candles(n: number, startPx: number, up: number, down: number, lastVolSpike = 1): Candle[] {
