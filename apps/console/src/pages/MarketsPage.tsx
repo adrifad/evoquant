@@ -7,6 +7,7 @@ import { InstrumentChart } from "../components/InstrumentChart";
 
 export function MarketsPage({ status }: { status: ApiState<Row> }) {
   const market = useApi<unknown>("/api/market");
+  const watchlist = useApi<unknown>("/api/watchlist", 60_000);
   const [selected, setSelected] = useState("");
   const d = asRow(market.data);
   const snapshot = asRow(d?.snapshot);
@@ -14,9 +15,35 @@ export function MarketsPage({ status }: { status: ApiState<Row> }) {
   const weights = asRow(d?.weights) ?? {};
   const instrument = selected || asText(status.data?.instrument);
   const selectedRow = scanner.find(row => row.instrument === instrument);
+  const wl = asRow(watchlist.data);
+  const dynamic = asRows(wl?.dynamic);
+  const refreshWatchlist = async () => {
+    if (!window.confirm("This normally refreshes once per day. Refresh now?")) return;
+    const response = await fetch("/api/watchlist", { method: "POST" });
+    if (!response.ok) return;
+    watchlist.applyResponse(await response.json() as unknown);
+    window.dispatchEvent(new Event("evoquant:refresh"));
+  };
 
   return <div className="page">
     <PageHeading title="Markets" description="Inspect the market inputs and regime used by the current decision cycle." detail={<span className="muted-small">Updated {formatTimestamp(d?.updatedAt)}</span>}/>
+    <Panel title="Daily Dynamic Watchlist" subtitle={`Status ${asText(wl?.status, "LOADING")} · Last updated ${formatTimestamp(wl?.generated_at)} · Next ${formatTimestamp(wl?.next_refresh)}`} action={<button className="button button-secondary" onClick={() => void refreshWatchlist()}>Refresh dynamic watchlist</button>}>
+      <DataState loading={watchlist.loading} error={watchlist.error} empty={!dynamic.length} hasData={watchlist.data !== null} emptyTitle="No dynamic markets selected" emptyDetail="Core markets remain monitored. The next eligible daily discovery will retain only markets that pass quality filters.">
+        <DataTable rows={dynamic} rowKey={r => String(r.symbol)} minWidth={900} columns={[
+          { key: "rank", label: "Rank", numeric: true, render: r => `#${asText(r.rank)}` },
+          { key: "symbol", label: "Symbol", render: r => asText(r.symbol) },
+          { key: "trend", label: "Trend", render: r => <StatusBadge value={r.trend_direction}/> },
+          { key: "score", label: "Score", numeric: true, render: r => formatNumber(r.score, 1) },
+          { key: "1h", label: "1h", numeric: true, render: r => `${formatNumber(asRow(r.metrics)?.momentum1hPct, 2)}%` },
+          { key: "4h", label: "4h", numeric: true, render: r => `${formatNumber(asRow(r.metrics)?.momentum4hPct, 2)}%` },
+          { key: "adx", label: "ADX", numeric: true, render: r => formatNumber(asRow(r.metrics)?.adx14, 1) },
+          { key: "volume", label: "Volume", numeric: true, render: r => `${formatNumber(asRow(r.metrics)?.relativeVolume, 2)}x` },
+          { key: "spread", label: "Spread", numeric: true, render: r => `${formatNumber(asRow(r.metrics)?.spreadPct, 3)}%` },
+          { key: "status", label: "Status", render: () => <StatusBadge value="DYNAMIC"/> },
+        ]}/>
+      </DataState>
+      <p className="muted-small">Core symbols are always monitored. A selected dynamic market still must pass Strategy Core, Gate, Risk, and Execution; trending is not an entry signal.</p>
+    </Panel>
     <Panel title="Market scanner" subtitle="Select an instrument; setup, context veto and risk retain separate states">
       <DataState loading={market.loading} error={market.error} empty={!scanner.length} hasData={market.data !== null} emptyTitle="Scanner is waiting for a confirmed market cycle">
         <DataTable rows={scanner} rowKey={r => String(r.instrument)} onRowClick={r => setSelected(String(r.instrument))} minWidth={1050} columns={[

@@ -13,11 +13,12 @@ import { DEFAULT_V2_PARAMS } from "../src/strategy/core-v2.ts";
 import { scannerProjection, type evolutionFamilies } from "../src/core/workstation.ts";
 import type { ScanRow } from "../src/strategy/scanner.ts";
 import type { ExecutorDeps } from "../src/execution/executor.ts";
+import type { WatchlistProjection } from "../src/market/dynamic-watchlist.ts";
 
 const symbol = "BTC-USDT-SWAP";
 const json = <T>(response: Response): Promise<T> => response.json() as Promise<T>;
 type RiskResponse = ReturnType<RuntimeRiskService["snapshot"]> & { audit: Array<{ payload: string }> };
-async function fixture(t: test.TestContext) {
+async function fixture(t: test.TestContext, dynamicWatchlist?: { projection(): WatchlistProjection; refreshManual(): Promise<WatchlistProjection> }) {
   const root = mkdtempSync(path.join(os.tmpdir(), "evoq-workstation-api-"));
   const store = openStore(root), risk = loadRiskConfig(), trading = loadTradingConfig();
   ensureV2Registry(store);
@@ -28,13 +29,25 @@ async function fixture(t: test.TestContext) {
   } } as unknown as ExecutorDeps;
   const server = startDashboard({ port: 0, trading, risk, runtimeRisk: new RuntimeRiskService({ store, risk }),
     deps: () => deps, strategyCoreVersion: 2, getLastTick: () => null, getScan: () => [], getKillReason: () => null,
-    evolution: { enabled: true, reviewEvery: true, signalInterval: 8, strategyInterval: 15, minSample: 20, maxWeightChangePct: 5, maxParamChanges: 1 } });
+    evolution: { enabled: true, reviewEvery: true, signalInterval: 8, strategyInterval: 15, minSample: 20, maxWeightChangePct: 5, maxParamChanges: 1 }, ...(dynamicWatchlist ? { dynamicWatchlist } : {}) });
   t.after(() => { server.close(); store.close(); rmSync(root, { recursive: true, force: true }); });
   await new Promise<void>(resolve => setImmediate(resolve));
   const base = `http://127.0.0.1:${server.address()!.port}`;
   const request = (route: string, init?: RequestInit) => fetch(base + route, init);
   return { store, risk, request, base, exchangeRequests: () => exchangeRequests };
 }
+
+test("watchlist API reports a persisted projection and manual refresh remains same-origin", async t => {
+  let manual = 0;
+  const projection = (): WatchlistProjection => ({ generated_at: "2026-10-10T00:15:00.000Z", stale: false, stale_age_ms: 0, next_refresh: "2026-10-11T00:15:00.000Z",
+    status: "CURRENT", core: [{ symbol, kind: "CORE" }], dynamic: [{ rank: 1, symbol: "SUI-USDT-SWAP", score: 81.2, trend_direction: "BULLISH", metrics: { momentum1hPct: 1, momentum4hPct: 3, adx14: 30, emaSeparationPct: 1, relativeVolume: 1.2, spreadPct: 0.1, liquidityUsdt: 2_000_000 }, status: "DYNAMIC" }], active: [symbol, "SUI-USDT-SWAP"], statistics: { discovered: 9, basic: 2, analyzed: 2, qualifying: 1, selected: 1, requestCount: 4, durationMs: 10 } });
+  const f = await fixture(t, { projection, refreshManual: async () => { manual++; return projection(); } });
+  const get = await json<{ dynamic: Array<{ symbol: string }> }>(await f.request("/api/watchlist"));
+  assert.equal(get.dynamic[0]!.symbol, "SUI-USDT-SWAP");
+  assert.equal((await f.request("/api/watchlist", { method: "POST", headers: { origin: "https://external.invalid" } })).status, 403);
+  assert.equal((await f.request("/api/watchlist", { method: "POST" })).status, 200);
+  assert.equal(manual, 1);
+});
 
 test("risk API rejects ceilings, cross-origin writes and stale revisions; commits audited hot settings", async t => {
   const f = await fixture(t);

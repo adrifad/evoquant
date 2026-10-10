@@ -31,6 +31,8 @@ export interface Ticker {
   bidPx: number;
   askPx: number;
   ts: number;
+  volCcy24h?: number;
+  vol24h?: number;
 }
 
 // Spec §7.1 — server time (epoch ms); used at startup and for clock drift.
@@ -60,6 +62,9 @@ interface RawInstrument {
   minSz?: string;
   ctVal?: string;
   ctValCcy?: string;
+  state?: string;
+  settleCcy?: string;
+  listTime?: string;
 }
 
 function mapInstrument(raw: RawInstrument): InstrumentInfo {
@@ -70,6 +75,9 @@ function mapInstrument(raw: RawInstrument): InstrumentInfo {
     minSz: String(raw.minSz ?? ""),
     ctVal: String(raw.ctVal ?? ""),
     ctValCcy: String(raw.ctValCcy ?? ""),
+    state: String(raw.state ?? ""),
+    settleCcy: String(raw.settleCcy ?? ""),
+    listTime: Number(raw.listTime),
   };
 }
 
@@ -83,7 +91,17 @@ export async function getTicker(client: OkxClient, instId: string): Promise<Tick
     bidPx: Number(raw.bidPx),
     askPx: Number(raw.askPx),
     ts: Number(raw.ts),
+    volCcy24h: Number(raw.volCcy24h),
+    vol24h: Number(raw.vol24h),
   };
+}
+
+/** One batched SWAP ticker request for daily discovery. For derivatives,
+ * volCcy24h is base-currency volume; callers normalize it using last price. */
+export async function getTickers(client: OkxClient, instType: InstrumentType = "SWAP"): Promise<Ticker[]> {
+  const data = await client.get<RawTicker[]>("/api/v5/market/tickers", { instType });
+  return data.map((raw) => ({ instId: String(raw.instId ?? ""), last: Number(raw.last), bidPx: Number(raw.bidPx),
+    askPx: Number(raw.askPx), ts: Number(raw.ts), volCcy24h: Number(raw.volCcy24h), vol24h: Number(raw.vol24h) }));
 }
 
 interface RawTicker {
@@ -92,6 +110,8 @@ interface RawTicker {
   bidPx?: string;
   askPx?: string;
   ts?: string;
+  volCcy24h?: string;
+  vol24h?: string;
 }
 
 // Spec §7.3 — candles. Raw row: [ts, o, h, l, c, vol, volCcy, (volCcyQuote),

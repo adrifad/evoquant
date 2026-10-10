@@ -78,6 +78,22 @@ persisted historical candles. V2 evolution evidence remains separate by family.
 See [`docs/WORKSTATION_V2_REVIEW.md`](docs/WORKSTATION_V2_REVIEW.md) for the
 architecture review, implementation, verification and remaining limitations.
 
+## Daily Dynamic Watchlist
+
+The **Core Watchlist** is the seven configured permanent markets and is always
+monitored. The **Daily Dynamic Watchlist** is a deterministic, OKX-public-data
+selection of up to eight additional live USDT perpetual swaps. It runs at most
+once per UTC day (00:15 UTC by default), persists the selected metrics, and
+reuses the last successful snapshot after a discovery failure. A manual console
+refresh is explicitly audited.
+
+The **Strategy Scanner** is separate: it evaluates normal Strategy Core V2
+conditions only after a market is in the Core plus Dynamic universe. **Trending
+does not mean an entry signal.** Every selected dynamic instrument still has to
+pass Strategy Core, Gate, deterministic Risk, and execution checks. Symbols
+removed from the next daily selection remain monitored until any existing
+position closes, but cannot receive a new entry.
+
 ## Setup
 
 ```bash

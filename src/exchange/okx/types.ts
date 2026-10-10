@@ -17,6 +17,9 @@ export interface InstrumentInfo {
   ctVal: string;
   // spec §7.2 — contract value currency
   ctValCcy: string;
+  state?: string;
+  settleCcy?: string;
+  listTime?: number;
 }
 
 // spec §7.3 — market candle; `confirm` stays the raw OKX flag "0"|"1"

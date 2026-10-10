@@ -27,6 +27,20 @@ const TradingSchema = z.object({
   instrument: z.object({ id: z.string(), type: z.literal("SWAP") }),
   // multi-coin scan (§17): trade any watchlist member; instrument.id stays primary/anchor
   instruments: z.object({ watchlist: z.array(z.string()).min(1).optional() }).optional(),
+  dynamic_watchlist: z.object({
+    enabled: z.boolean().default(true),
+    dynamic_slots: z.number().int().min(0).max(8).default(8),
+    max_total_symbols: z.number().int().min(7).max(15).default(15),
+    refresh_hour_utc: z.number().int().min(0).max(23).default(0),
+    refresh_minute_utc: z.number().int().min(0).max(59).default(15),
+    filters: z.object({
+      min_listing_age_days: z.number().int().min(0).max(3650).default(7),
+      max_spread_pct: z.number().positive().max(2).default(0.15),
+      min_liquidity_usdt: z.number().positive().max(1_000_000_000).default(1_000_000),
+      candidate_analysis_limit: z.number().int().min(8).max(60).default(30),
+    }).default({ min_listing_age_days: 7, max_spread_pct: 0.15, min_liquidity_usdt: 1_000_000, candidate_analysis_limit: 30 }),
+  }).default({ enabled: true, dynamic_slots: 8, max_total_symbols: 15, refresh_hour_utc: 0, refresh_minute_utc: 15,
+    filters: { min_listing_age_days: 7, max_spread_pct: 0.15, min_liquidity_usdt: 1_000_000, candidate_analysis_limit: 30 } }),
   // 5m hybrid scalp engine (§46 fee guard) — deterministic signals + LLM gate/supervisor
   scalp: z.object({
     enabled: z.boolean().default(false),

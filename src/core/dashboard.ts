@@ -34,6 +34,7 @@ import { evolutionFamilies, scannerProjection } from "./workstation.ts";
 import type { ScanRow } from "../strategy/scanner.ts";
 import { getCandles, type Bar } from "../exchange/okx/market.ts";
 import { portfolioOpenRisk } from "../risk/portfolio-open-risk.ts";
+import type { WatchlistProjection } from "../market/dynamic-watchlist.ts";
 
 const log = createLogger("dashboard");
 const REPO_ROOT = path.resolve(import.meta.dirname, "../..");
@@ -62,6 +63,7 @@ export interface DashboardConfig {
   llmRoles?: RoleLlmService;
   runtimeRisk?: RuntimeRiskService;
   runtimeTrading?: RuntimeTradingService;
+  dynamicWatchlist?: { projection(): WatchlistProjection; refreshManual(): Promise<WatchlistProjection> };
   settingsFile?: string;
 }
 
@@ -282,6 +284,15 @@ export function startDashboard(cfg: DashboardConfig): DashboardServer {
       const weights = getWeights(store, "SWING_15M", { strategyCoreVersion: cfg.strategyCoreVersion ?? 1 });
       return send(200, { snapshot: tick?.features ?? null, regime: tick?.regime ?? "UNKNOWN", updatedAt: tick?.at ?? null,
         weights, ...(weightsByFamily ? { weightsByFamily } : {}), scan: scannerProjection(store, cfg.getScan() as ScanRow[], cfg.getLastTick()?.at ?? null) });
+    }
+    if (p === "/api/watchlist") {
+      if (!cfg.dynamicWatchlist) return send(503, { error: "Dynamic watchlist unavailable." });
+      if (method === "GET") return send(200, cfg.dynamicWatchlist.projection());
+      if (method === "POST") {
+        try { return send(200, await cfg.dynamicWatchlist.refreshManual()); }
+        catch { return send(503, { error: "Dynamic watchlist refresh failed; the previous snapshot remains active." }); }
+      }
+      return send(405, { error: "Method not allowed." });
     }
     if (p === "/api/evolution") {
       const strategies = store.db.prepare("SELECT name,version,parent_version,params,status,hypothesis,created_ts FROM strategy_versions ORDER BY name,version").all();

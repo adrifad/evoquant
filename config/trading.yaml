@@ -16,6 +16,21 @@ instruments:
     - DOGE-USDT-SWAP
     - ADA-USDT-SWAP
 
+# Core instruments are always monitored. Dynamic names are a deterministic
+# once-daily discovery universe; a trend score is never an entry instruction.
+dynamic_watchlist:
+  enabled: true
+  dynamic_slots: 8
+  max_total_symbols: 15
+  refresh_hour_utc: 0
+  refresh_minute_utc: 15
+  filters:
+    min_listing_age_days: 7
+    max_spread_pct: 0.15
+    # Estimated 24h USDT turnover = last price × OKX SWAP volCcy24h.
+    min_liquidity_usdt: 1000000
+    candidate_analysis_limit: 30
+
 timeframe: 15m
 
 account:

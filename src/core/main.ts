@@ -42,6 +42,7 @@ import { runOncePerGlobalCycle } from "./global-cycle.ts";
 import { RoleLlmService } from "./llm-role-service.ts";
 import { createLogger } from "./logger.ts";
 import { startDashboard } from "./dashboard.ts";
+import { DynamicWatchlistService } from "../market/dynamic-watchlist.ts";
 import YAML from "yaml";
 import { readFileSync } from "node:fs";
 import path from "node:path";
@@ -80,19 +81,23 @@ async function main(): Promise<void> {
   const llmRoles = new RoleLlmService({ root: REPO_ROOT, store });
   if (strategyCoreVersion === 2) ensureV2Registry(store, configuredV2Params);
   const { client } = createDemoExchange(env);
-  // multi-coin scan (§17): watchlist metadata cached at startup (§7.2/§43)
-  const watchlistReq = trading.instruments?.watchlist ?? [trading.instrument.id];
-  const allSwaps = await import("../exchange/okx/market.ts").then((m) => m.getInstruments(client, "SWAP"));
+  const dynamicWatchlist = new DynamicWatchlistService({ store, client, config: trading.dynamic_watchlist,
+    core: trading.instruments?.watchlist ?? [trading.instrument.id] });
+  await dynamicWatchlist.initialize();
   const instruments: Record<string, InstrumentInfo> = {};
-  for (const w of watchlistReq) {
-    const i = allSwaps.find((x) => x.instId === w);
-    if (i) instruments[w] = i;
-    else log.warn({ event: "watchlist_symbol_no_metadata", instId: w });
-  }
-  const watchlist = Object.keys(instruments);
+  dynamicWatchlist.syncCatalog(instruments);
+  const watchlist = dynamicWatchlist.currentActiveUniverse((getOpenTrades(store) as Array<Record<string, unknown>>).map((t) => String(t.instrument)));
+  dynamicWatchlist.applyRiskAllowlist(risk.hard_limits.allowed_symbols);
   if (watchlist.length === 0) throw new Error("no watchlist instruments have metadata (§43)");
-  const runtimeTrading = new RuntimeTradingService({ store, trading, risk, instruments: watchlist });
+  const runtimeTrading = new RuntimeTradingService({ store, trading, risk, instruments: dynamicWatchlist.currentEntryUniverse() });
   const deps = { client, trading, risk, store, instruments, watchlist };
+  const syncDynamicUniverse = () => {
+    dynamicWatchlist.syncCatalog(instruments);
+    dynamicWatchlist.applyRiskAllowlist(risk.hard_limits.allowed_symbols);
+    runtimeTrading.setInstruments(dynamicWatchlist.currentEntryUniverse());
+    const open = (getOpenTrades(store) as Array<Record<string, unknown>>).map((t) => String(t.instrument));
+    watchlist.splice(0, watchlist.length, ...dynamicWatchlist.currentActiveUniverse(open));
+  };
   if (!runtimePolicy.evolutionEnabled) {
     logSystemEvent(store, "EVOLUTION_FROZEN", { reason: baselineMode ? "baseline_validation_mode" : "configuration_disabled",
       scalp: baselineMode ? "disabled" : "unchanged", maxConcurrentPositions: risk.hard_limits.max_concurrent_positions });
@@ -160,6 +165,9 @@ async function main(): Promise<void> {
     getKillReason: () => getLastKillReason(),
     getScan: () => lastScan,
     llmRoles,
+    dynamicWatchlist: { projection: () => dynamicWatchlist.projection(), refreshManual: async () => {
+      const result = await dynamicWatchlist.refreshManual(); syncDynamicUniverse(); return result;
+    } },
   });
 
   const ctxFor = (instId2: string, features: FeatureSnapshot, regime: Regime, strategies: StrategyDef[], candidate?: TradeCandidate) => ({
@@ -206,9 +214,10 @@ async function main(): Promise<void> {
       for (const snap of snaps) persistMarketSnapshot(store, snapshotTs, snap.instrument, snap.features);
       if (anchorSnap) lastTick = { features: anchorSnap.features, regime: anchorSnap.regime, at: snapshotTs };
       // 2) deterministic pre-rank (§37 opportunity agent as scanner)
+      const entrySnaps = snaps.filter((snap) => dynamicWatchlist.currentEntryUniverse().includes(snap.instrument));
       const rows = strategyCoreVersion === 2
-        ? scanCoreV2(snaps, histories, activeV2Params, activeV2Versions, v2Weights(store, activeV2Versions), trading.strategy_core.enabled_families)
-        : scanInstruments(snaps, trading.strategies_enabled
+        ? scanCoreV2(entrySnaps, histories, activeV2Params, activeV2Versions, v2Weights(store, activeV2Versions), trading.strategy_core.enabled_families)
+        : scanInstruments(entrySnaps, trading.strategies_enabled
           ? strategies.filter((strategy) => trading.strategies_enabled!.includes(`${strategy.name}_V${strategy.version}`))
           : strategies, getWeights(store, "SWING_15M", { strategyCoreVersion: 1 }));
       lastScan = rows;
@@ -378,6 +387,15 @@ async function main(): Promise<void> {
   sched.start();
   await tick(); // immediate first evaluation with warm-up data
 
+  let dynamicRefreshTimer: NodeJS.Timeout | undefined;
+  const scheduleDynamicRefresh = () => {
+    const next = Date.parse(dynamicWatchlist.projection().next_refresh);
+    dynamicRefreshTimer = setTimeout(() => {
+      void dynamicWatchlist.refreshIfDue().then(syncDynamicUniverse).finally(scheduleDynamicRefresh);
+    }, Math.max(1_000, next - Date.now()));
+  };
+  scheduleDynamicRefresh();
+
   // 5m hybrid scalp engine (user mode choice 2026-10-05): deterministic signals
   // on 1m closes, LLM supervisor (stance) + LLM gate (per-setup veto), fail-closed.
   let scalpRunner: ScalpRunner | undefined;
@@ -387,13 +405,14 @@ async function main(): Promise<void> {
     scalpRunner = new ScalpRunner({
       client, trading, risk, store, instruments, cfg: scalpCfg,
       llm: llmRoles,
+      entryUniverse: () => dynamicWatchlist.currentEntryUniverse(),
     });
     scalpRunner.start();
   }
 
   process.on("SIGINT", () => {
     log.warn({ event: "sigint_emergency_stop" });
-    void emergencyStop(deps).finally(() => { sched.stop(); clearInterval(intrabar); clearInterval(evidenceFinalizer); scalpRunner?.stop(); store.close(); process.exit(0); });
+    void emergencyStop(deps).finally(() => { sched.stop(); clearInterval(intrabar); clearInterval(evidenceFinalizer); if (dynamicRefreshTimer) clearTimeout(dynamicRefreshTimer); scalpRunner?.stop(); store.close(); process.exit(0); });
   });
 }
 

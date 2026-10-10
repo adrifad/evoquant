@@ -53,6 +53,7 @@ export interface ScalpDeps {
   instruments: Record<string, InstrumentInfo>;
   llm: RoleLlmService;
   cfg: ScalpCfg;
+  entryUniverse?: () => readonly string[];
 }
 
 function dayStartIso(): string {
@@ -115,7 +116,7 @@ export class ScalpRunner {
 
   private async symbolContexts(): Promise<Array<{ instrument: string; features: FeatureSnapshot; regime: Regime; closes1m: import("../exchange/okx/types.ts").Candle[]; last5m: { close: number } | null }>> {
     const out = [];
-    for (const sym of this.d.trading.instruments?.watchlist ?? []) {
+    for (const sym of this.d.entryUniverse?.() ?? this.d.trading.instruments?.watchlist ?? []) {
       if (!this.d.instruments[sym]) continue;
       const c15 = (await getCandles(this.d.client, sym, "15m", 80)).filter((c) => c.confirm === "1").sort((a, b) => a.ts - b.ts);
       const c5 = (await getCandles(this.d.client, sym, this.d.cfg.signal_tf, 8)).filter((c) => c.confirm === "1").sort((a, b) => a.ts - b.ts);

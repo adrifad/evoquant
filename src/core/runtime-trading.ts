@@ -40,7 +40,7 @@ export function entrySettingsFingerprint(trading: TradingConfig, risk: RiskConfi
 export class RuntimeTradingService {
   private revision = 0;
   private readonly store: Store;
-  private readonly instruments: readonly string[];
+  private instruments: string[];
   readonly trading: TradingConfig;
   readonly risk: RiskConfig;
   constructor(options: { store: Store; trading: TradingConfig; risk: RiskConfig; instruments: string[] }) {
@@ -56,6 +56,8 @@ export class RuntimeTradingService {
   private allowedInstruments(): string[] {
     return this.instruments.filter((id) => this.risk.hard_limits.allowed_symbols.includes(id));
   }
+  /** Discovery updates this bounded runtime list; persisted settings are still validated on write. */
+  setInstruments(instruments: readonly string[]): void { this.instruments = [...new Set(instruments)]; }
   private validateInstrument(id: string): void {
     if (!this.allowedInstruments().includes(id)) {
       throw new RuntimeTradingError(400, "INVALID_TRADING_INSTRUMENT", "Select an instrument in the available watchlist and risk allowlist.");

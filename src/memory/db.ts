@@ -197,6 +197,43 @@ CREATE TABLE IF NOT EXISTS llm_runs (
   context_ref TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_llm_runs_role_ts ON llm_runs(role,ts DESC);
+CREATE TABLE IF NOT EXISTS dynamic_watchlist_runs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  snapshot_date TEXT NOT NULL,
+  generated_at TEXT NOT NULL,
+  source TEXT NOT NULL, -- AUTOMATIC | MANUAL
+  status TEXT NOT NULL, -- SUCCESS | FAILED
+  attempts INTEGER NOT NULL,
+  candidate_count INTEGER NOT NULL DEFAULT 0,
+  analyzed_count INTEGER NOT NULL DEFAULT 0,
+  qualifying_count INTEGER NOT NULL DEFAULT 0,
+  selected_count INTEGER NOT NULL DEFAULT 0,
+  request_count INTEGER NOT NULL DEFAULT 0,
+  duration_ms INTEGER NOT NULL DEFAULT 0,
+  error_reason TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_dynamic_watchlist_runs_date ON dynamic_watchlist_runs(snapshot_date,generated_at DESC);
+CREATE TABLE IF NOT EXISTS dynamic_watchlist_snapshots (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  snapshot_date TEXT NOT NULL,
+  generated_at TEXT NOT NULL,
+  source TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'SUCCESS'
+);
+CREATE INDEX IF NOT EXISTS idx_dynamic_watchlist_snapshots_date ON dynamic_watchlist_snapshots(snapshot_date,generated_at DESC);
+CREATE TABLE IF NOT EXISTS dynamic_watchlist_entries (
+  snapshot_id INTEGER NOT NULL REFERENCES dynamic_watchlist_snapshots(id) ON DELETE CASCADE,
+  symbol TEXT NOT NULL,
+  rank INTEGER NOT NULL,
+  score REAL NOT NULL,
+  trend_direction TEXT NOT NULL,
+  selected INTEGER NOT NULL DEFAULT 1,
+  metrics_json TEXT NOT NULL,
+  instrument_json TEXT NOT NULL,
+  selection_reason TEXT,
+  PRIMARY KEY(snapshot_id,symbol)
+);
+CREATE INDEX IF NOT EXISTS idx_dynamic_watchlist_entries_snapshot ON dynamic_watchlist_entries(snapshot_id,rank);
 CREATE TABLE IF NOT EXISTS instruments (
   instId TEXT PRIMARY KEY, instType TEXT, tickSz TEXT, lotSz TEXT, minSz TEXT,
   ctVal TEXT, ctValCcy TEXT, cached_ts TEXT
