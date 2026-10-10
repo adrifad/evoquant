@@ -12,7 +12,7 @@ import { DEFAULT_V2_PARAMS, StrategyV2ParamsSchema, type StrategyV2Id, type Stra
 import { createV2Challenger, getV2Champions, listV2Versions, V2_STRATEGIES } from "../strategy/v2-registry.ts";
 import { familyForV2 } from "../strategy/identity.ts";
 
-const ProposalSchema = z.object({
+export const ProposalSchema = z.object({
   proposals: z.array(z.object({
     strategy: z.enum(["TREND_FOLLOWING_V2", "BREAKOUT_V2", "MEAN_REVERSION_V2"]),
     parent_version: z.number().int().positive(),

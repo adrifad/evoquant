@@ -34,6 +34,17 @@ test("role endpoint, key, and model overrides remain isolated", () => {
   assert.equal(resolved.status, "AVAILABLE");
 });
 
+test("role capability overrides remain isolated", () => {
+  const env = {
+    LLM_GATE_SUPPORTS_JSON_OBJECT: "false", LLM_GATE_SUPPORTS_TEMPERATURE: "false", LLM_GATE_TOKEN_PARAMETER: "max_completion_tokens",
+    LLM_REVIEWER_SUPPORTS_JSON_OBJECT: "true", LLM_REVIEWER_SUPPORTS_TEMPERATURE: "true", LLM_REVIEWER_TOKEN_PARAMETER: "max_tokens",
+  };
+  const gate = getLlmConfigForRole("gate", { root: REPO_ROOT, env });
+  const reviewer = getLlmConfigForRole("reviewer", { root: REPO_ROOT, env });
+  assert.deepEqual(gate.config.capabilities, { supportsJsonObject: false, supportsTemperature: false, tokenParameter: "max_completion_tokens" });
+  assert.deepEqual(reviewer.config.capabilities, { supportsJsonObject: true, supportsTemperature: true, tokenParameter: "max_tokens" });
+});
+
 test("role-specific values override YAML and generic legacy settings are isolated to Gate", () => {
   const specific = getLlmConfigForRole("gate", { root: REPO_ROOT, env: {
     LLM_GATE_MODEL: "gate-override", LLM_MODEL: "legacy-model", LLM_BASE_URL: "https://legacy.example/v1", LLM_API_KEY: "legacy-key",

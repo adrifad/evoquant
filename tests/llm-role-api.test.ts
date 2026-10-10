@@ -66,7 +66,9 @@ test("role settings API isolates writes, preserves blank keys, masks secrets, te
     assert.equal(unconfirmed.status, 400);
     const connection = await fetch(`${base}/api/settings/llm-roles/gate/test`, { method: "POST", headers: { "content-type": "application/json" },
       body: JSON.stringify({ baseUrl: "https://draft-gate.test/v1", model: "draft-gate-model" }) }).then((response) => response.json()) as Record<string, unknown>;
-    assert.deepEqual(connection, { success: false, role: "gate", error: "AUTHENTICATION_FAILED" });
+    assert.equal(connection.success, false);
+    assert.equal(connection.error, "AUTHENTICATION_FAILED");
+    assert.equal(connection.http_status, 401);
     assert.deepEqual(requests, ["https://draft-gate.test/v1/chat/completions"]);
     const afterTest = await fetch(`${base}/api/settings/llm-roles`).then((response) => response.json()) as { roles: Array<Record<string, unknown>> };
     assert.equal(afterTest.roles.find((role) => role.role === "reviewer")?.lastFailure, null);

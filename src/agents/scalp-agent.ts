@@ -11,13 +11,13 @@ import { createLogger } from "../core/logger.ts";
 
 const log = createLogger("scalp-llm");
 
-const StanceSchema = z.object({
+export const StanceSchema = z.object({
   stance: z.enum(["AGGRESSIVE", "NEUTRAL", "DEFENSIVE"]),
   confidence: z.number().min(0).max(1),
   reason: z.string().max(300),
 }).strict();
 
-const GateSchema = z.object({
+export const ScalpCandidateGateSchema = z.object({
   verdict: z.enum(["ALLOW", "DENY"]),
   confidence: z.number().min(0).max(1),
   reason: z.string().max(200),
@@ -44,7 +44,7 @@ export async function gateSignal(roles: RoleLlmService, signal: ScalpSignal, cfg
   ctx: { stance: Stance; regime: Regime; atrPct15m: number; spreadOk: boolean }): Promise<{ allow: boolean; confidence: number; reason: string }> {
   const sys = `You are a veto gate for ONE crypto-scalp setup (demo futures). The deterministic engine already passed all hard rules; your ONLY job is to deny setups that look like classic traps: chasing vertical blow-offs, RSI extreme against direction, entry against higher-timeframe trend, or news-like gaps. The scalper's stop distance is ${((Math.abs(signal.price - signal.stopPx) / signal.price) * 100).toFixed(2)}% (1m-ATR based), take-profit ${((Math.abs(signal.tpPx - signal.price) / signal.price) * 100).toFixed(2)}%. Reply JSON {"verdict":"ALLOW"|"DENY","confidence":0-1,"reason":"max 200 chars"}. When uncertain, ALLOW — policy is handled elsewhere.`;
   const user = JSON.stringify({ signal, stance: ctx.stance, regime: ctx.regime, atrPct15m: ctx.atrPct15m, maxHoldS: cfgp.max_hold_s });
-  const out = await roles.json("scalp", sys, user, GateSchema, "scalp_candidate_gate");
+const out = await roles.json("scalp", sys, user, ScalpCandidateGateSchema, "scalp_candidate_gate");
   if (!out) { log.warn({ event: "gate_fail_closed", instrument: signal.instrument }); return { allow: false, confidence: 0, reason: "LLM gate unavailable → DENY (fail-closed §21)" }; }
   return { allow: out.verdict === "ALLOW", confidence: out.confidence, reason: out.reason };
 }

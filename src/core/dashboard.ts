@@ -358,6 +358,10 @@ export function startDashboard(cfg: DashboardConfig): DashboardServer {
       if (!cfg.llmRoles) return send(503, { error: "ROLE_SETTINGS_UNAVAILABLE" });
       if (method === "GET") return send(200, { roles: cfg.llmRoles.settings() });
     }
+    if (p === "/api/settings/llm-roles/diagnostics") {
+      if (!cfg.llmRoles) return send(503, { error: "ROLE_SETTINGS_UNAVAILABLE" });
+      if (method === "GET") return send(200, { window: { hour: "1h", day: "24h" }, roles: cfg.llmRoles.diagnostics() });
+    }
     const rolePath = p.match(/^\/api\/settings\/llm-roles\/([a-z]+)(?:\/(test|api-key))?$/);
     if (rolePath && cfg.llmRoles) {
       const roleName = rolePath[1] ?? "";
@@ -379,7 +383,7 @@ export function startDashboard(cfg: DashboardConfig): DashboardServer {
         }
       }
       if (method === "POST" && action === "test") {
-        const result = await cfg.llmRoles.testConnection(role, await readJson(req));
+        const result = await cfg.llmRoles.testRole(role, await readJson(req));
         return send(result.success ? 200 : 502, result);
       }
       if (method === "DELETE" && action === "api-key") {

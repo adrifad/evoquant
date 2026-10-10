@@ -11,6 +11,10 @@ llm:
       timeout_ms: 20000
       max_output_tokens: 250
       retries: 1
+      capabilities: &openai_compatible
+        supports_json_object: true
+        supports_temperature: true
+        token_parameter: max_tokens
       budget:
         max_calls_per_hour: 30
     scalp:
@@ -22,6 +26,7 @@ llm:
       timeout_ms: 20000
       max_output_tokens: 350
       retries: 1
+      capabilities: *openai_compatible
       budget:
         max_calls_per_hour: 12
     reviewer:
@@ -33,6 +38,7 @@ llm:
       timeout_ms: 60000
       max_output_tokens: 900
       retries: 2
+      capabilities: *openai_compatible
       budget:
         max_calls_per_hour: 10
     evolution:
@@ -44,6 +50,7 @@ llm:
       timeout_ms: 120000
       max_output_tokens: 1500
       retries: 2
+      capabilities: *openai_compatible
       budget:
         max_calls_per_day: 8
     critic:
@@ -55,6 +62,7 @@ llm:
       timeout_ms: 90000
       max_output_tokens: 1000
       retries: 2
+      capabilities: *openai_compatible
       max_revision_rounds: 1
       budget:
         max_calls_per_day: 8

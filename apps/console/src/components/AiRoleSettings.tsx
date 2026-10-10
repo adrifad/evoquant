@@ -9,6 +9,7 @@ interface RoleForm {
   enabled: boolean; provider: string; baseUrl: string; apiKey: string; model: string;
   temperature: string; timeoutMs: string; maxOutputTokens: string; retryCount: string;
   maxCallsPerHour: string; maxCallsPerDay: string; maxRevisionRounds: string;
+  supportsJsonObject: boolean; supportsTemperature: boolean; tokenParameter: "max_tokens" | "max_completion_tokens";
 }
 
 const ROLE_NAMES: RoleName[] = ["gate", "scalp", "reviewer", "evolution", "critic"];
@@ -21,7 +22,7 @@ const ROLE_COPY: Record<RoleName, { title: string; purpose: string }> = {
 };
 const EMPTY: RoleForm = {
   enabled: true, provider: "", baseUrl: "", apiKey: "", model: "", temperature: "0.2",
-  timeoutMs: "20000", maxOutputTokens: "250", retryCount: "1", maxCallsPerHour: "", maxCallsPerDay: "", maxRevisionRounds: "1",
+  timeoutMs: "20000", maxOutputTokens: "250", retryCount: "1", maxCallsPerHour: "", maxCallsPerDay: "", maxRevisionRounds: "1", supportsJsonObject: true, supportsTemperature: true, tokenParameter: "max_tokens",
 };
 
 export function AiRoleSettings() {
@@ -29,7 +30,7 @@ export function AiRoleSettings() {
   const roles = useMemo(() => asRows(asRow(api.data)?.roles), [api.data]);
   const [forms, setForms] = useState<Partial<Record<RoleName, RoleForm>>>({});
   const [dirty, setDirty] = useState<Partial<Record<RoleName, boolean>>>({});
-  const [busy, setBusy] = useState<{ role: RoleName; action: "save" | "test" | "clear" } | null>(null);
+  const [busy, setBusy] = useState<{ role: RoleName; action: "save" | "test" | "schema" | "clear" } | null>(null);
   const [message, setMessage] = useState<Partial<Record<RoleName, { text: string; tone: string }>>>({});
   const [testMessage, setTestMessage] = useState<Partial<Record<RoleName, string>>>({});
 
@@ -66,14 +67,16 @@ export function AiRoleSettings() {
     } finally { setBusy(null); }
   };
 
-  const testConnection = async (role: RoleName) => {
-    setBusy({ role, action: "test" }); setTestMessage(previous => ({ ...previous, [role]: "" }));
+  const testConnection = async (role: RoleName, mode: "connection" | "schema") => {
+    setBusy({ role, action: mode === "schema" ? "schema" : "test" }); setTestMessage(previous => ({ ...previous, [role]: "" }));
     try {
-      const response = await fetch(`/api/settings/llm-roles/${role}/test`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(payload(forms[role] ?? EMPTY)) });
+      const response = await fetch(`/api/settings/llm-roles/${role}/test`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ ...payload(forms[role] ?? EMPTY), mode }) });
       const result = await readResponse(response);
-      if (!response.ok || result.success !== true) throw new Error([asText(result.error, `Connection test failed (${response.status})`), asText(result.detail, "")].filter(Boolean).join(": "));
+      if (!response.ok || result.success !== true) throw new Error([asText(result.failure_class, asText(result.error, `Validation failed (${response.status})`)), asText(result.failure_reason, ""), result.http_status == null ? "" : `HTTP ${asText(result.http_status)}`].filter(Boolean).join(" · "));
       const latency = asNumber(result.latency_ms);
-      setTestMessage(previous => ({ ...previous, [role]: `Connection succeeded${latency === null ? "." : ` in ${Math.round(latency)} ms.`}` }));
+      const checks = asRow(result.checks);
+      const details = mode === "schema" && role === "scalp" ? Object.entries(checks ?? {}).map(([name, value]) => `${name}: ${asRow(value)?.success === true ? "PASS" : "FAIL"}`).join(" · ") : "";
+      setTestMessage(previous => ({ ...previous, [role]: `${mode === "schema" ? "Role validation" : "Connection"} succeeded${latency === null ? "." : ` in ${Math.round(latency)} ms.`}${details ? ` ${details}` : ""}` }));
       await api.reload(true);
     } catch (error) {
       setTestMessage(previous => ({ ...previous, [role]: error instanceof Error ? error.message : "Connection test failed." }));
@@ -134,14 +137,20 @@ export function AiRoleSettings() {
               <label className="role-form-field"><span>HTTP requests / hour</span><input type="number" min="1" max="100000" value={form.maxCallsPerHour} onChange={event => change(roleName, "maxCallsPerHour", event.target.value)} placeholder="Keep saved limit"/></label>
               <label className="role-form-field"><span>HTTP requests / day</span><input type="number" min="1" max="1000000" value={form.maxCallsPerDay} onChange={event => change(roleName, "maxCallsPerDay", event.target.value)} placeholder="Keep saved limit"/></label>
               {roleName === "critic" ? <label className="role-form-field"><span>Max revision rounds</span><select value={form.maxRevisionRounds} onChange={event => change(roleName, "maxRevisionRounds", event.target.value)}><option value="0">0: no revision</option><option value="1">1: one revision</option></select></label> : null}
+              <details className="role-form-wide"><summary>Advanced provider compatibility</summary><div className="ai-role-form">
+                <label className="role-enabled"><input type="checkbox" checked={form.supportsJsonObject} onChange={event => change(roleName, "supportsJsonObject", event.target.checked)}/><span>JSON object response mode</span></label>
+                <label className="role-enabled"><input type="checkbox" checked={form.supportsTemperature} onChange={event => change(roleName, "supportsTemperature", event.target.checked)}/><span>Temperature support</span></label>
+                <label className="role-form-field"><span>Token parameter</span><select value={form.tokenParameter} onChange={event => change(roleName, "tokenParameter", event.target.value)}><option value="max_tokens">max_tokens</option><option value="max_completion_tokens">max_completion_tokens</option></select></label>
+              </div></details>
               <div className="ai-role-actions role-form-wide">
                 <button className="primary-button" type="submit" disabled={isBusy}><Save size={13} aria-hidden="true"/>{busy?.role === roleName && busy.action === "save" ? "Saving" : "Save role"}</button>
-                <button className="secondary-button" type="button" onClick={() => void testConnection(roleName)} disabled={isBusy}><PlugZap size={13} aria-hidden="true"/>{busy?.role === roleName && busy.action === "test" ? "Testing" : "Test connection"}</button>
+                <button className="secondary-button" type="button" onClick={() => void testConnection(roleName, "connection")} disabled={isBusy}><PlugZap size={13} aria-hidden="true"/>{busy?.role === roleName && busy.action === "test" ? "Testing" : "Test connection"}</button>
+                <button className="secondary-button" type="button" onClick={() => void testConnection(roleName, "schema")} disabled={isBusy}>{busy?.role === roleName && busy.action === "schema" ? "Validating" : "Validate role"}</button>
                 <button className="secondary-button role-clear-key" type="button" onClick={() => void clearKey(roleName)} disabled={isBusy || role.apiKeyConfigured !== true}><Trash2 size={13} aria-hidden="true"/>{busy?.role === roleName && busy.action === "clear" ? "Clearing" : "Clear key"}</button>
               </div>
-              <p className="role-message role-form-wide">Connection test checks a structured reply using your token and timeout settings, capped at 2048 tokens and 60 seconds, with no retries.</p>
+              <p className="role-message role-form-wide">Connection checks transport. Validate role uses the production response schema without creating trading, review, or evolution records.</p>
               {currentMessage ? <p className={`role-message role-message-${currentMessage.tone}`} role="status">{currentMessage.text}</p> : null}
-              {currentTest ? <p className={`role-message ${currentTest.startsWith("Connection succeeded") ? "role-message-positive" : "role-message-negative"}`} role="status">{currentTest}</p> : null}
+              {currentTest ? <p className={`role-message ${currentTest.includes("succeeded") ? "role-message-positive" : "role-message-negative"}`} role="status">{currentTest}</p> : null}
             </form>
             <div className="ai-role-health" aria-label={`${ROLE_COPY[roleName].title} request health`}>
               <div><span>Last success</span><strong>{formatTime(role.lastSuccess)}</strong></div>
@@ -168,6 +177,9 @@ function fromRow(row: Row): RoleForm {
     maxCallsPerHour: budget.maxCallsPerHour == null ? "" : String(budget.maxCallsPerHour),
     maxCallsPerDay: budget.maxCallsPerDay == null ? "" : String(budget.maxCallsPerDay),
     maxRevisionRounds: String(row.maxRevisionRounds ?? EMPTY.maxRevisionRounds),
+    supportsJsonObject: asRow(row.capabilities)?.supportsJsonObject !== false,
+    supportsTemperature: asRow(row.capabilities)?.supportsTemperature !== false,
+    tokenParameter: asText(asRow(row.capabilities)?.tokenParameter, "max_tokens") === "max_completion_tokens" ? "max_completion_tokens" : "max_tokens",
   };
 }
 
@@ -181,6 +193,7 @@ function payload(form: RoleForm): Row {
     model: form.model, temperature: number(form.temperature), timeoutMs: number(form.timeoutMs),
     maxOutputTokens: number(form.maxOutputTokens), retryCount: number(form.retryCount), budget,
     ...(form.maxRevisionRounds !== "" ? { maxRevisionRounds: number(form.maxRevisionRounds) } : {}),
+    capabilities: { supportsJsonObject: form.supportsJsonObject, supportsTemperature: form.supportsTemperature, tokenParameter: form.tokenParameter },
   };
 }
 

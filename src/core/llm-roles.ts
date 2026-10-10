@@ -22,6 +22,11 @@ const DefaultsSchema = z.object({
   retries: z.number().int().min(0).max(3),
   budget: BudgetSchema,
   max_revision_rounds: z.number().int().min(0).max(1).optional(),
+  capabilities: z.object({
+    supports_json_object: z.boolean().default(true),
+    supports_temperature: z.boolean().default(true),
+    token_parameter: z.enum(["max_tokens", "max_completion_tokens"]).default("max_tokens"),
+  }).default({ supports_json_object: true, supports_temperature: true, token_parameter: "max_tokens" }),
 }).strict();
 
 const RolesFileSchema = z.object({ llm: z.object({ roles: z.record(z.string(), z.unknown()) }) });
@@ -44,6 +49,7 @@ export interface RoleLlmConfig {
   retryCount: number;
   budget: RoleBudget;
   maxRevisionRounds: 0 | 1;
+  capabilities: { supportsJsonObject: boolean; supportsTemperature: boolean; tokenParameter: "max_tokens" | "max_completion_tokens" };
 }
 
 export type RoleHealthStatus = "AVAILABLE" | "UNCONFIGURED" | "DISABLED" | "ERROR";
@@ -53,8 +59,9 @@ export interface ResolvedRoleConfig {
   errorClass?: "INVALID_ROLE_CONFIG" | "INVALID_BASE_URL";
 }
 
-export type RuntimeRoleConfig = Partial<Omit<RoleLlmConfig, "role" | "budget">> & {
+export type RuntimeRoleConfig = Partial<Omit<RoleLlmConfig, "role" | "budget" | "capabilities">> & {
   budget?: RoleBudget;
+  capabilities?: Partial<RoleLlmConfig["capabilities"]>;
 };
 
 export interface RoleResolutionOptions {
@@ -64,7 +71,7 @@ export interface RoleResolutionOptions {
   defaults?: unknown;
 }
 
-const ROLE_ENV_NAMES = ["ENABLED", "PROVIDER", "BASE_URL", "API_KEY", "MODEL", "TEMPERATURE", "TIMEOUT_MS", "MAX_OUTPUT_TOKENS", "RETRIES", "MAX_CALLS_PER_HOUR", "MAX_CALLS_PER_DAY", "MAX_REVISION_ROUNDS"] as const;
+const ROLE_ENV_NAMES = ["ENABLED", "PROVIDER", "BASE_URL", "API_KEY", "MODEL", "TEMPERATURE", "TIMEOUT_MS", "MAX_OUTPUT_TOKENS", "RETRIES", "MAX_CALLS_PER_HOUR", "MAX_CALLS_PER_DAY", "MAX_REVISION_ROUNDS", "SUPPORTS_JSON_OBJECT", "SUPPORTS_TEMPERATURE", "TOKEN_PARAMETER"] as const;
 
 export function roleEnvKey(role: LlmRole, name: typeof ROLE_ENV_NAMES[number]): string {
   return `LLM_${role.toUpperCase()}_${name}`;
@@ -144,6 +151,11 @@ export function getLlmConfigForRole(role: LlmRole, options: RoleResolutionOption
       retryCount: parseNumber(selected(roleRuntime.retryCount, "RETRIES", roleDefaults.retries), roleDefaults.retries),
       budget,
       maxRevisionRounds: parseNumber(selected(roleRuntime.maxRevisionRounds, "MAX_REVISION_ROUNDS", roleDefaults.max_revision_rounds ?? 1), 1) as 0 | 1,
+      capabilities: {
+        supportsJsonObject: parseBoolean(selected(roleRuntime.capabilities?.supportsJsonObject, "SUPPORTS_JSON_OBJECT", roleDefaults.capabilities.supports_json_object), roleDefaults.capabilities.supports_json_object),
+        supportsTemperature: parseBoolean(selected(roleRuntime.capabilities?.supportsTemperature, "SUPPORTS_TEMPERATURE", roleDefaults.capabilities.supports_temperature), roleDefaults.capabilities.supports_temperature),
+        tokenParameter: String(selected(roleRuntime.capabilities?.tokenParameter, "TOKEN_PARAMETER", roleDefaults.capabilities.token_parameter)) as "max_tokens" | "max_completion_tokens",
+      },
     };
     validateResolvedConfig(config);
     const hasRuntimeOrEnvUrl = config.baseUrl.length > 0;
@@ -199,6 +211,7 @@ function validateResolvedConfig(config: RoleLlmConfig): void {
     maxOutputTokens: z.number().int().min(1).max(16_000), retryCount: z.number().int().min(0).max(3),
     budget: z.object({ maxCallsPerHour: z.number().int().positive().max(100_000).optional(), maxCallsPerDay: z.number().int().positive().max(1_000_000).optional() }),
     maxRevisionRounds: z.number().int().min(0).max(1),
+    capabilities: z.object({ supportsJsonObject: z.boolean(), supportsTemperature: z.boolean(), tokenParameter: z.enum(["max_tokens", "max_completion_tokens"]) }),
   }).parse(config);
   if (config.baseUrl) {
     if (/[\r\n\u0000]/.test(config.baseUrl)) throw new Error("invalid base URL");
@@ -217,6 +230,7 @@ function unavailable(role: LlmRole, partial: RuntimeRoleConfig, errorClass: Reso
       model: String(partial.model ?? ""), temperature: Number(partial.temperature ?? 0), timeoutMs: Number(partial.timeoutMs ?? 20_000),
       maxOutputTokens: Number(partial.maxOutputTokens ?? 250), retryCount: Number(partial.retryCount ?? 0),
       budget: partial.budget ?? {}, maxRevisionRounds: partial.maxRevisionRounds === 0 ? 0 : 1,
+      capabilities: { supportsJsonObject: true, supportsTemperature: true, tokenParameter: "max_tokens", ...partial.capabilities },
     },
     status: "ERROR", ...(errorClass ? { errorClass } : {}),
   };

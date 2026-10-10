@@ -92,7 +92,9 @@ test("test connection uses only its role and failures never persist provider bod
   });
   try {
     const result = await f.service.testConnection("gate", { baseUrl: "https://gate-draft.test/v1", model: "gate-draft-model" });
-    assert.deepEqual(result, { success: false, role: "gate", error: "AUTHENTICATION_FAILED" });
+    assert.equal(result.success, false);
+    assert.equal(result.error, "AUTHENTICATION_FAILED");
+    assert.equal(result.http_status, 401);
     assert.deepEqual(seen, ["https://gate-draft.test/v1/chat/completions"]);
     const persisted = JSON.stringify({ events: f.store.db.prepare("SELECT payload FROM system_events").all(), runs: f.store.db.prepare("SELECT * FROM llm_runs").all() });
     assert.equal(persisted.includes("fake-gate-secret"), false);
@@ -101,6 +103,49 @@ test("test connection uses only its role and failures never persist provider bod
     assert.equal(settings.includes("fake-gate-secret"), false);
     assert.equal(settings.includes("fake-review-secret"), false);
     assert.equal((f.store.db.prepare("SELECT COUNT(*) count FROM llm_runs WHERE role='reviewer'").get() as { count: number }).count, 0);
+  } finally { f.close(); }
+});
+
+test("schema probes use each production role schema without mutating domain records", async () => {
+  const payloads: Record<string, unknown> = {
+    gate: { verdict: "ALLOW", confidence: 0.8, reasoning: [], risk_flags: [] },
+    scalp_stance: { stance: "NEUTRAL", confidence: 0.8, reason: "diagnostic" },
+    scalp_gate: { verdict: "ALLOW", confidence: 0.8, reason: "diagnostic" },
+    reviewer: { observations: [], assumptions_check: {}, lesson_candidates: [] },
+    evolution: { proposals: [], no_change_reason: "diagnostic" },
+    critic: { verdict: "ACCEPT", confidence: 0.8, issues: [], reasoning_summary: [] },
+  };
+  const f = fixture(Object.fromEntries(["GATE", "SCALP", "REVIEWER", "EVOLUTION", "CRITIC"].flatMap(role => [[`LLM_${role}_BASE_URL`, `https://${role.toLowerCase()}.test/v1`], [`LLM_${role}_API_KEY`, `key-${role}`]])), async (_input, init) => {
+    const body = JSON.parse(String(init?.body)) as { messages: Array<{ content: string }> };
+    const user = body.messages[1]?.content ?? "";
+    const key = user.includes('"stance"') ? "scalp_stance" : user.includes('"reason":"diagnostic"') ? "scalp_gate" : user.includes('"observations"') ? "reviewer" : user.includes('"proposals"') ? "evolution" : user.includes('"issues"') ? "critic" : "gate";
+    return new Response(JSON.stringify({ choices: [{ message: { content: JSON.stringify(payloads[key]) } }] }));
+  });
+  try {
+    for (const role of ["gate", "scalp", "reviewer", "evolution", "critic"] as const) {
+      const result = await f.service.testRole(role, { mode: "schema" });
+      assert.equal(result.success, true, `${role}: ${JSON.stringify(result)}`);
+    }
+    assert.equal((f.store.db.prepare("SELECT COUNT(*) count FROM trade_reviews").get() as { count: number }).count, 0);
+    assert.equal((f.store.db.prepare("SELECT COUNT(*) count FROM lessons").get() as { count: number }).count, 0);
+    assert.equal((f.store.db.prepare("SELECT COUNT(*) count FROM strategy_versions WHERE status='CHALLENGER'").get() as { count: number }).count, 0);
+    const contexts = f.store.db.prepare("SELECT context_ref FROM llm_runs ORDER BY id").all() as Array<{ context_ref: string }>;
+    assert.ok(contexts.some(row => row.context_ref === "diagnostic_schema_scalp_stance"));
+    assert.ok(contexts.some(row => row.context_ref === "diagnostic_schema_scalp_gate"));
+  } finally { f.close(); }
+});
+
+test("successful request restores role health while retaining prior safe failure diagnostics", async () => {
+  let invalid = true;
+  const f = fixture({ LLM_GATE_BASE_URL: "https://gate.test/v1", LLM_GATE_API_KEY: "key" }, async () => new Response(JSON.stringify({ choices: [{ message: { content: invalid ? '{"ok":"wrong"}' : '{"ok":true}' } }] })));
+  try {
+    assert.equal(await f.service.json("gate", "s", "u", OkSchema, "candidate_gate"), null);
+    invalid = false;
+    assert.deepEqual(await f.service.json("gate", "s", "u", OkSchema, "candidate_gate"), { ok: true });
+    const health = f.service.settings().find(entry => entry.role === "gate");
+    assert.equal(health?.status, "AVAILABLE");
+    assert.equal(health?.lastStatus, "SUCCESS");
+    assert.equal(health?.lastFailureReason, "SCHEMA_MISMATCH");
   } finally { f.close(); }
 });
 
@@ -178,6 +223,6 @@ test("llm run ledger migration exists and contains no secret column", () => {
   const f = fixture({}, async () => successResponse());
   try {
     const columns = (f.store.db.prepare("PRAGMA table_info(llm_runs)").all() as Array<{ name: string }>).map((column) => column.name);
-    assert.deepEqual(columns, ["id", "ts", "role", "provider", "model", "status", "latency_ms", "input_tokens", "output_tokens", "error_class", "context_ref", "provider_requests"]);
+    assert.deepEqual(columns, ["id", "ts", "role", "provider", "model", "status", "latency_ms", "input_tokens", "output_tokens", "error_class", "context_ref", "provider_requests", "http_status", "failure_reason"]);
   } finally { f.close(); }
 });

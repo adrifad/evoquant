@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { z } from "zod";
-import { llmJsonDetailed } from "../src/core/llm.ts";
+import { buildChatCompletionRequest, llmJsonDetailed } from "../src/core/llm.ts";
 
 const schema = z.object({ ok: z.boolean() });
 const success = () => new Response(JSON.stringify({ choices: [{ message: { content: "{\"ok\":true}" } }],
@@ -88,4 +88,46 @@ test("transport never treats reasoning content as a final answer", async () => {
   assert.equal(result.status, "INVALID_RESPONSE");
   assert.equal(result.failureReason, "EMPTY_CONTENT");
   assert.equal(result.value, null);
+});
+
+test("request capabilities omit only unsupported provider parameters", () => {
+  const base = { baseUrl: "https://provider.test/v1", apiKey: "key", model: "model", maxOutputTokens: 12, temperature: 0.3 };
+  const defaultBody = buildChatCompletionRequest(base, "s", "u");
+  assert.equal(defaultBody.temperature, 0.3); assert.equal(defaultBody.max_tokens, 12); assert.deepEqual(defaultBody.response_format, { type: "json_object" });
+  const restricted = buildChatCompletionRequest({ ...base, capabilities: { supportsTemperature: false, supportsJsonObject: false, tokenParameter: "max_completion_tokens" } }, "s", "u");
+  assert.equal("temperature" in restricted, false); assert.equal("response_format" in restricted, false);
+  assert.equal(restricted.max_completion_tokens, 12); assert.equal("max_tokens" in restricted, false);
+});
+
+test("429 Retry-After and total deadline remain bounded", async () => {
+  let calls = 0, clock = 0; const waits: number[] = [];
+  const result = await llmJsonDetailed({ baseUrl: "https://provider.test/v1", apiKey: "key", model: "model", timeoutMs: 2_000, retryCount: 1, now: () => clock }, "s", "u", schema,
+    async () => { calls++; return new Response("busy", { status: 429, headers: { "Retry-After": "10" } }); },
+    async (ms) => { waits.push(ms); clock += ms; });
+  assert.equal(calls, 1, "provider-directed wait equal to the remaining deadline does not dispatch a second request");
+  assert.deepEqual(waits, [2_000]);
+  assert.equal(result.status, "TIMEOUT");
+});
+
+test("HTTP classifications retain status and never retry deterministic client errors", async () => {
+  for (const [code, status] of [[401, "AUTHENTICATION_FAILED"], [403, "AUTHENTICATION_FAILED"], [400, "HTTP_ERROR"], [404, "HTTP_ERROR"]] as const) {
+    let calls = 0;
+    const result = await llmJsonDetailed({ baseUrl: "https://provider.test/v1", apiKey: "key", model: "model", retryCount: 2 }, "s", "u", schema, async () => { calls++; return new Response("safe", { status: code }); });
+    assert.equal(result.status, status); assert.equal(result.httpStatus, code); assert.equal(calls, 1);
+  }
+});
+
+test("transient provider and network failures retry within the configured count", async () => {
+  for (const code of [500, 502, 503]) {
+    let calls = 0;
+    const result = await llmJsonDetailed({ baseUrl: "https://provider.test/v1", apiKey: "key", model: "model", retryCount: 1 }, "s", "u", schema, async () => {
+      calls++; return calls === 1 ? new Response("busy", { status: code }) : success();
+    }, async () => undefined);
+    assert.equal(result.status, "SUCCESS"); assert.equal(calls, 2);
+  }
+  let calls = 0;
+  const network = await llmJsonDetailed({ baseUrl: "https://provider.test/v1", apiKey: "key", model: "model", retryCount: 1 }, "s", "u", schema, async () => {
+    calls++; if (calls === 1) throw new TypeError("socket reset"); return success();
+  }, async () => undefined);
+  assert.equal(network.status, "SUCCESS"); assert.equal(calls, 2);
 });
