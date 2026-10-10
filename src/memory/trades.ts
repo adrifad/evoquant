@@ -70,8 +70,8 @@ export function openTrade(
 
 export interface ClosedMetrics {
   exitPx: number; exitTs: string; exitReason: string;
-  fees: number; funding: number | null;
-  pnl: number; pnlPct: number; resultR: number;
+  fees: number | null; funding: number | null;
+  pnl: number | null; pnlPct: number; resultR: number | null;
   mfe: number | null; mae: number | null; durationS: number;
 }
 
@@ -84,7 +84,7 @@ export function computeClosedMetrics(args: {
   exitReason: string;
   entryTs: string; exitTs: string;
   candlesWhileOpen: Candle[] | null;   // confirmed candles covering the complete open period
-  fees: number; funding: number | null;
+  fees: number | null; funding: number | null;
 }): ClosedMetrics {
   const { side, entryPx, stopPx, exitPx, contracts, ctVal } = args;
   const dir = side === "LONG" ? 1 : -1;
@@ -97,12 +97,15 @@ export function computeClosedMetrics(args: {
     mae = Math.max(mae ?? 0, side === "LONG" ? entryPx - c.l : c.h - entryPx);
   }
   const grossPnl = (exitPx - entryPx) * dir * contracts * ctVal;
-  const pnl = grossPnl - args.fees + (args.funding ?? 0);
+  // Gross price movement is known after a proven fill. NET PnL and R are not
+  // known until both exchange fees and funding are proven.
+  const accountingComplete = args.fees !== null && args.funding !== null;
+  const pnl = accountingComplete ? grossPnl - Number(args.fees) + Number(args.funding) : null;
   const pnlPct = entryPx > 0 ? ((exitPx - entryPx) * dir / entryPx) * 100 : 0;
   const riskPerUnit = Math.abs(entryPx - (args.initialStopPx ?? stopPx));
   const riskCapital = riskPerUnit * contracts * ctVal;
   // Net R: realized cash PnL after fees/funding divided by initial cash risk.
-  const resultR = riskCapital > 0 ? pnl / riskCapital : 0;
+  const resultR = pnl !== null && riskCapital > 0 ? pnl / riskCapital : null;
   const durationS = Math.max(0, Math.round((Date.parse(args.exitTs) - Date.parse(args.entryTs)) / 1000));
   return {
     exitPx, exitTs: args.exitTs, exitReason: args.exitReason,
@@ -112,19 +115,25 @@ export function computeClosedMetrics(args: {
 }
 
 export function closeTrade(store: Store, tradeId: string, m: ClosedMetrics): void {
-  const eligible = m.funding !== null && m.mfe !== null && m.mae !== null && Number.isFinite(m.resultR) ? 1 : 0;
-  const accountingQuality = m.funding === null ? "FUNDING_UNAVAILABLE" : "COMPLETE";
+  const accountingComplete = m.fees !== null && m.funding !== null;
+  const eligible = accountingComplete && m.mfe !== null && m.mae !== null && Number.isFinite(m.resultR) ? 1 : 0;
+  const accountingQuality = m.fees === null ? "FEE_PENDING" : m.funding === null ? "FUNDING_PENDING" : "COMPLETE";
+  const pendingReasons = [m.fees === null ? "FEE_LOOKUP_PENDING" : null, m.funding === null ? "FUNDING_LOOKUP_PENDING" : null,
+    m.mfe === null || m.mae === null ? "WAITING_FOR_CONFIRMED_CANDLE" : null].filter((reason): reason is string => reason !== null);
   store.db
     .prepare(
       `UPDATE trades SET status='CLOSED', result_r_basis=@resultRBasis, evidence_state=@evidenceState,
         evolution_evidence_eligible=@eligible, accounting_quality=@accountingQuality, exit_px=@exitPx, exit_ts=@exitTs, exit_reason=@exitReason,
         fees=@fees, funding=@funding, pnl=@pnl, pnl_pct=@pnlPct, result_r=@resultR,
-        mfe=@mfe, mae=@mae, duration_s=@durationS
+        mfe=@mfe, mae=@mae, duration_s=@durationS, evidence_reason=@evidenceReason,
+        evidence_attempts=0, evidence_next_retry_ts=@nextRetryTs
        WHERE trade_id=@tradeId AND status IN ('OPEN','RECONCILIATION_PENDING')`,
     )
-    .run({ tradeId, ...m, eligible, accountingQuality,
-      resultRBasis: m.funding === null ? "FEES_EX_FUNDING" : "NET",
-      evidenceState: eligible ? "VALID" : "ACCOUNTING_INCOMPLETE" });
+    .run({ tradeId, ...m, pnl: accountingComplete ? m.pnl : null, resultR: accountingComplete ? m.resultR : null, eligible, accountingQuality,
+      resultRBasis: accountingComplete ? "NET" : "PENDING",
+      evidenceState: eligible ? "VALID" : "EVIDENCE_PENDING",
+      evidenceReason: pendingReasons.join(",") || null,
+      nextRetryTs: eligible ? null : new Date().toISOString() });
 }
 
 export function getOpenTrades(store: Store): Array<Record<string, unknown>> {
@@ -134,8 +143,8 @@ export function getOpenTrades(store: Store): Array<Record<string, unknown>> {
 /** Missing exchange exit proof leaves the trade unresolved and ineligible for all learning. */
 export function markReconciliationPending(store: Store, tradeId: string, reason: string): void {
   store.db.prepare(`UPDATE trades SET status='RECONCILIATION_PENDING', evidence_state='RECONCILIATION_PENDING',
-    evolution_evidence_eligible=0, accounting_quality='PENDING', exit_reason=?
-    WHERE trade_id=? AND status IN ('OPEN','RECONCILIATION_PENDING')`).run(reason, tradeId);
+    evolution_evidence_eligible=0, accounting_quality='PENDING', evidence_reason=?, exit_reason=?
+    WHERE trade_id=? AND status IN ('OPEN','RECONCILIATION_PENDING')`).run(reason, reason, tradeId);
 }
 
 export function getClosedTrades(store: Store, limit = 500): Array<Record<string, unknown>> {

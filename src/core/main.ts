@@ -24,6 +24,7 @@ import { updateTradeStopPlus } from "../execution/position-management.ts";
 import { getBotState, setBotState } from "./state.ts";
 import { decide, gateCandidate, holdBecause, type Decision } from "../agents/decision-agent.ts";
 import { reviewTrade } from "../agents/reviewer-agent.ts";
+import { finalizePendingEvidence, reviewerEligibleTradeIds } from "../evidence/finalizer.ts";
 import { maybeEvolveStrategies } from "../agents/evolution-agent.ts";
 import { maybeEvolveV2Strategies } from "../agents/v2-evolution.ts";
 import { getWeights, maybeEvolveWeights, type SignalWeights } from "../learning/signal-weights.ts";
@@ -246,15 +247,18 @@ async function main(): Promise<void> {
           lastKill = (await runTick(deps, ctx, { instId: target.instrument, meta: instruments[target.instrument]! })).kill ?? lastKill;
         }
       }
-      // after tick: any newly-closed trades get reviewed (M4)
-      const closed = store.db.prepare("SELECT trade_id FROM trades WHERE status='CLOSED' AND evolution_evidence_eligible=1 AND trade_id NOT IN (SELECT trade_id FROM trade_reviews) ORDER BY exit_ts DESC LIMIT 3").all() as Array<{ trade_id: string }>;
+      // Resolve delayed exchange accounting and confirmed-candle coverage before
+      // an LLM ever sees the trade as learning evidence.
+      await finalizePendingEvidence({ client, store, instruments, trading });
+      // after tick: only deterministically final evidence gets reviewed (M4)
+      const closed = reviewerEligibleTradeIds(store);
       if (evolution.review_every_closed_trade) {
-        for (const c of closed) {
-          if (reviewsInFlight.has(c.trade_id)) continue;
-          reviewsInFlight.add(c.trade_id);
-          void reviewTrade(REPO_ROOT, llmRoles, store, c.trade_id).catch(() => {
-            log.warn({ event: "review_deferred", tradeId: c.trade_id });
-          }).finally(() => reviewsInFlight.delete(c.trade_id));
+        for (const tradeId of closed) {
+          if (reviewsInFlight.has(tradeId)) continue;
+          reviewsInFlight.add(tradeId);
+          void reviewTrade(REPO_ROOT, llmRoles, store, tradeId).catch(() => {
+            log.warn({ event: "review_deferred", tradeId });
+          }).finally(() => reviewsInFlight.delete(tradeId));
         }
       }
 
@@ -361,6 +365,15 @@ async function main(): Promise<void> {
     }
   }, 60_000);
 
+  let finalizerRunning = false;
+  const evidenceFinalizer = setInterval(() => {
+    if (finalizerRunning) return;
+    finalizerRunning = true;
+    void finalizePendingEvidence({ client, store, instruments, trading }).catch((error) => {
+      log.warn({ event: "evidence_finalizer_error", error: error instanceof Error ? error.message : String(error) });
+    }).finally(() => { finalizerRunning = false; });
+  }, 60_000);
+
   const sched = new CandleCloseScheduler(msForBar(trading.timeframe), tick);
   sched.start();
   await tick(); // immediate first evaluation with warm-up data
@@ -380,7 +393,7 @@ async function main(): Promise<void> {
 
   process.on("SIGINT", () => {
     log.warn({ event: "sigint_emergency_stop" });
-    void emergencyStop(deps).finally(() => { sched.stop(); clearInterval(intrabar); scalpRunner?.stop(); store.close(); process.exit(0); });
+    void emergencyStop(deps).finally(() => { sched.stop(); clearInterval(intrabar); clearInterval(evidenceFinalizer); scalpRunner?.stop(); store.close(); process.exit(0); });
   });
 }
 

@@ -110,7 +110,7 @@ function persistComparison(store: Store, comparison: Comparison): void {
 function tradeRs(store: Store, s: StrategyDef, engine: string): number[] {
   // AI-managed V1 exits have no deterministic historical analogue; keep them
   // out of demo-forward comparisons rather than mixing exit policies.
-  return (store.db.prepare("SELECT result_r r FROM trades WHERE status='CLOSED' AND evolution_evidence_eligible=1 AND result_r_basis='NET' AND engine=? AND strategy_core_version=1 AND strategy=? AND strategy_version=? AND result_r IS NOT NULL AND COALESCE(exit_reason,'')<>'AI_CLOSE'")
+  return (store.db.prepare("SELECT result_r r FROM trades WHERE status='CLOSED' AND evidence_state='VALID' AND evolution_evidence_eligible=1 AND result_r_basis='NET' AND engine=? AND strategy_core_version=1 AND strategy=? AND strategy_version=? AND result_r IS NOT NULL AND COALESCE(exit_reason,'')<>'AI_CLOSE'")
     .all(engine, s.name, s.version) as Array<{ r: number }>).map((x) => x.r);
 }
 

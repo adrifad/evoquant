@@ -255,7 +255,9 @@ export async function finalizeOpenTradeFromExchange(d: ExecutorDeps, t: Record<s
     contracts, ctVal, exitReason: fills.length ? "FILL_CONFIRM" : "RECONCILE",
     entryTs: String(t.entry_ts), exitTs: new Date(Number(exitFill.ts)).toISOString(),
     candlesWhileOpen: await excursionCandles(d, t, Date.parse(String(t.entry_ts)), Number(exitFill.ts)),
-    fees: fills.reduce((a, f) => a + Math.abs(Number(f.fee) || 0), 0), funding: null,
+    // Reconciliation history proves the exit, but it may omit entry fills.
+    // Let the evidence finalizer resolve the complete fee ledger.
+    fees: null, funding: null,
   });
   closeTrade(d.store, String(t.trade_id), m);
   log.info({ event: "trade:finalized_reconcile", tradeId: String(t.trade_id), resultR: m.resultR });
@@ -655,14 +657,19 @@ async function closeOpenTradeOnExchange(d: ExecutorDeps, t: Record<string, unkno
     throw error; // keep the trade OPEN and its exchange-side protection intact
   }
   // §27 fees: sum |fee| across this trade's fills (entry + close orders)
-  let feesPaid = 0;
+  let feesPaid: number | null = 0;
   for (const id of [String(t.ord_open_id ?? ""), placed.ordId]) {
-    if (!id) continue;
-    const fs = await getFills(d.client, String(t.instrument), id).catch(() => []);
+    if (!id) { feesPaid = null; continue; }
+    let fs: Awaited<ReturnType<typeof getFills>>;
+    try { fs = await getFills(d.client, String(t.instrument), id); }
+    catch { feesPaid = null; continue; }
+    if (fs.length === 0) { feesPaid = null; continue; }
     persistFills(d.store, fs.map((fx) => ({ tradeId: fx.tradeId, ordId: fx.ordId, clOrdId: fx.clOrdId,
       instId: fx.instId, fillPx: fx.fillPx, fillSz: fx.fillSz, fee: fx.fee, feeCcy: fx.feeCcy,
       side: fx.side, posSide: fx.posSide, ts: fx.ts })));
-    for (const fx of fs) feesPaid += Math.abs(Number(fx.fee) || 0);
+    if (feesPaid !== null) {
+      for (const fx of fs) feesPaid += Math.abs(Number(fx.fee) || 0);
+    }
   }
   const exitFill = [...(await getFills(d.client, String(t.instrument), placed.ordId).catch(() => []))]
     .find((fill) => fill.side === (side === "LONG" ? "sell" : "buy"));

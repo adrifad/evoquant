@@ -30,9 +30,12 @@ CREATE TABLE IF NOT EXISTS trades (
   engine TEXT NOT NULL DEFAULT 'SWING_15M', -- SWING_15M | SCALP_5M; legacy rows backfilled below
   result_r_basis TEXT NOT NULL DEFAULT 'NET',
   status TEXT NOT NULL,            -- OPEN | RECONCILIATION_PENDING | CLOSED
-  evidence_state TEXT NOT NULL DEFAULT 'OPEN', -- OPEN | RECONCILIATION_PENDING | VALID | ACCOUNTING_INCOMPLETE
-  evolution_evidence_eligible INTEGER NOT NULL DEFAULT 1,
-  accounting_quality TEXT NOT NULL DEFAULT 'PENDING', -- PENDING | FUNDING_UNAVAILABLE | COMPLETE
+  evidence_state TEXT NOT NULL DEFAULT 'OPEN', -- OPEN | RECONCILIATION_PENDING | EVIDENCE_PENDING | VALID | ACCOUNTING_INCOMPLETE | INVALID
+  evolution_evidence_eligible INTEGER NOT NULL DEFAULT 0,
+  accounting_quality TEXT NOT NULL DEFAULT 'PENDING', -- PENDING | FEE_PENDING | FUNDING_PENDING | COMPLETE
+  evidence_reason TEXT,
+  evidence_attempts INTEGER NOT NULL DEFAULT 0,
+  evidence_next_retry_ts TEXT,
   instrument TEXT NOT NULL,
   timeframe TEXT NOT NULL,
   side TEXT NOT NULL,              -- LONG | SHORT
@@ -249,6 +252,7 @@ export function openStore(root: string): Store {
   // lightweight column migration for pre-existing DBs
   const cols = new Set((db.prepare("PRAGMA table_info(trades)").all() as Array<{ name: string }>).map((c) => c.name));
   const hadEngine = cols.has("engine");
+  const hadEvidenceState = cols.has("evidence_state");
   if (!hadEngine) db.exec("ALTER TABLE trades ADD COLUMN engine TEXT NOT NULL DEFAULT 'SWING_15M'");
   if (!cols.has("result_r_basis")) db.exec("ALTER TABLE trades ADD COLUMN result_r_basis TEXT NOT NULL DEFAULT 'LEGACY_GROSS'");
   if (!cols.has("algo_id")) db.exec("ALTER TABLE trades ADD COLUMN algo_id TEXT");
@@ -261,6 +265,9 @@ export function openStore(root: string): Store {
   if (!cols.has("evidence_state")) db.exec("ALTER TABLE trades ADD COLUMN evidence_state TEXT NOT NULL DEFAULT 'OPEN'");
   if (!cols.has("evolution_evidence_eligible")) db.exec("ALTER TABLE trades ADD COLUMN evolution_evidence_eligible INTEGER NOT NULL DEFAULT 0");
   if (!cols.has("accounting_quality")) db.exec("ALTER TABLE trades ADD COLUMN accounting_quality TEXT NOT NULL DEFAULT 'PENDING'");
+  if (!cols.has("evidence_reason")) db.exec("ALTER TABLE trades ADD COLUMN evidence_reason TEXT");
+  if (!cols.has("evidence_attempts")) db.exec("ALTER TABLE trades ADD COLUMN evidence_attempts INTEGER NOT NULL DEFAULT 0");
+  if (!cols.has("evidence_next_retry_ts")) db.exec("ALTER TABLE trades ADD COLUMN evidence_next_retry_ts TEXT");
   // Historical records are Core 1 unless a future migration has explicit evidence.
   if (!cols.has("strategy_core_version")) db.exec("ALTER TABLE trades ADD COLUMN strategy_core_version INTEGER NOT NULL DEFAULT 1");
   db.exec(`UPDATE trades SET engine=CASE WHEN lower(timeframe)='scalp' THEN 'SCALP_5M' ELSE 'SWING_15M' END
@@ -270,6 +277,15 @@ export function openStore(root: string): Store {
   db.exec("UPDATE trades SET initial_stop_px=stop_px WHERE initial_stop_px IS NULL AND stop_px IS NOT NULL");
   db.exec(`UPDATE trades SET evidence_state=CASE WHEN status='CLOSED' THEN 'ACCOUNTING_INCOMPLETE' ELSE 'OPEN' END
     WHERE evidence_state IS NULL OR evidence_state=''`);
+  if (!hadEvidenceState) db.exec(`UPDATE trades SET evidence_state='EVIDENCE_PENDING', evidence_reason='LEGACY_EVIDENCE_RECHECK',
+    evolution_evidence_eligible=0 WHERE status='CLOSED'`);
+  // Before asynchronous finalization existed, closed records with incomplete
+  // accounting were terminal. Requeue only those legacy rows once; a row that
+  // has an explicit finalizer reason is an intentional terminal outcome.
+  db.exec(`UPDATE trades SET evidence_state='EVIDENCE_PENDING', evidence_reason='LEGACY_EVIDENCE_RECHECK',
+      evolution_evidence_eligible=0
+    WHERE status='CLOSED' AND evidence_state='ACCOUNTING_INCOMPLETE' AND evidence_reason IS NULL`);
+  db.exec("UPDATE trades SET evolution_evidence_eligible=0 WHERE evidence_state<>'VALID'");
   const lessonCols = new Set((db.prepare("PRAGMA table_info(lessons)").all() as Array<{ name: string }>).map((c) => c.name));
   if (!lessonCols.has("scope_engine")) db.exec("ALTER TABLE lessons ADD COLUMN scope_engine TEXT");
   if (!lessonCols.has("scope_strategy_version")) db.exec("ALTER TABLE lessons ADD COLUMN scope_strategy_version INTEGER");

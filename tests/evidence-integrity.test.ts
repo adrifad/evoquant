@@ -58,8 +58,8 @@ test("a disappeared position remains unresolved until a reliable exit fill is fo
 
   history = [{ instId: symbol, tradeId: "F1", ordId: "O-CLOSE", fillPx: "105", fillSz: "1", side: "sell", posSide: "long", execType: "T", ts: String(exitMs), fee: "0.1", feeCcy: "USDT" }];
   await finalizeOpenTradeFromExchange(deps, store.db.prepare("SELECT * FROM trades WHERE trade_id='TRD-EVIDENCE'").get() as Record<string, unknown>);
-  saved = store.db.prepare("SELECT status,exit_px,result_r,evolution_evidence_eligible FROM trades WHERE trade_id='TRD-EVIDENCE'").get() as Record<string, unknown>;
-  assert.deepEqual(saved, { status: "CLOSED", exit_px: 105, result_r: 2.45, evolution_evidence_eligible: 0 });
+  saved = store.db.prepare("SELECT status,exit_px,result_r,evidence_state,evolution_evidence_eligible FROM trades WHERE trade_id='TRD-EVIDENCE'").get() as Record<string, unknown>;
+  assert.deepEqual(saved, { status: "CLOSED", exit_px: 105, result_r: null, evidence_state: "EVIDENCE_PENDING", evolution_evidence_eligible: 0 });
 });
 
 test("fill-provider failures never fabricate a breakeven exit", async t => {
@@ -94,8 +94,8 @@ test("reviewer schema rejects AI-authored deterministic outcomes and accounting 
   unresolvedTrade(store, "TRD-ACCOUNTING");
   closeTrade(store, "TRD-ACCOUNTING", { exitPx: 104, exitTs: new Date(exitMs).toISOString(), exitReason: "FILL_CONFIRM",
     fees: 0.1, funding: null, pnl: 3.9, pnlPct: 4, resultR: 1.95, mfe: 4, mae: 0, durationS: 120 });
-  const saved = store.db.prepare("SELECT result_r,result_r_basis,accounting_quality,evolution_evidence_eligible FROM trades WHERE trade_id='TRD-ACCOUNTING'").get();
-  assert.deepEqual(saved, { result_r: 1.95, result_r_basis: "FEES_EX_FUNDING", accounting_quality: "FUNDING_UNAVAILABLE", evolution_evidence_eligible: 0 });
+  const saved = store.db.prepare("SELECT result_r,result_r_basis,accounting_quality,evidence_state,evolution_evidence_eligible FROM trades WHERE trade_id='TRD-ACCOUNTING'").get();
+  assert.deepEqual(saved, { result_r: null, result_r_basis: "PENDING", accounting_quality: "FUNDING_PENDING", evidence_state: "EVIDENCE_PENDING", evolution_evidence_eligible: 0 });
 });
 
 test("five shared slots and the portfolio stop-risk cap reject a sixth or excessive candidate", () => {

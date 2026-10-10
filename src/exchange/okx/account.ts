@@ -10,6 +10,42 @@
 import { firstOf, type OkxClient } from "./client.ts";
 import type { Position } from "./types.ts";
 
+export interface FundingBill {
+  billId: string;
+  instId: string;
+  ts: string;
+  balChg: string;
+  ccy: string;
+  type: string;
+  subType: string;
+}
+
+interface RawFundingBill {
+  billId?: string;
+  instId?: string;
+  ts?: string;
+  balChg?: string;
+  ccy?: string;
+  type?: string;
+  subType?: string;
+}
+
+/**
+ * Account bills are the exchange ledger source for realized funding. The
+ * caller filters the exact position interval and must treat a failed request
+ * as unknown, never as zero.
+ */
+export async function getFundingBills(client: OkxClient, instId: string, begin: number, end: number, nowMs: number = Date.now()): Promise<FundingBill[]> {
+  const path = nowMs - end > 6 * 24 * 60 * 60 * 1000 ? "/api/v5/account/bills-archive" : "/api/v5/account/bills";
+  const data = await client.get<RawFundingBill[]>(path, {
+    instType: "SWAP", instId, begin: String(begin), end: String(end), limit: "100",
+  }, true);
+  return data.map((raw) => ({
+    billId: String(raw.billId ?? ""), instId: String(raw.instId ?? ""), ts: String(raw.ts ?? ""),
+    balChg: String(raw.balChg ?? ""), ccy: String(raw.ccy ?? ""), type: String(raw.type ?? ""), subType: String(raw.subType ?? ""),
+  })).filter((bill) => bill.type === "8" || bill.subType === "173" || bill.subType === "174");
+}
+
 // Spec §7.7 — balance detail for one currency (all strings from OKX).
 export interface BalanceDetail {
   ccy: string;

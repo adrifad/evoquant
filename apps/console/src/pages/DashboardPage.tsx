@@ -48,6 +48,7 @@ export function DashboardPage({ status }: { status: ApiState<Row> }) {
 
     <section className="metric-strip" aria-label="Account summary">
       <Metric label="Positions" value={`${openPositions.length} / ${asText(limits.max_concurrent_positions)}`} detail="Shared swing / scalp slots"/>
+      <Metric label="Evidence pending" value={asText(s.evidencePending, "0")} tone={Number(s.evidencePending) > 0 ? "warning" : "neutral"} detail="Closed trades awaiting deterministic evidence"/>
       <Metric label="Daily loss" value={formatPercent(daily.lossPct)} tone={Number(daily.lossPct) > 0 ? "warning" : "neutral"} detail="Current day vs baseline"/>
       <Metric label="Drawdown" value={formatPercent(s.drawdownPct)} tone={Number(s.drawdownPct) > 0 ? "warning" : "neutral"} detail="From account peak"/>
       <Metric label="Open PnL" value={formatMoney(currentPnl)} tone={toneFor(currentPnl)} detail={`${openPositions.length} open positions${pnlKnown ? "" : " | live PnL unavailable"}`}/>

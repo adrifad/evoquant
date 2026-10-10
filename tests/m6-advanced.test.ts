@@ -41,8 +41,8 @@ const feat = (p: Partial<Record<string, number>> = {}): string =>
 
 // §31 — a strong-signal sample must actually MOVE weights, and directionally
 function seedTrades(st: ReturnType<typeof openStore>, n: number, winRate: number): void {
-  const ins = st.db.prepare(`INSERT INTO trades(trade_id,status,instrument,timeframe,side,strategy,strategy_version,regime,contracts,result_r,entry_features,exit_ts)
-    VALUES(?, 'CLOSED','BTC-USDT-SWAP','15m','LONG','TREND_FOLLOWING',1,'TRENDING_BULLISH','0.01', ?, ?, '2026-10-01T00:00:00Z')`);
+  const ins = st.db.prepare(`INSERT INTO trades(trade_id,status,evidence_state,evolution_evidence_eligible,result_r_basis,instrument,timeframe,side,strategy,strategy_version,regime,contracts,result_r,entry_features,exit_ts)
+    VALUES(?, 'CLOSED','VALID',1,'NET','BTC-USDT-SWAP','15m','LONG','TREND_FOLLOWING',1,'TRENDING_BULLISH','0.01', ?, ?, '2026-10-01T00:00:00Z')`);
   for (let i = 0; i < n; i++) {
     const win = (i % 10) < Math.round(winRate * 10);
     // winners: high trend/volume; losers: low — contributions become measurable
@@ -70,8 +70,8 @@ test("weights actually update with measurable signal contributions (§31)", () =
 
 test("signal learning aligns profitable and losing bearish SHORT evidence and isolates engines", () => {
   const st = openStore(tmpRoot());
-  const insert = st.db.prepare(`INSERT INTO trades(trade_id,engine,status,instrument,timeframe,side,strategy,strategy_version,regime,contracts,result_r,entry_features,raw_confidence,exit_ts)
-    VALUES(?,?,'CLOSED','BTC-USDT-SWAP',?,'SHORT','TREND_FOLLOWING',2,'TRENDING_BEARISH','1',?,?,0.9,'2026-10-01T00:00:00Z')`);
+  const insert = st.db.prepare(`INSERT INTO trades(trade_id,engine,status,evidence_state,evolution_evidence_eligible,result_r_basis,instrument,timeframe,side,strategy,strategy_version,regime,contracts,result_r,entry_features,raw_confidence,exit_ts)
+    VALUES(?,?,'CLOSED','VALID',1,'NET','BTC-USDT-SWAP',?,'SHORT','TREND_FOLLOWING',2,'TRENDING_BEARISH','1',?,?,0.9,'2026-10-01T00:00:00Z')`);
   for (let i = 0; i < 35; i++) insert.run(`SH${i}`, "SWING_15M", "15m", 2.5, feat({ emaSpreadPct: -0.8, rsi14: 38 }));
   for (let i = 0; i < 35; i++) insert.run(`SC${i}`, "SCALP_5M", "scalp", -0.5, feat({ emaSpreadPct: -0.8, rsi14: 38 }));
   assert.ok(measureContributions(st, "SWING_15M").trend > 0.5, "profitable bearish SHORT should reinforce aligned trend evidence");

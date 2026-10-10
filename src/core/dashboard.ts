@@ -136,6 +136,7 @@ export function startDashboard(cfg: DashboardConfig): DashboardServer {
         : { known: false, lossToStops: null, riskPct: null, unavailable: [] };
       const projected = open.map(t => projectTrade(t, exchange.positions, eq));
       const closed = store.db.prepare("SELECT COUNT(*) c, COALESCE(SUM(pnl),0) p, COALESCE(AVG(result_r),0) e FROM trades WHERE status='CLOSED'").get() as { c: number; p: number; e: number };
+      const evidencePending = store.db.prepare("SELECT COUNT(*) c FROM trades WHERE status='CLOSED' AND evidence_state='EVIDENCE_PENDING'").get() as { c: number };
       return send(200, {
         environment: "DEMO",                       // §96 always visible
         exchange: "OKX",
@@ -150,7 +151,7 @@ export function startDashboard(cfg: DashboardConfig): DashboardServer {
         daily: { dayStart: base?.dayStartEquity ?? null, pnl: base && eq !== null ? eq - base.dayStartEquity : null,
           lossPct: base && eq !== null && base.dayStartEquity > 0 ? Math.max(0, (base.dayStartEquity - eq) / base.dayStartEquity * 100) : null },
         drawdownPct: base && eq !== null && base.peakEquity > 0 ? Math.max(0, (base.peakEquity - eq) / base.peakEquity * 100) : null,
-        totals: { closed: closed.c, pnl: closed.p, expectancyR: closed.e },
+        totals: { closed: closed.c, pnl: closed.p, expectancyR: closed.e }, evidencePending: evidencePending.c,
         openPositions: projected, openPosition: projected[0] ?? null,
         criticalEvents: store.db.prepare("SELECT ts,kind,payload FROM system_events WHERE kind IN ('ERROR','RISK_EVENT','LLM_TIMEOUT','LLM_AUTH_FAILURE','STATE') ORDER BY id DESC LIMIT 4").all(),
         reconciliationWarnings: store.db.prepare("SELECT trade_id,instrument,side,entry_ts,exit_reason FROM trades WHERE status='RECONCILIATION_PENDING' ORDER BY entry_ts DESC").all(),
@@ -168,7 +169,7 @@ export function startDashboard(cfg: DashboardConfig): DashboardServer {
       });
     }
     if (p === "/api/trades") {
-      const rows = store.db.prepare("SELECT trade_id,instrument,side,strategy,strategy_core_version,strategy_version,regime,entry_px,initial_stop_px,stop_px,take_profit_px,exit_px,result_r,result_r_basis,pnl,fees,funding,accounting_quality,evidence_state,evolution_evidence_eligible,duration_s,exit_reason,exit_ts,status,calibrated_confidence,contracts,entry_ts,leverage,mfe,mae,planned_risk_pct FROM trades ORDER BY COALESCE(exit_ts,entry_ts) DESC LIMIT 100").all() as Array<Record<string, unknown>>;
+      const rows = store.db.prepare("SELECT trade_id,instrument,side,strategy,strategy_core_version,strategy_version,regime,entry_px,initial_stop_px,stop_px,take_profit_px,exit_px,result_r,result_r_basis,pnl,fees,funding,accounting_quality,evidence_state,evidence_reason,evolution_evidence_eligible,duration_s,exit_reason,exit_ts,status,calibrated_confidence,contracts,entry_ts,leverage,mfe,mae,planned_risk_pct FROM trades ORDER BY COALESCE(exit_ts,entry_ts) DESC LIMIT 100").all() as Array<Record<string, unknown>>;
       const exchange = await exchangeSnapshot();
       return send(200, rows.map(t => projectTrade(t, exchange.positions, finite(exchange.balance?.details.find(d => d.ccy === "USDT")?.eq))));
     }

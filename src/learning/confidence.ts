@@ -45,7 +45,7 @@ export function calibrate(store: Store, rawConfidence: number, minSample = 30, e
 
 export function recomputeCalibration(store: Store, engine: TradingEngine = "SWING_15M", scope: LearningScope = {}): CalibrationTable | null {
   const rows = store.db.prepare(
-    `SELECT raw_confidence AS c, result_r AS r FROM trades WHERE status='CLOSED' AND evolution_evidence_eligible=1 AND result_r_basis='NET' AND engine=? AND strategy_core_version=? AND result_r IS NOT NULL AND raw_confidence IS NOT NULL
+    `SELECT raw_confidence AS c, result_r AS r FROM trades WHERE status='CLOSED' AND evidence_state='VALID' AND evolution_evidence_eligible=1 AND result_r_basis='NET' AND engine=? AND strategy_core_version=? AND result_r IS NOT NULL AND raw_confidence IS NOT NULL
       AND (? IS NULL OR strategy=?) AND (? IS NULL OR strategy_version=?)
       AND (? IS NULL OR instrument=?) AND (? IS NULL OR regime=?) AND (? IS NULL OR side=?)`,
   ).all(engine, ...scopeArgs(scope)) as Array<{ c: number; r: number }>;

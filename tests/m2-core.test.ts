@@ -335,8 +335,8 @@ test("lesson evidence transitions (§29/§30)", () => {
   const st = openStore(tmpRoot());
   // seed 12 closed losing trades in scope
   for (let i = 0; i < 12; i++) {
-    st.db.prepare(`INSERT INTO trades(trade_id,status,instrument,timeframe,side,strategy,strategy_version,regime,contracts,result_r,exit_ts)
-      VALUES('TRD-L' || ${i},'CLOSED','BTC-USDT-SWAP','15m','LONG','BREAKOUT',1,'SIDEWAYS','0.01',${i < 9 ? -0.5 : 0.5},'2026-10-01T00:00:00Z')`).run();
+    st.db.prepare(`INSERT INTO trades(trade_id,status,evidence_state,evolution_evidence_eligible,result_r_basis,instrument,timeframe,side,strategy,strategy_version,regime,contracts,result_r,exit_ts)
+      VALUES('TRD-L' || ${i},'CLOSED','VALID',1,'NET','BTC-USDT-SWAP','15m','LONG','BREAKOUT',1,'SIDEWAYS','0.01',${i < 9 ? -0.5 : 0.5},'2026-10-01T00:00:00Z')`).run();
   }
   const id = upsertLesson(st, { statement: "breakouts underperform in low volume", scope: { strategy: "BREAKOUT", instrument: "BTC-USDT-SWAP", regime: "SIDEWAYS" }, confidence: 0.4 });
   for (let i = 0; i < 12; i++) addLessonEvidence(st, id, `TRD-L${i}`, i < 9);
@@ -351,8 +351,8 @@ test("lesson evidence transitions (§29/§30)", () => {
 
 test("weights evolve bounded (±10%) after interval (§31)", () => {
   const st = openStore(tmpRoot());
-  const insert = st.db.prepare(`INSERT INTO trades(trade_id,status,instrument,timeframe,side,strategy,strategy_version,regime,contracts,result_r,entry_features,exit_ts)
-    VALUES(?, 'CLOSED','BTC-USDT-SWAP','15m','LONG','TREND_FOLLOWING',1,'TRENDING_BULLISH','0.01', ?, ?, '2026-10-01T00:00:00Z')`);
+  const insert = st.db.prepare(`INSERT INTO trades(trade_id,status,evidence_state,evolution_evidence_eligible,result_r_basis,instrument,timeframe,side,strategy,strategy_version,regime,contracts,result_r,entry_features,exit_ts)
+    VALUES(?, 'CLOSED','VALID',1,'NET','BTC-USDT-SWAP','15m','LONG','TREND_FOLLOWING',1,'TRENDING_BULLISH','0.01', ?, ?, '2026-10-01T00:00:00Z')`);
   for (let i = 0; i < 31; i++) {
     insert.run(`T${i}`, i % 2, JSON.stringify(feat({ emaSpreadPct: 0.6, volumeRatio: 1.4 })));
   }
@@ -370,8 +370,8 @@ test("calibration identity until sample, then shrinks (§33)", () => {
   const st = openStore(tmpRoot());
   assert.equal(calibrate(st, 0.9), 0.9);
   for (let i = 0; i < 40; i++) {
-    st.db.prepare(`INSERT INTO trades(trade_id,status,instrument,timeframe,side,strategy,strategy_version,regime,contracts,raw_confidence,result_r,exit_ts)
-      VALUES('C' || ${i},'CLOSED','BTC-USDT-SWAP','15m','LONG','TREND_FOLLOWING',1,'SIDEWAYS','0.01',0.95,${i % 3 === 0 ? 1 : -0.5},'2026-10-01T00:00:00Z')`).run();
+    st.db.prepare(`INSERT INTO trades(trade_id,status,evidence_state,evolution_evidence_eligible,result_r_basis,instrument,timeframe,side,strategy,strategy_version,regime,contracts,raw_confidence,result_r,exit_ts)
+      VALUES('C' || ${i},'CLOSED','VALID',1,'NET','BTC-USDT-SWAP','15m','LONG','TREND_FOLLOWING',1,'SIDEWAYS','0.01',0.95,${i % 3 === 0 ? 1 : -0.5},'2026-10-01T00:00:00Z')`).run();
   }
   const table = recomputeCalibration(st);
   assert.ok(table && table.sample >= 30);

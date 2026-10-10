@@ -33,7 +33,7 @@ export async function reviewTrade(
   tradeId: string,
 ): Promise<Review | null> {
   const t = store.db.prepare("SELECT * FROM trades WHERE trade_id=?").get(tradeId) as Record<string, unknown> | undefined;
-  if (!t || t.status !== "CLOSED") return null;
+  if (!t || t.status !== "CLOSED" || t.evidence_state !== "VALID" || t.evolution_evidence_eligible !== 1 || t.result_r_basis !== "NET") return null;
   const prompt = readFileSync(path.join(root, "prompts/review.md"), "utf8");
   const initialRisk = Math.abs(Number(t.entry_px) - Number(t.initial_stop_px ?? t.stop_px));
   const input = {

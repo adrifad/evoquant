@@ -80,7 +80,7 @@ export function evaluateV2Lifecycle(store: Store, source: ReadonlyMap<string, Ca
     const c = summarize(cRows.map((r) => r.net_r)), x = summarize(xRows.map((r) => r.net_r));
     const symbol = pairedSymbols(cRows, xRows), quality = { pairs: Object.values(symbol).filter((p) => p.champion.trades && p.challenger.trades) };
     const demo = store.db.prepare(`SELECT result_r r FROM trades WHERE engine='SWING_15M' AND strategy=? AND strategy_core_version=2
-      AND strategy_version=? AND status='CLOSED' AND evolution_evidence_eligible=1 AND result_r_basis='NET' AND result_r IS NOT NULL AND exit_ts>=?`)
+      AND strategy_version=? AND status='CLOSED' AND evidence_state='VALID' AND evolution_evidence_eligible=1 AND result_r_basis='NET' AND result_r IS NOT NULL AND exit_ts>=?`)
       .all(family, champion.version, started) as Array<{ r: number }>;
     comparison = comparisonFor(champion, challenger, trainX, oosX, cutoff, split, "SHADOW");
     comparison.shadowExperimentId = expId; comparison.shadowStartedTs = started;
