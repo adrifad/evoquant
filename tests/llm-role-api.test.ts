@@ -71,6 +71,11 @@ test("role settings API isolates writes, preserves blank keys, masks secrets, te
     assert.equal(connection.http_status, 401);
     assert.deepEqual(requests, ["https://draft-gate.test/v1/chat/completions"]);
     const afterTest = await fetch(`${base}/api/settings/llm-roles`).then((response) => response.json()) as { roles: Array<Record<string, unknown>> };
+    const gateAfterTest = afterTest.roles.find((role) => role.role === "gate");
+    assert.equal(gateAfterTest?.lastStatus, "AUTHENTICATION_FAILED");
+    assert.equal(typeof gateAfterTest?.lastRequestAt, "string");
+    assert.equal(gateAfterTest?.lastFailureStatus, "AUTHENTICATION_FAILED");
+    assert.equal(gateAfterTest?.lastFailureHttpStatus, 401);
     assert.equal(afterTest.roles.find((role) => role.role === "reviewer")?.lastFailure, null);
     const dbContents = JSON.stringify(store.db.prepare("SELECT kind,payload FROM system_events").all());
     assert.equal(dbContents.includes("fake-gate-secret"), false);

@@ -3,6 +3,7 @@ import { AiRoleSettings } from "../components/AiRoleSettings";
 import { useApi } from "../hooks/useApi";
 import { asNumber, asRow, asRows, asText } from "../lib/types";
 import { formatNumber, formatTimestamp } from "../lib/format";
+import { roleHealthPresentation } from "../lib/roleHealth";
 import { DataState, DataTable, PageHeading, Panel, StatusBadge } from "../components/Primitives";
 import { MemoryPage } from "./MemoryPage";
 
@@ -31,7 +32,14 @@ export function AiPage() {
             { key: "retries", label: "Retries / day", numeric: true, render: r => formatNumber(r.retriesToday, 0) },
             { key: "tokens", label: "Input / output tokens", numeric: true, render: r => `${formatNumber(r.inputTokensToday, 0)} / ${formatNumber(r.outputTokensToday, 0)}` },
             { key: "budget", label: "Budget used / limit", render: r => { const b = asRow(r.budget); return <>{formatNumber(r.budgetRequestsThisHour ?? r.providerRequestsThisHour, 0)} / {asText(b?.maxCallsPerHour, "∞")} this hour<small className="source-note">{formatNumber(r.budgetRequestsToday ?? r.providerRequestsToday, 0)} / {asText(b?.maxCallsPerDay, "∞")} today</small></>; } },
-            { key: "last", label: "Last success / error", render: r => <>{formatTimestamp(r.lastSuccess)}<small className="source-note">{asText(r.lastStatus, "No requests")} · {asText(r.lastFailureReason, asText(r.errorClass, "No error"))}{r.lastHttpStatus == null ? "" : ` · HTTP ${asText(r.lastHttpStatus)}`}</small></> },
+            { key: "last", label: "Latest / previous failure", render: r => {
+              const health = roleHealthPresentation(r);
+              if (!health.currentStatus) return <span className="source-note">No requests yet</span>;
+              const detail = health.currentReason || health.currentHttpStatus !== null
+                ? <small className="source-note">{health.currentReason ? `Reason: ${health.currentReason}` : ""}{health.currentReason && health.currentHttpStatus !== null ? " · " : ""}{health.currentHttpStatus === null ? "" : `HTTP ${health.currentHttpStatus}`}</small>
+                : health.previousFailureStatus ? <small className="source-note">Previous: {health.previousFailureStatus}{health.previousFailureReason ? ` · ${health.previousFailureReason}` : ""}{health.previousFailureHttpStatus === null ? "" : ` · HTTP ${health.previousFailureHttpStatus}`} · {formatTimestamp(health.previousFailureTimestamp)}</small> : null;
+              return <><strong>{health.currentStatus}</strong><small className="source-note">{formatTimestamp(health.currentTimestamp)}</small>{detail}</>;
+            } },
           ]}/>
         </DataState>
       </Panel>

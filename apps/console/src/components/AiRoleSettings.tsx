@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState, type FormEvent } from "react";
 import { Activity, PlugZap, Save, Trash2 } from "lucide-react";
 import { useApi } from "../hooks/useApi";
 import { asNumber, asRow, asRows, asText, type Row } from "../lib/types";
+import { roleHealthPresentation } from "../lib/roleHealth";
 import { Badge, DataState, StatusBadge } from "./Primitives";
 
 type RoleName = "gate" | "scalp" | "reviewer" | "evolution" | "critic";
@@ -115,6 +116,7 @@ export function AiRoleSettings() {
           const status = asText(role.status, "UNCONFIGURED");
           const currentMessage = message[roleName];
           const currentTest = testMessage[roleName];
+          const health = roleHealthPresentation(role);
           const isBusy = busy !== null;
           return <section className="ai-role-card" key={roleName} aria-labelledby={`role-${roleName}-title`}>
             <header className="ai-role-card-heading">
@@ -153,8 +155,9 @@ export function AiRoleSettings() {
               {currentTest ? <p className={`role-message ${currentTest.includes("succeeded") ? "role-message-positive" : "role-message-negative"}`} role="status">{currentTest}</p> : null}
             </form>
             <div className="ai-role-health" aria-label={`${ROLE_COPY[roleName].title} request health`}>
+              <div><span>Latest request</span><strong>{health.currentStatus ?? "No requests yet"}</strong><small>{formatTime(health.currentTimestamp)}</small>{health.currentReason ? <small>Reason: {health.currentReason}</small> : null}{health.currentHttpStatus === null ? null : <small>HTTP: {health.currentHttpStatus}</small>}</div>
+              {health.previousFailureStatus ? <div><span>Previous failure</span><strong>{health.previousFailureStatus}</strong><small>{formatTime(health.previousFailureTimestamp)}</small>{health.previousFailureReason ? <small>Reason: {health.previousFailureReason}</small> : null}{health.previousFailureHttpStatus === null ? null : <small>HTTP: {health.previousFailureHttpStatus}</small>}</div> : null}
               <div><span>Last success</span><strong>{formatTime(role.lastSuccess)}</strong></div>
-              <div><span>Last failure</span><strong>{formatTime(role.lastFailure)}{role.errorClass ? ` · ${asText(role.errorClass)}` : ""}</strong></div>
               <div><span>Last latency</span><strong>{role.lastLatencyMs == null ? "Unavailable" : `${Math.round(Number(role.lastLatencyMs))} ms`}</strong></div>
               <div><span>Budget used this hour</span><strong>{asText(role.budgetRequestsThisHour ?? role.providerRequestsThisHour, "0")} / {asText(budget.maxCallsPerHour, "∞")}</strong></div>
               <div><span>Budget used today</span><strong>{asText(role.budgetRequestsToday ?? role.providerRequestsToday, "0")} / {asText(budget.maxCallsPerDay, "∞")}</strong></div>

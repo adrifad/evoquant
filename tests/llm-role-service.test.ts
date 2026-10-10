@@ -16,8 +16,15 @@ function fixture(env: Record<string, string | undefined>, fetchImpl: typeof fetc
   mkdirSync(path.join(root, "config"), { recursive: true });
   copyFileSync(path.join(REPO_ROOT, "config/llm-roles.yaml"), path.join(root, "config/llm-roles.yaml"));
   const store = openStore(root);
-  const service = new RoleLlmService({ root, store, env, fetchImpl, now: () => now, sleep: async () => undefined });
-  return { root, store, service, close: () => { store.close(); rmSync(root, { recursive: true, force: true }); } };
+  let clock = now;
+  const service = new RoleLlmService({ root, store, env, fetchImpl, now: () => clock, sleep: async () => undefined });
+  return {
+    root,
+    store,
+    service,
+    advance: (ms: number) => { clock += ms; },
+    close: () => { store.close(); rmSync(root, { recursive: true, force: true }); },
+  };
 }
 
 function successResponse(): Response {
@@ -140,12 +147,37 @@ test("successful request restores role health while retaining prior safe failure
   const f = fixture({ LLM_GATE_BASE_URL: "https://gate.test/v1", LLM_GATE_API_KEY: "key" }, async () => new Response(JSON.stringify({ choices: [{ message: { content: invalid ? '{"ok":"wrong"}' : '{"ok":true}' } }] })));
   try {
     assert.equal(await f.service.json("gate", "s", "u", OkSchema, "candidate_gate"), null);
+    f.advance(1_000);
     invalid = false;
     assert.deepEqual(await f.service.json("gate", "s", "u", OkSchema, "candidate_gate"), { ok: true });
     const health = f.service.settings().find(entry => entry.role === "gate");
     assert.equal(health?.status, "AVAILABLE");
     assert.equal(health?.lastStatus, "SUCCESS");
+    assert.equal(health?.lastRequestAt, "2026-10-07T00:00:01.000Z");
+    assert.equal(health?.lastSuccess, "2026-10-07T00:00:01.000Z");
+    assert.equal(health?.lastFailure, "2026-10-07T00:00:00.000Z");
+    assert.equal(health?.lastFailureStatus, "INVALID_RESPONSE");
     assert.equal(health?.lastFailureReason, "SCHEMA_MISMATCH");
+    assert.equal(health?.lastFailureHttpStatus, null);
+  } finally { f.close(); }
+});
+
+test("HTTP failure history remains distinct after the role recovers", async () => {
+  let fail = true;
+  const f = fixture({ LLM_GATE_BASE_URL: "https://gate.test/v1", LLM_GATE_API_KEY: "key" }, async () =>
+    fail ? new Response("bad request", { status: 400 }) : successResponse());
+  try {
+    assert.equal(await f.service.json("gate", "s", "u", OkSchema, "candidate_gate"), null);
+    f.advance(1_000);
+    fail = false;
+    assert.deepEqual(await f.service.json("gate", "s", "u", OkSchema, "candidate_gate"), { ok: true });
+    const health = f.service.settings().find(entry => entry.role === "gate");
+    assert.equal(health?.status, "AVAILABLE");
+    assert.equal(health?.lastStatus, "SUCCESS");
+    assert.equal(health?.lastFailureStatus, "HTTP_ERROR");
+    assert.equal(health?.lastFailureReason, "HTTP_ERROR");
+    assert.equal(health?.lastFailureHttpStatus, 400);
+    assert.equal(health?.lastHttpStatus, 400);
   } finally { f.close(); }
 });
 
@@ -190,7 +222,27 @@ test("role health preserves safe structured-output failure classes", async () =>
     const run = f.store.db.prepare("SELECT status,error_class FROM llm_runs WHERE role='gate' ORDER BY id DESC LIMIT 1")
       .get() as { status: string; error_class: string };
     assert.deepEqual(run, { status: "INVALID_RESPONSE", error_class: "EMPTY_CONTENT" });
-    assert.equal(f.service.settings().find((entry) => entry.role === "gate")?.errorClass, "EMPTY_CONTENT");
+    const health = f.service.settings().find((entry) => entry.role === "gate");
+    assert.equal(health?.status, "ERROR");
+    assert.equal(health?.lastStatus, "INVALID_RESPONSE");
+    assert.equal(health?.lastFailureStatus, "INVALID_RESPONSE");
+    assert.equal(health?.lastFailureReason, "EMPTY_CONTENT");
+    assert.equal(health?.lastRequestAt, health?.lastFailure);
+    assert.equal(health?.errorClass, "EMPTY_CONTENT");
+  } finally { f.close(); }
+});
+
+test("new role health has no request or failure history", () => {
+  const f = fixture({ LLM_GATE_BASE_URL: "https://gate.test/v1", LLM_GATE_API_KEY: "key" }, async () => successResponse());
+  try {
+    const health = f.service.settings().find((entry) => entry.role === "gate");
+    assert.equal(health?.status, "AVAILABLE");
+    assert.equal(health?.lastStatus, null);
+    assert.equal(health?.lastRequestAt, null);
+    assert.equal(health?.lastFailure, null);
+    assert.equal(health?.lastFailureStatus, null);
+    assert.equal(health?.lastFailureReason, null);
+    assert.equal(health?.lastFailureHttpStatus, null);
   } finally { f.close(); }
 });
 

@@ -80,7 +80,11 @@ export interface SafeRoleSettings {
   outputTokensToday: number | null;
   errorClass: string | null;
   lastStatus: string | null;
+  lastRequestAt: string | null;
   lastFailureReason: string | null;
+  lastFailureStatus: string | null;
+  lastFailureHttpStatus: number | null;
+  /** @deprecated Use lastFailureHttpStatus for explicitly historical context. */
   lastHttpStatus: number | null;
 }
 
@@ -277,8 +281,8 @@ export class RoleLlmService {
       .get(role) as { ts: string; status: string; latency_ms: number; error_class: string | null; failure_reason: string | null; http_status: number | null } | undefined;
     const success = this.options.store.db.prepare("SELECT ts FROM llm_runs WHERE role=? AND status='SUCCESS' ORDER BY id DESC LIMIT 1")
       .get(role) as { ts: string } | undefined;
-    const failure = this.options.store.db.prepare("SELECT ts,error_class,failure_reason,http_status FROM llm_runs WHERE role=? AND status NOT IN ('SUCCESS','DISABLED','UNCONFIGURED','INVALID_CONFIG','BUDGET_EXHAUSTED') ORDER BY id DESC LIMIT 1")
-      .get(role) as { ts: string; error_class: string | null; failure_reason: string | null; http_status: number | null } | undefined;
+    const failure = this.options.store.db.prepare("SELECT ts,status,error_class,failure_reason,http_status FROM llm_runs WHERE role=? AND status NOT IN ('SUCCESS','DISABLED','UNCONFIGURED','INVALID_CONFIG','BUDGET_EXHAUSTED') ORDER BY id DESC LIMIT 1")
+      .get(role) as { ts: string; status: string; error_class: string | null; failure_reason: string | null; http_status: number | null } | undefined;
     const budgetRequestsThisHour = this.countRequests(role, hourStart);
     const budgetRequestsToday = this.countRequests(role, todayStart);
     const legacyBudgetChargesThisHour = this.countLegacyCharges(role, hourStart);
@@ -305,7 +309,11 @@ export class RoleLlmService {
       maxRevisionRounds: config.maxRevisionRounds, capabilities: config.capabilities, apiKeyConfigured: Boolean(config.apiKey), apiKeyMasked: maskApiKey(config.apiKey),
       status, lastSuccess: success?.ts ?? null, lastFailure: failure?.ts ?? null, lastLatencyMs: recent?.latency_ms ?? null,
       callsThisHour, callsToday, errorClass: status === "AVAILABLE" ? null : recent?.error_class ?? resolved.errorClass ?? null,
-      lastStatus: recent?.status ?? null, lastFailureReason: failure?.failure_reason ?? failure?.error_class ?? null, lastHttpStatus: failure?.http_status ?? null,
+      lastStatus: recent?.status ?? null, lastRequestAt: recent?.ts ?? null,
+      lastFailureReason: failure?.failure_reason ?? failure?.error_class ?? null,
+      lastFailureStatus: failure?.status ?? null,
+      lastFailureHttpStatus: failure?.http_status ?? null,
+      lastHttpStatus: failure?.http_status ?? null,
       providerRequestsThisHour, providerRequestsToday, retriesToday: retry.count,
       legacyBudgetChargesThisHour, legacyBudgetChargesToday, budgetRequestsThisHour, budgetRequestsToday,
       inputTokensToday: usage.completed_requests === providerRequestsToday && !legacyBudgetChargesToday ? usage.input : null,
