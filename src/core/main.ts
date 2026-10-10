@@ -247,7 +247,7 @@ async function main(): Promise<void> {
         }
       }
       // after tick: any newly-closed trades get reviewed (M4)
-      const closed = store.db.prepare("SELECT trade_id FROM trades WHERE status='CLOSED' AND trade_id NOT IN (SELECT trade_id FROM trade_reviews) ORDER BY exit_ts DESC LIMIT 3").all() as Array<{ trade_id: string }>;
+      const closed = store.db.prepare("SELECT trade_id FROM trades WHERE status='CLOSED' AND evolution_evidence_eligible=1 AND trade_id NOT IN (SELECT trade_id FROM trade_reviews) ORDER BY exit_ts DESC LIMIT 3").all() as Array<{ trade_id: string }>;
       if (evolution.review_every_closed_trade) {
         for (const c of closed) {
           if (reviewsInFlight.has(c.trade_id)) continue;

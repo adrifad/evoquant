@@ -51,7 +51,7 @@ export async function maybeEvolveStrategies(
   root: string, roles: RoleLlmService, store: Store,
   interval: number, maxParamChanges: number, minSample: number, engine: TradingEngine = "SWING_15M",
 ): Promise<number> {
-  const closed = (store.db.prepare("SELECT COUNT(*) c FROM trades WHERE status='CLOSED' AND result_r_basis='NET' AND engine=? AND strategy_core_version=1").get(engine) as { c: number }).c;
+  const closed = (store.db.prepare("SELECT COUNT(*) c FROM trades WHERE status='CLOSED' AND evolution_evidence_eligible=1 AND result_r_basis='NET' AND engine=? AND strategy_core_version=1").get(engine) as { c: number }).c;
   let lastRun = 0;
   for (const row of store.db.prepare("SELECT payload FROM system_events WHERE kind='EVOLUTION' ORDER BY id DESC LIMIT 20").all() as Array<{ payload: string }>) {
     try {

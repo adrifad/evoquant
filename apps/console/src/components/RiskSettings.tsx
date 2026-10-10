@@ -7,6 +7,7 @@ import { DataState, DataTable, Field, Panel } from "./Primitives";
 const fields = [
   ["risk_per_trade_pct", "Risk per trade", "%", 0.1],
   ["max_concurrent_positions", "Maximum positions", "positions", 1],
+  ["max_portfolio_open_risk_pct", "Portfolio open risk limit", "%", 0.1],
   ["max_leverage", "Maximum leverage", "x", 1],
   ["max_daily_loss_pct", "Daily loss limit", "%", 0.1],
   ["max_drawdown_pct", "Maximum drawdown", "%", 0.1],

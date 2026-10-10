@@ -13,11 +13,12 @@ const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..")
 
 // spec §48 — these may NEVER be relaxed via config/evolution; outside = refuse.
 export const ABSOLUTE_MAX = {
-  leverage: 10,
-  riskPerTradePct: 10.0, // Operator-requested ceiling; configured risk remains independently bounded.
-  maxDailyLossPct: 5.0,
-  maxDrawdownPct: 20.0,
-  maxConcurrentPositions: 3,
+  leverage: 5,
+  riskPerTradePct: 2.0,
+  maxDailyLossPct: 3.0,
+  maxDrawdownPct: 10.0,
+  maxConcurrentPositions: 5,
+  maxPortfolioOpenRiskPct: 5.0,
 } as const;
 
 const TradingSchema = z.object({
@@ -47,10 +48,8 @@ const TradingSchema = z.object({
     cooldown_s: z.number().int().min(60).max(900).default(240),
     max_daily_trades: z.number().int().min(1).max(40).default(20),
     llm_gate: z.boolean().default(true),
-    llm_max_per_hour: z.number().int().min(2).max(20).default(6),
     stance_refresh_s: z.number().int().min(300).max(1800).default(900),
     fee_pct: z.number().min(0.02).max(0.1).default(0.05),
-    entry_order: z.enum(["market", "post_only"]).default("market"),
     position_pct: z.number().min(1).max(100).default(8),
   }).optional(),
   timeframe: z.enum(["1m", "3m", "5m", "15m", "30m", "1H", "2H", "4H", "6H", "12H", "1D", "1W"]),
@@ -91,6 +90,7 @@ const RiskSchema = z.object({
     max_drawdown_pct: z.number().positive().lte(ABSOLUTE_MAX.maxDrawdownPct),
     max_leverage: z.number().int().min(1).lte(ABSOLUTE_MAX.leverage),
     max_concurrent_positions: z.number().int().min(1).lte(ABSOLUTE_MAX.maxConcurrentPositions),
+    max_portfolio_open_risk_pct: z.number().positive().lte(ABSOLUTE_MAX.maxPortfolioOpenRiskPct),
     allowed_symbols: z.array(z.string()).min(1),
   }),
   kill_switch: z.array(z.string()).min(1),

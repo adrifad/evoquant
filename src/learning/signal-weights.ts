@@ -32,7 +32,7 @@ export function getWeights(store: Store, engine: TradingEngine = "SWING_15M", sc
 export function measureContributions(store: Store, engine: TradingEngine = "SWING_15M", scope: LearningScope = {}): Record<keyof SignalWeights, number> {
   const rows = store.db.prepare(`
     SELECT result_r, entry_features, entry_conditions, side FROM trades
-    WHERE status='CLOSED' AND result_r IS NOT NULL AND result_r_basis='NET' AND engine=?
+    WHERE status='CLOSED' AND evolution_evidence_eligible=1 AND result_r IS NOT NULL AND result_r_basis='NET' AND engine=?
       AND strategy_core_version=?
       AND (? IS NULL OR strategy=?) AND (? IS NULL OR strategy_version=?)
       AND (? IS NULL OR instrument=?) AND (? IS NULL OR regime=?) AND (? IS NULL OR side=?)`).all(engine, ...scopeArgs(scope)) as
@@ -76,7 +76,7 @@ export function measureContributions(store: Store, engine: TradingEngine = "SWIN
 
 // §31: update only every N closed trades; ±10% max change per cycle; never below 0.5 / above 2.
 export function maybeEvolveWeights(store: Store, interval: number, maxDeltaPct: number, engine: TradingEngine = "SWING_15M", minimumSample = 30, scope: LearningScope = {}): SignalWeights | null {
-  const n = (store.db.prepare(`SELECT COUNT(*) c FROM trades WHERE status='CLOSED' AND result_r_basis='NET' AND engine=?
+  const n = (store.db.prepare(`SELECT COUNT(*) c FROM trades WHERE status='CLOSED' AND evolution_evidence_eligible=1 AND result_r_basis='NET' AND engine=?
     AND strategy_core_version=?
     AND (? IS NULL OR strategy=?) AND (? IS NULL OR strategy_version=?)
     AND (? IS NULL OR instrument=?) AND (? IS NULL OR regime=?) AND (? IS NULL OR side=?)`).get(engine, ...scopeArgs(scope)) as { c: number }).c;

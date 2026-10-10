@@ -43,7 +43,7 @@ test("risk API rejects ceilings, cross-origin writes and stale revisions; commit
     headers: { "content-type": "application/json", ...(origin ? { origin } : {}) }, body: JSON.stringify(body) });
   const invalid = await put({ revision: initial.revision, limits: { ...initial.limits, max_leverage: 25 }, confirmRiskIncrease: true });
   assert.equal(invalid.status, 400);
-  assert.equal((await json<{ error: string }>(invalid)).error, "Maximum allowed leverage is 10x.");
+  assert.equal((await json<{ error: string }>(invalid)).error, "Maximum allowed leverage is 5x.");
   const limits = { ...initial.limits, max_leverage: 2, max_concurrent_positions: 1 };
   assert.equal((await put({ revision: 0, limits }, "https://external.invalid")).status, 403);
   assert.equal((await put({ revision: 0, limits }, f.base)).status, 200);
@@ -57,21 +57,27 @@ test("risk API rejects ceilings, cross-origin writes and stale revisions; commit
   assert.equal(f.exchangeRequests(), 0, "risk changes must not resize positions or call exchange");
 });
 
-test("risk API publishes 10 percent ceiling, requires confirmation and rejects 10.01 percent", async t => {
+test("risk API enforces 2 percent trade and 5 percent portfolio ceilings", async t => {
   const f = await fixture(t);
   const initial = await json<RiskResponse>(await f.request("/api/risk"));
-  assert.equal(initial.ceilings.risk_per_trade_pct, 10);
+  assert.equal(initial.ceilings.risk_per_trade_pct, 2);
+  assert.equal(initial.ceilings.max_portfolio_open_risk_pct, 5);
   assert.equal(initial.limits.risk_per_trade_pct, 2, "raising the ceiling never raises active risk automatically");
-  const put = (riskPerTrade: number, confirmRiskIncrease = false, revision = 0) => f.request("/api/risk", {
+  const put = (limits: Record<string, unknown>, confirmRiskIncrease = false, revision = 0) => f.request("/api/risk", {
     method: "PUT", headers: { "content-type": "application/json" },
-    body: JSON.stringify({ revision, limits: { ...initial.limits, risk_per_trade_pct: riskPerTrade }, confirmRiskIncrease }),
+    body: JSON.stringify({ revision, limits, confirmRiskIncrease }),
   });
-  assert.equal((await put(10)).status, 400);
-  assert.equal((await put(10, true)).status, 200);
-  const over = await put(10.01, true, 1);
-  assert.equal(over.status, 400);
-  assert.equal((await json<{ error: string }>(over)).error, "Maximum allowed risk per trade is 10%.");
-  assert.equal(f.risk.hard_limits.risk_per_trade_pct, 10);
+  const overTrade = await put({ ...initial.limits, risk_per_trade_pct: 2.01 }, true);
+  assert.equal(overTrade.status, 400);
+  assert.equal((await json<{ error: string }>(overTrade)).error, "Maximum allowed risk per trade is 2%.");
+  const atPortfolioCeiling = { ...initial.limits, max_portfolio_open_risk_pct: 5 };
+  assert.equal((await put(atPortfolioCeiling)).status, 400, "loosening portfolio risk requires confirmation");
+  assert.equal((await put(atPortfolioCeiling, true)).status, 200);
+  const overPortfolio = await put({ ...atPortfolioCeiling, max_portfolio_open_risk_pct: 5.01 }, true, 1);
+  assert.equal(overPortfolio.status, 400);
+  assert.equal((await json<{ error: string }>(overPortfolio)).error, "Maximum allowed portfolio open risk is 5%.");
+  assert.equal(f.risk.hard_limits.risk_per_trade_pct, 2);
+  assert.equal(f.risk.hard_limits.max_portfolio_open_risk_pct, 5);
   assert.equal(f.exchangeRequests(), 0);
 });
 
@@ -85,6 +91,39 @@ test("offline account stays unavailable and shared snapshots bound exchange requ
   assert.equal(f.exchangeRequests(), 2, "balance and positions are fetched once for concurrent views");
   await f.request("/api/status");
   assert.equal(f.exchangeRequests(), 2);
+});
+
+test("normal settings reads never discover provider models and explicit refresh is cached", async t => {
+  const previousUrl = process.env.LLM_BASE_URL;
+  const previousKey = process.env.LLM_API_KEY;
+  const originalFetch = globalThis.fetch;
+  let modelRequests = 0;
+  process.env.LLM_BASE_URL = "https://models.fixture.invalid/v1";
+  process.env.LLM_API_KEY = "fixture-key";
+  globalThis.fetch = (async (input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
+    if (String(input) === "https://models.fixture.invalid/v1/models") {
+      modelRequests += 1;
+      assert.equal(init?.headers instanceof Headers ? init.headers.get("authorization") : (init?.headers as Record<string, string>)?.Authorization, "Bearer fixture-key");
+      return new Response(JSON.stringify({ data: [{ id: "fixture-model" }] }), { status: 200, headers: { "content-type": "application/json" } });
+    }
+    return originalFetch(input, init);
+  }) as typeof fetch;
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+    if (previousUrl === undefined) delete process.env.LLM_BASE_URL; else process.env.LLM_BASE_URL = previousUrl;
+    if (previousKey === undefined) delete process.env.LLM_API_KEY; else process.env.LLM_API_KEY = previousKey;
+  });
+  const f = await fixture(t);
+  await Promise.all([f.request("/api/settings"), f.request("/api/settings"), f.request("/api/settings")]);
+  assert.equal(modelRequests, 0, "dashboard polling must not hit provider /models");
+  const first = await f.request("/api/settings/models/refresh", { method: "POST" });
+  assert.equal(first.status, 200);
+  assert.equal(modelRequests, 1);
+  assert.deepEqual((await json<{ models: string[]; cached: boolean }>(first)).models, ["fixture-model"]);
+  const second = await f.request("/api/settings/models/refresh", { method: "POST" });
+  assert.equal(second.status, 200);
+  assert.equal((await json<{ cached: boolean }>(second)).cached, true);
+  assert.equal(modelRequests, 1, "second explicit refresh uses the thirty-minute cache");
 });
 
 test("candles remain isolated by instrument and timeframe, bounded and explicit when unavailable", async t => {

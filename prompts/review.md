@@ -10,8 +10,6 @@ Your words are never treated as truth — statistics validate later (§53).
 
 ## Output — STRICT JSON:
 {
-  "outcome": "WIN" | "LOSS" | "BREAKEVEN",
-  "result_r": <number>,
   "observations": [
     {"factor": "<feature or regime|volume|timing|stop_width|...>",
      "effect": "positive" | "negative" | "neutral",
@@ -37,3 +35,5 @@ Your words are never treated as truth — statistics validate later (§53).
    application pins every lesson candidate to the reviewed trade's engine,
    strategy version, instrument, regime axes, and side; semantic validation is
    not inferred from matching broad statistics.
+6. Do not restate, classify, calculate, or reinterpret outcome, R, PnL, fees,
+   funding, MFE, MAE, duration, or exit reason. Those are deterministic facts.

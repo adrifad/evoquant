@@ -26,12 +26,14 @@ export function DashboardPage({ status }: { status: ApiState<Row> }) {
   const executionDetail = [executionPayload.instId ?? executionPayload.instrument, executionPayload.side, executionPayload.reason, executionPayload.tradeId].filter(value => value !== null && value !== undefined && value !== "").map(String).join(" | ");
   const roles = asRows(s?.aiRoles);
   const roleWarnings = roles.filter(role => role.status !== "AVAILABLE");
+  const reconciliationWarnings = asRows(s?.reconciliationWarnings);
 
   if (!s) return <div className="page"><DataState loading={status.loading} error={status.error} empty={false}><span/></DataState></div>;
 
   return <div className="page dashboard-page">
     <PageHeading title="Operations overview" description="Risk, exposure, account state, and the latest decision cycle." detail={<Badge tone="info">OKX DEMO WORKSTATION</Badge>}/>
     {s.exchangeState !== "CURRENT" ? <div className="inline-warning" role="status">Exchange account data unavailable. Capital and live position values cannot currently be confirmed.</div> : null}
+    {reconciliationWarnings.length ? <div className="inline-warning" role="alert"><strong>Reconciliation pending</strong> {reconciliationWarnings.map(row => `${asText(row.instrument)} ${asText(row.side)} (${asText(row.trade_id)})`).join(", ")}. Exit evidence is not proven; these trades are excluded from review and evolution until recovery completes.</div> : null}
     <CapitalSummary status={s}/>
     <div className={`risk-banner ${halt ? "risk-critical" : warning ? "risk-warning" : "risk-safe"}`} role="status">
       <div className="risk-banner-copy"><span className="risk-banner-mark"/><div><strong>{halt ? "Trading risk halt" : warning ? `Bot ${asText(s.botState).toLowerCase()}` : "Risk controls active"}</strong><span>{halt ? asText(s.killReason, s.emergencyHalted ? "Emergency stop is active." : "Trading halted by system state.") : warning ? "No new automated entries are being evaluated while the bot is paused." : "No active kill-switch condition is reported by status."}</span></div></div>

@@ -13,8 +13,8 @@ export interface ScalpCfg {
   vol_burst_min: number; min_score: number;
   stop_atr_mult: number; tp_r: number; min_tp_pct: number;   // fee guard: TP distance ≥ ~3×roundtrip fee
   max_hold_s: number; cooldown_s: number; max_daily_trades: number;
-  llm_gate: boolean; llm_max_per_hour: number; stance_refresh_s: number;
-  fee_pct: number; entry_order: "market" | "post_only";
+  llm_gate: boolean; stance_refresh_s: number;
+  fee_pct: number;
   position_pct: number;
 }
 
@@ -130,8 +130,8 @@ export const SCALP_DEFAULTS: ScalpCfg = {
   rsi_long_min: 50, rsi_long_max: 68, rsi_short_min: 32, rsi_short_max: 50,
   vol_burst_min: 1.25, min_score: 0.6, stop_atr_mult: 1.4, tp_r: 2.0, min_tp_pct: 0.35,
   max_hold_s: 900, cooldown_s: 240, max_daily_trades: 20,
-  llm_gate: true, llm_max_per_hour: 6, stance_refresh_s: 900,
-  fee_pct: 0.05, entry_order: "market", position_pct: 20,
+  llm_gate: true, stance_refresh_s: 900,
+  fee_pct: 0.05, position_pct: 20,
 };
 
 export function stanceAllows(stance: Stance, signal: ScalpSignal): GateOutcome {

@@ -52,7 +52,6 @@ scalp:
   position_pct: 20         # scalp notional ~$20/position (smaller than 15m swing $55)
   max_daily_trades: 20
   llm_gate: true
-  llm_max_per_hour: 6
 
 # Strategy selection is independent of the baseline safety overlay.
 strategy_core:

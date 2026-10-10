@@ -29,7 +29,10 @@ CREATE TABLE IF NOT EXISTS trades (
   trade_id TEXT PRIMARY KEY,
   engine TEXT NOT NULL DEFAULT 'SWING_15M', -- SWING_15M | SCALP_5M; legacy rows backfilled below
   result_r_basis TEXT NOT NULL DEFAULT 'NET',
-  status TEXT NOT NULL,            -- OPEN | CLOSED
+  status TEXT NOT NULL,            -- OPEN | RECONCILIATION_PENDING | CLOSED
+  evidence_state TEXT NOT NULL DEFAULT 'OPEN', -- OPEN | RECONCILIATION_PENDING | VALID | ACCOUNTING_INCOMPLETE
+  evolution_evidence_eligible INTEGER NOT NULL DEFAULT 1,
+  accounting_quality TEXT NOT NULL DEFAULT 'PENDING', -- PENDING | FUNDING_UNAVAILABLE | COMPLETE
   instrument TEXT NOT NULL,
   timeframe TEXT NOT NULL,
   side TEXT NOT NULL,              -- LONG | SHORT
@@ -255,6 +258,9 @@ export function openStore(root: string): Store {
   if (!cols.has("max_hold_bars")) db.exec("ALTER TABLE trades ADD COLUMN max_hold_bars INTEGER");
   if (!cols.has("regime_axes")) db.exec("ALTER TABLE trades ADD COLUMN regime_axes TEXT");
   if (!cols.has("entry_conditions")) db.exec("ALTER TABLE trades ADD COLUMN entry_conditions TEXT");
+  if (!cols.has("evidence_state")) db.exec("ALTER TABLE trades ADD COLUMN evidence_state TEXT NOT NULL DEFAULT 'OPEN'");
+  if (!cols.has("evolution_evidence_eligible")) db.exec("ALTER TABLE trades ADD COLUMN evolution_evidence_eligible INTEGER NOT NULL DEFAULT 0");
+  if (!cols.has("accounting_quality")) db.exec("ALTER TABLE trades ADD COLUMN accounting_quality TEXT NOT NULL DEFAULT 'PENDING'");
   // Historical records are Core 1 unless a future migration has explicit evidence.
   if (!cols.has("strategy_core_version")) db.exec("ALTER TABLE trades ADD COLUMN strategy_core_version INTEGER NOT NULL DEFAULT 1");
   db.exec(`UPDATE trades SET engine=CASE WHEN lower(timeframe)='scalp' THEN 'SCALP_5M' ELSE 'SWING_15M' END
@@ -262,6 +268,8 @@ export function openStore(root: string): Store {
   db.exec("DROP INDEX IF EXISTS idx_trades_learning_scope");
   db.exec("CREATE INDEX IF NOT EXISTS idx_trades_learning_scope ON trades(engine,strategy_core_version,status,strategy,strategy_version,instrument,regime,side)");
   db.exec("UPDATE trades SET initial_stop_px=stop_px WHERE initial_stop_px IS NULL AND stop_px IS NOT NULL");
+  db.exec(`UPDATE trades SET evidence_state=CASE WHEN status='CLOSED' THEN 'ACCOUNTING_INCOMPLETE' ELSE 'OPEN' END
+    WHERE evidence_state IS NULL OR evidence_state=''`);
   const lessonCols = new Set((db.prepare("PRAGMA table_info(lessons)").all() as Array<{ name: string }>).map((c) => c.name));
   if (!lessonCols.has("scope_engine")) db.exec("ALTER TABLE lessons ADD COLUMN scope_engine TEXT");
   if (!lessonCols.has("scope_strategy_version")) db.exec("ALTER TABLE lessons ADD COLUMN scope_strategy_version INTEGER");

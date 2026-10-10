@@ -2,7 +2,7 @@
 // Hot path DETERMINISTIC (src/scalp/signals.ts); LLM present in two places
 // (§ user requirement), both fail-closed:
 //   • supervisor: stance every stance_refresh_s (default 15m)
-//   • gate: ALLOW/DENY per candidate, budgeted (≤ llm_max_per_hour)
+//   • gate: ALLOW/DENY per candidate, using the authoritative Scalp role budget
 // Hard limits enforced here, not by the LLM: max daily trades, per-symbol
 // cooldown, total position cap (shared with 15m pipeline), one scalp/symbol,
 // time-stop (max_hold_s), SL/TP via exchange algo + 15s ticker fallback.
@@ -40,6 +40,7 @@ import { evaluateKillSwitch } from "../risk/limits.ts";
 import { evaluateGlobalEntryGate } from "../risk/global-entry-gate.ts";
 import type { Position } from "../exchange/okx/types.ts";
 import { isTradeOwnedBy } from "../memory/engines.ts";
+import { candidateStopRiskPct, portfolioOpenRisk } from "../risk/portfolio-open-risk.ts";
 
 const log = createLogger("scalp");
 const TF_TAG = "scalp";
@@ -242,6 +243,11 @@ export class ScalpRunner {
       const finalEquity = finalEquityRow ? Number(finalEquityRow.eq) || Number(finalEquityRow.availEq) || 0 : 0;
       const finalBase = baseline(store, finalEquity);
       const finalLocal = getOpenTrades(store) as Array<Record<string, unknown>>;
+      if (finalLocal.some((trade) => String(trade.status) === "RECONCILIATION_PENDING")) {
+        log.info({ event: "scalp_global_risk_reject", inst: sig.instrument, reason: "RECONCILIATION_PENDING", stage: "pre_order" });
+        logSystemEvent(store, "RISK_REJECT", { engine: "SCALP_5M", instId: sig.instrument, reason: "RECONCILIATION_PENDING" });
+        return;
+      }
       const finalLocalKeys = new Set(finalLocal.map((t) => `${String(t.instrument)}:${String(t.side).toLowerCase()}`));
       const finalExchangeKeys = new Set(finalPositions.map((p) => `${p.instId}:${p.posSide}`));
       const finalKill = evaluateKillSwitch({
@@ -253,14 +259,9 @@ export class ScalpRunner {
         dailyLossPct: finalBase.dayStartEquity > 0 ? ((finalBase.dayStartEquity - finalEquity) / finalBase.dayStartEquity) * 100 : 0,
         drawdownPct: finalBase.peakEquity > 0 ? ((finalBase.peakEquity - finalEquity) / finalBase.peakEquity) * 100 : 0,
       }, risk, store);
-      const finalGate = evaluateGlobalEntryGate({
-        killSwitchActive: finalKill, botState: getBotState(store), openPositions: finalPositions.length,
-        instrument: sig.instrument, instrumentOccupied: finalPositions.some((p) => p.instId === sig.instrument) ||
-          finalLocal.some((t) => String(t.instrument) === sig.instrument),
-      }, risk);
-      if (!finalGate.allowed || entrySettingsFingerprint(this.d.trading, risk) !== settingsAtPreparation) {
+      if (entrySettingsFingerprint(this.d.trading, risk) !== settingsAtPreparation) {
         log.info({ event: "scalp_global_risk_reject", inst: sig.instrument,
-          reason: entrySettingsFingerprint(this.d.trading, risk) !== settingsAtPreparation ? "ENTRY_SETTINGS_CHANGED" : finalGate.reason, stage: "pre_order" });
+          reason: "ENTRY_SETTINGS_CHANGED", stage: "pre_order" });
         return;
       }
       try {
@@ -269,6 +270,20 @@ export class ScalpRunner {
         { mode: "percent_of_equity", position_pct: cfg.position_pct });
       } catch (e) {
         log.info({ event: "scalp_sizing_reject", inst: sig.instrument, stage: "pre_order", error: e instanceof Error ? e.message.slice(0, 80) : "" }); return;
+      }
+      const portfolio = portfolioOpenRisk({ equity: finalEquity, positions: finalPositions, trades: finalLocal, instruments: this.d.instruments });
+      const candidateRisk = candidateStopRiskPct(Number(sz.contracts) * Number(meta.ctVal) * Math.abs(sig.price - sig.stopPx), finalEquity);
+      const finalGate = evaluateGlobalEntryGate({
+        killSwitchActive: finalKill, botState: getBotState(store), openPositions: finalPositions.length,
+        instrument: sig.instrument, instrumentOccupied: finalPositions.some((p) => p.instId === sig.instrument) ||
+          finalLocal.some((t) => String(t.instrument) === sig.instrument),
+        portfolioOpenRiskPct: portfolio.riskPct, candidateRiskPct: candidateRisk,
+      }, risk);
+      if (!finalGate.allowed) {
+        log.info({ event: "scalp_global_risk_reject", inst: sig.instrument, reason: finalGate.reason, stage: "pre_order" });
+        logSystemEvent(store, "RISK_REJECT", { engine: "SCALP_5M", instId: sig.instrument, reason: finalGate.reason,
+          checks: finalGate.checks, portfolioOpenRiskPct: portfolio.riskPct, candidateRiskPct: candidateRisk });
+        return;
       }
       const clOpen = clId(side, "OPEN", sig.instrument);
       const placed = await submitReservedEntry(this.d, {

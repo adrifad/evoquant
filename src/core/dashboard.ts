@@ -16,7 +16,7 @@ import type { Store } from "../memory/db.ts";
 import { getBotState, setBotState, isEmergencyHalted, setEmergencyHalted, baseline } from "../core/state.ts";
 import { getWeights } from "../learning/signal-weights.ts";
 import { regimeStats, scopedPerformance } from "../memory/regimes.ts";
-import { kvGet } from "../memory/db.ts";
+import { kvGet, logSystemEvent } from "../memory/db.ts";
 import { emergencyStop, type ExecutorDeps } from "../execution/executor.ts";
 import { setEnvKeys, maskKey } from "./settings.ts";
 import { loadRepoEnv } from "./env.ts";
@@ -33,6 +33,7 @@ import { RuntimeTradingError, type RuntimeTradingService } from "./runtime-tradi
 import { evolutionFamilies, scannerProjection } from "./workstation.ts";
 import type { ScanRow } from "../strategy/scanner.ts";
 import { getCandles, type Bar } from "../exchange/okx/market.ts";
+import { portfolioOpenRisk } from "../risk/portfolio-open-risk.ts";
 
 const log = createLogger("dashboard");
 const REPO_ROOT = path.resolve(import.meta.dirname, "../..");
@@ -85,7 +86,7 @@ export function startDashboard(cfg: DashboardConfig): DashboardServer {
   const projectTrade = (trade: Record<string, unknown>, positions: Awaited<ReturnType<typeof getPositions>> | null, equity: number | null) => {
     const saved = store.db.prepare("SELECT observed_at,snapshot FROM entry_capital WHERE trade_id=?").get(String(trade.trade_id)) as { observed_at: string; snapshot: string } | undefined;
     const entryCapital = saved ? JSON.parse(saved.snapshot) as Record<string, unknown> : null;
-    if (trade.status !== "OPEN") return { ...trade, entry_capital: entryCapital, capital_observed_at: saved?.observed_at ?? null };
+    if (!["OPEN", "RECONCILIATION_PENDING"].includes(String(trade.status))) return { ...trade, entry_capital: entryCapital, capital_observed_at: saved?.observed_at ?? null };
     const position = positions?.find(p => p.instId === trade.instrument && p.posSide === String(trade.side).toLowerCase() && Number(p.pos) !== 0);
     const capital = positionCapital(trade, position, cfg.deps().instruments[String(trade.instrument)], equity,
       Math.min(cfg.trading.leverage.default, Number(cfg.risk.hard_limits.max_leverage)));
@@ -96,6 +97,9 @@ export function startDashboard(cfg: DashboardConfig): DashboardServer {
   const candleCache = new Map<string, { at: number; rows: unknown[] }>();
   const candleRequests = new Map<string, Promise<unknown[]>>();
   const settingsFile = cfg.settingsFile ?? path.join(REPO_ROOT, ".env");
+  let modelDiscovery: { models: string[]; fetchedAt: string | null; expiresAt: number; baseUrl: string | null } = {
+    models: [], fetchedAt: null, expiresAt: 0, baseUrl: null,
+  };
 
   const rMultiple = (entry: number, stop: number, mark: number, side: string): number => {
     const risk = Math.abs(entry - stop);
@@ -125,8 +129,11 @@ export function startDashboard(cfg: DashboardConfig): DashboardServer {
       const usdt = bal?.details.find((d) => d.ccy === "USDT");
       const eq = finite(usdt?.eq);
       const base = eq !== null ? baseline(store, eq) : null;
-      const open = store.db.prepare("SELECT * FROM trades WHERE status='OPEN'").all() as Array<Record<string, unknown>>;
+      const open = store.db.prepare("SELECT * FROM trades WHERE status IN ('OPEN','RECONCILIATION_PENDING')").all() as Array<Record<string, unknown>>;
       const capital = accountCapital(bal, exchange.positions, open, cfg.deps().instruments, cfg.trading.leverage.default);
+      const portfolio = exchange.positions && eq !== null
+        ? portfolioOpenRisk({ equity: eq, positions: exchange.positions, trades: open, instruments: cfg.deps().instruments })
+        : { known: false, lossToStops: null, riskPct: null, unavailable: [] };
       const projected = open.map(t => projectTrade(t, exchange.positions, eq));
       const closed = store.db.prepare("SELECT COUNT(*) c, COALESCE(SUM(pnl),0) p, COALESCE(AVG(result_r),0) e FROM trades WHERE status='CLOSED'").get() as { c: number; p: number; e: number };
       return send(200, {
@@ -145,7 +152,8 @@ export function startDashboard(cfg: DashboardConfig): DashboardServer {
         drawdownPct: base && eq !== null && base.peakEquity > 0 ? Math.max(0, (base.peakEquity - eq) / base.peakEquity * 100) : null,
         totals: { closed: closed.c, pnl: closed.p, expectancyR: closed.e },
         openPositions: projected, openPosition: projected[0] ?? null,
-        criticalEvents: store.db.prepare("SELECT ts,kind,payload FROM system_events WHERE kind IN ('ERROR','RISK_EVENT','LLM_TIMEOUT','LLM_AUTH_FAILURE') ORDER BY id DESC LIMIT 4").all(),
+        criticalEvents: store.db.prepare("SELECT ts,kind,payload FROM system_events WHERE kind IN ('ERROR','RISK_EVENT','LLM_TIMEOUT','LLM_AUTH_FAILURE','STATE') ORDER BY id DESC LIMIT 4").all(),
+        reconciliationWarnings: store.db.prepare("SELECT trade_id,instrument,side,entry_ts,exit_reason FROM trades WHERE status='RECONCILIATION_PENDING' ORDER BY entry_ts DESC").all(),
         aiRoles: cfg.llmRoles?.settings() ?? [],
         scan: scannerProjection(store, cfg.getScan() as ScanRow[], cfg.getLastTick()?.at ?? null),
         evolution: { enabled: cfg.evolution.enabled ?? null, active: listV2Versions(store).filter(v => v.status === "CHALLENGER" || v.status === "SHADOW").map(v => ({ strategy: v.strategy, version: v.version, status: v.status })) },
@@ -154,11 +162,13 @@ export function startDashboard(cfg: DashboardConfig): DashboardServer {
         regime: cfg.getLastTick()?.regime ?? "UNKNOWN",
         market: cfg.getLastTick()?.features ?? null,
         limits: cfg.risk.hard_limits,              // §83
+        portfolioRisk: portfolio,
+        availablePositionSlots: Math.max(0, Number(cfg.risk.hard_limits.max_concurrent_positions) - (exchange.positions?.filter(p => Number(p.pos) !== 0).length ?? 0)),
         hardMaxesLocked: true,                     // §48: shown as locked
       });
     }
     if (p === "/api/trades") {
-      const rows = store.db.prepare("SELECT trade_id,instrument,side,strategy,strategy_core_version,strategy_version,regime,entry_px,initial_stop_px,stop_px,take_profit_px,exit_px,result_r,pnl,duration_s,exit_reason,exit_ts,status,calibrated_confidence,contracts,entry_ts,leverage,mfe,mae,planned_risk_pct FROM trades ORDER BY COALESCE(exit_ts,entry_ts) DESC LIMIT 100").all() as Array<Record<string, unknown>>;
+      const rows = store.db.prepare("SELECT trade_id,instrument,side,strategy,strategy_core_version,strategy_version,regime,entry_px,initial_stop_px,stop_px,take_profit_px,exit_px,result_r,result_r_basis,pnl,fees,funding,accounting_quality,evidence_state,evolution_evidence_eligible,duration_s,exit_reason,exit_ts,status,calibrated_confidence,contracts,entry_ts,leverage,mfe,mae,planned_risk_pct FROM trades ORDER BY COALESCE(exit_ts,entry_ts) DESC LIMIT 100").all() as Array<Record<string, unknown>>;
       const exchange = await exchangeSnapshot();
       return send(200, rows.map(t => projectTrade(t, exchange.positions, finite(exchange.balance?.details.find(d => d.ccy === "USDT")?.eq))));
     }
@@ -377,13 +387,26 @@ export function startDashboard(cfg: DashboardConfig): DashboardServer {
           temperature: Number(env.LLM_TEMPERATURE ?? "0.2"),
           apiKeyMasked: maskKey(env[KEY_ENV_NAME]),
           hasKey: Boolean(env[KEY_ENV_NAME]),
-          models: await listKiosModels(env),
+          models: modelDiscovery.models,
+          modelsCachedAt: modelDiscovery.fetchedAt,
+          modelsCacheExpiresAt: modelDiscovery.expiresAt || null,
         },
         learning: cfg.evolution,
         controlsLocked: [
           "environment", "absolute safety ceilings", "allowed symbols", "promotion criteria", "kill switch",
         ],
       });
+    }
+    if (method === "POST" && p === "/api/settings/models/refresh") {
+      const env = loadRepoEnvSafe();
+      const baseUrl = env.LLM_BASE_URL ?? null;
+      const now = Date.now();
+      if (baseUrl && modelDiscovery.baseUrl === baseUrl && modelDiscovery.expiresAt > now) {
+        return send(200, { models: modelDiscovery.models, cached: true, fetchedAt: modelDiscovery.fetchedAt,
+          expiresAt: modelDiscovery.expiresAt });
+      }
+      const models = await refreshLegacyModels(env);
+      return send(200, { models, cached: false, fetchedAt: modelDiscovery.fetchedAt, expiresAt: modelDiscovery.expiresAt });
     }
     if (method === "POST" && p === "/api/settings") {
       const body = await readJson(req);
@@ -415,17 +438,27 @@ export function startDashboard(cfg: DashboardConfig): DashboardServer {
     }
     try { return JSON.parse(Buffer.concat(chunks).toString("utf8")) as Record<string, unknown>; } catch { return {}; }
   }
-  async function listKiosModels(env: Record<string, string>): Promise<string[]> {
+  async function refreshLegacyModels(env: Record<string, string>): Promise<string[]> {
     if (!env.LLM_BASE_URL || !env[KEY_ENV_NAME]) return [];
+    logSystemEvent(store, "MODEL_DISCOVERY_REQUEST", { provider: "legacy", source: "dashboard", separate_from_llm_budget: true });
     try {
       const r = await fetch(`${env.LLM_BASE_URL.replace(/\/$/, "")}/models`, {
         headers: { Authorization: "Bearer " + env[KEY_ENV_NAME] },
         signal: AbortSignal.timeout(8_000),
       });
-      if (!r.ok) return [];
+      if (!r.ok) {
+        logSystemEvent(store, "MODEL_DISCOVERY_FAILED", { provider: "legacy", status: r.status, separate_from_llm_budget: true });
+        return [];
+      }
       const j = (await r.json()) as { data?: Array<{ id: string }> };
-      return (j.data ?? []).map((m) => m.id).sort();
-    } catch { return []; }
+      const models = (j.data ?? []).map((m) => m.id).sort();
+      modelDiscovery = { models, fetchedAt: new Date().toISOString(), expiresAt: Date.now() + 30 * 60_000, baseUrl: env.LLM_BASE_URL };
+      logSystemEvent(store, "MODEL_DISCOVERY_SUCCESS", { provider: "legacy", count: models.length, separate_from_llm_budget: true });
+      return models;
+    } catch {
+      logSystemEvent(store, "MODEL_DISCOVERY_FAILED", { provider: "legacy", reason: "NETWORK_OR_INVALID_RESPONSE", separate_from_llm_budget: true });
+      return [];
+    }
   }
 
   function authorized(req: IncomingMessage): boolean {

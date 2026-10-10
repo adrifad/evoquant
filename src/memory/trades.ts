@@ -70,9 +70,9 @@ export function openTrade(
 
 export interface ClosedMetrics {
   exitPx: number; exitTs: string; exitReason: string;
-  fees: number; funding: number;
+  fees: number; funding: number | null;
   pnl: number; pnlPct: number; resultR: number;
-  mfe: number; mae: number; durationS: number;
+  mfe: number | null; mae: number | null; durationS: number;
 }
 
 // §27 — compute closed-trade metrics from the price path while open.
@@ -83,21 +83,21 @@ export function computeClosedMetrics(args: {
   contracts: number; ctVal: number;
   exitReason: string;
   entryTs: string; exitTs: string;
-  candlesWhileOpen: Candle[];   // closed candles covering the open period
-  fees: number; funding: number;
+  candlesWhileOpen: Candle[] | null;   // confirmed candles covering the complete open period
+  fees: number; funding: number | null;
 }): ClosedMetrics {
   const { side, entryPx, stopPx, exitPx, contracts, ctVal } = args;
   const dir = side === "LONG" ? 1 : -1;
   const path = args.candlesWhileOpen;
   // MFE/MAE: favorable/adverse price excursion magnitude (§27)
-  let mfe = 0;
-  let mae = 0;
-  for (const c of path) {
-    mfe = Math.max(mfe, side === "LONG" ? c.h - entryPx : entryPx - c.l);
-    mae = Math.max(mae, side === "LONG" ? entryPx - c.l : c.h - entryPx);
+  let mfe: number | null = path ? 0 : null;
+  let mae: number | null = path ? 0 : null;
+  for (const c of path ?? []) {
+    mfe = Math.max(mfe ?? 0, side === "LONG" ? c.h - entryPx : entryPx - c.l);
+    mae = Math.max(mae ?? 0, side === "LONG" ? entryPx - c.l : c.h - entryPx);
   }
   const grossPnl = (exitPx - entryPx) * dir * contracts * ctVal;
-  const pnl = grossPnl - args.fees + args.funding;
+  const pnl = grossPnl - args.fees + (args.funding ?? 0);
   const pnlPct = entryPx > 0 ? ((exitPx - entryPx) * dir / entryPx) * 100 : 0;
   const riskPerUnit = Math.abs(entryPx - (args.initialStopPx ?? stopPx));
   const riskCapital = riskPerUnit * contracts * ctVal;
@@ -112,18 +112,30 @@ export function computeClosedMetrics(args: {
 }
 
 export function closeTrade(store: Store, tradeId: string, m: ClosedMetrics): void {
+  const eligible = m.funding !== null && m.mfe !== null && m.mae !== null && Number.isFinite(m.resultR) ? 1 : 0;
+  const accountingQuality = m.funding === null ? "FUNDING_UNAVAILABLE" : "COMPLETE";
   store.db
     .prepare(
-      `UPDATE trades SET status='CLOSED', result_r_basis='NET', exit_px=@exitPx, exit_ts=@exitTs, exit_reason=@exitReason,
+      `UPDATE trades SET status='CLOSED', result_r_basis=@resultRBasis, evidence_state=@evidenceState,
+        evolution_evidence_eligible=@eligible, accounting_quality=@accountingQuality, exit_px=@exitPx, exit_ts=@exitTs, exit_reason=@exitReason,
         fees=@fees, funding=@funding, pnl=@pnl, pnl_pct=@pnlPct, result_r=@resultR,
         mfe=@mfe, mae=@mae, duration_s=@durationS
-       WHERE trade_id=@tradeId AND status='OPEN'`,
+       WHERE trade_id=@tradeId AND status IN ('OPEN','RECONCILIATION_PENDING')`,
     )
-    .run({ tradeId, ...m });
+    .run({ tradeId, ...m, eligible, accountingQuality,
+      resultRBasis: m.funding === null ? "FEES_EX_FUNDING" : "NET",
+      evidenceState: eligible ? "VALID" : "ACCOUNTING_INCOMPLETE" });
 }
 
 export function getOpenTrades(store: Store): Array<Record<string, unknown>> {
-  return store.db.prepare("SELECT * FROM trades WHERE status='OPEN'").all() as Array<Record<string, unknown>>;
+  return store.db.prepare("SELECT * FROM trades WHERE status IN ('OPEN','RECONCILIATION_PENDING')").all() as Array<Record<string, unknown>>;
+}
+
+/** Missing exchange exit proof leaves the trade unresolved and ineligible for all learning. */
+export function markReconciliationPending(store: Store, tradeId: string, reason: string): void {
+  store.db.prepare(`UPDATE trades SET status='RECONCILIATION_PENDING', evidence_state='RECONCILIATION_PENDING',
+    evolution_evidence_eligible=0, accounting_quality='PENDING', exit_reason=?
+    WHERE trade_id=? AND status IN ('OPEN','RECONCILIATION_PENDING')`).run(reason, tradeId);
 }
 
 export function getClosedTrades(store: Store, limit = 500): Array<Record<string, unknown>> {

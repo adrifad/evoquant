@@ -38,6 +38,7 @@ export const RISK_CEILINGS = Object.freeze({
   max_drawdown_pct: ABSOLUTE_MAX.maxDrawdownPct,
   max_leverage: ABSOLUTE_MAX.leverage,
   max_concurrent_positions: ABSOLUTE_MAX.maxConcurrentPositions,
+  max_portfolio_open_risk_pct: ABSOLUTE_MAX.maxPortfolioOpenRiskPct,
 });
 const LimitsSchema = z.object({
   risk_per_trade_pct: z.number().positive().max(RISK_CEILINGS.risk_per_trade_pct),
@@ -45,6 +46,7 @@ const LimitsSchema = z.object({
   max_drawdown_pct: z.number().positive().max(RISK_CEILINGS.max_drawdown_pct),
   max_leverage: z.number().int().min(1).max(RISK_CEILINGS.max_leverage),
   max_concurrent_positions: z.number().int().min(1).max(RISK_CEILINGS.max_concurrent_positions),
+  max_portfolio_open_risk_pct: z.number().positive().max(RISK_CEILINGS.max_portfolio_open_risk_pct),
 }).strict();
 export type OperationalRiskLimits = z.infer<typeof LimitsSchema>;
 const StoredSchema = z.object({ revision: z.number().int().nonnegative(), limits: LimitsSchema }).strict();
@@ -61,7 +63,8 @@ export function operationalLimits(risk: RiskConfig): OperationalRiskLimits {
   const h = risk.hard_limits;
   return { risk_per_trade_pct: h.risk_per_trade_pct, max_daily_loss_pct: h.max_daily_loss_pct,
     max_drawdown_pct: h.max_drawdown_pct, max_leverage: h.max_leverage,
-    max_concurrent_positions: h.max_concurrent_positions };
+    max_concurrent_positions: h.max_concurrent_positions,
+    max_portfolio_open_risk_pct: h.max_portfolio_open_risk_pct };
 }
 
 export class RuntimeRiskService {
@@ -91,7 +94,7 @@ export class RuntimeRiskService {
       const labels: Record<keyof OperationalRiskLimits, [string, string]> = {
         risk_per_trade_pct: ["risk per trade", "%"], max_daily_loss_pct: ["daily loss limit", "%"],
         max_drawdown_pct: ["drawdown", "%"], max_leverage: ["leverage", "x"],
-        max_concurrent_positions: ["concurrent positions", ""],
+        max_concurrent_positions: ["concurrent positions", ""], max_portfolio_open_risk_pct: ["portfolio open risk", "%"],
       };
       const label = labels[field];
       const message = issue?.code === "too_big" && label

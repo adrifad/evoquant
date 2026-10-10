@@ -31,20 +31,20 @@ function fixture(t: { after(fn: () => void): void }, baselineMode = false) {
   return { root, store, risk, service };
 }
 
-test("risk per trade accepts exactly 10 percent only after confirmation, persists it and rejects excess", t => {
+test("risk per trade accepts exactly 2 percent only after confirmation, persists it and rejects excess", t => {
   const { service, store, risk } = fixture(t);
-  assert.equal(service.snapshot().ceilings.risk_per_trade_pct, 10);
-  const limits = { ...service.snapshot().limits, risk_per_trade_pct: 10 };
+  assert.equal(service.snapshot().ceilings.risk_per_trade_pct, 2);
+  const limits = { ...service.snapshot().limits, risk_per_trade_pct: 2 };
   assert.throws(() => service.update({ revision: 0, limits }), /confirmRiskIncrease/);
   service.update({ revision: 0, limits, confirmRiskIncrease: true });
-  assert.equal(risk.hard_limits.risk_per_trade_pct, 10);
+  assert.equal(risk.hard_limits.risk_per_trade_pct, 2);
   const restored = new RuntimeRiskService({ store, risk: loadRiskConfig() });
-  assert.equal(restored.snapshot().limits.risk_per_trade_pct, 10);
-  assert.throws(() => service.update({ revision: 1, limits: { ...limits, risk_per_trade_pct: 10.01 }, confirmRiskIncrease: true }), /Maximum allowed risk per trade is 10%/);
+  assert.equal(restored.snapshot().limits.risk_per_trade_pct, 2);
+  assert.throws(() => service.update({ revision: 1, limits: { ...limits, risk_per_trade_pct: 2.01 }, confirmRiskIncrease: true }), /Maximum allowed risk per trade is 2%/);
   assert.equal(service.snapshot().revision, 1);
   const audit = store.db.prepare("SELECT payload FROM system_events WHERE kind='RISK_LIMIT_CHANGED'").all() as Array<{ payload: string }>;
   assert.equal(audit.length, 1);
-  assert.deepEqual(JSON.parse(audit[0]!.payload).newValue, 10);
+  assert.deepEqual(JSON.parse(audit[0]!.payload).newValue, 2);
 });
 
 test("runtime risk rejects unknown, missing, nonnumeric, nonfinite and ceiling violations without writes", (t) => {
@@ -67,7 +67,7 @@ test("runtime risk rejects unknown, missing, nonnumeric, nonfinite and ceiling v
 test("all loosenings require explicit boolean confirmation and stale writers conflict", (t) => {
   const { service, store, risk } = fixture(t);
   const other = new RuntimeRiskService({ store, risk: structuredClone(risk) });
-  for (const field of Object.keys(RISK_CEILINGS) as Array<keyof typeof RISK_CEILINGS>) {
+  for (const field of (Object.keys(RISK_CEILINGS) as Array<keyof typeof RISK_CEILINGS>).filter(field => RISK_CEILINGS[field] > service.snapshot().limits[field])) {
     assert.throws(() => service.update({ revision: 0,
       limits: { ...service.snapshot().limits, [field]: RISK_CEILINGS[field] } }), /confirmRiskIncrease/);
   }

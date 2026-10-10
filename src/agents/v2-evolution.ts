@@ -40,7 +40,7 @@ export interface ClosedEvidence {
 export function getV2EvolutionEvidence(store: Store, strategy: StrategyV2Id, version: number,
   engine: TradingEngine = "SWING_15M"): ClosedEvidence[] {
   return store.db.prepare(`SELECT result_r,side,instrument,regime,regime_axes,exit_reason,mfe,mae,entry_px,initial_stop_px,entry_ts,exit_ts
-    FROM trades WHERE status='CLOSED' AND result_r_basis='NET' AND engine=? AND strategy=?
+    FROM trades WHERE status='CLOSED' AND evolution_evidence_eligible=1 AND result_r_basis='NET' AND engine=? AND strategy=?
       AND strategy_core_version=2 AND strategy_version=? ORDER BY exit_ts`)
     .all(engine, familyForV2(strategy), version) as ClosedEvidence[];
 }

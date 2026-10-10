@@ -9,8 +9,6 @@ import { logSystemEvent } from "../memory/db.ts";
 import type { Store } from "../memory/db.ts";
 
 export const ReviewSchema = z.object({
-  outcome: z.enum(["WIN", "LOSS", "BREAKEVEN"]),
-  result_r: z.number(),
   observations: z.array(z.object({
     factor: z.string(),
     effect: z.enum(["positive", "negative", "neutral"]),
@@ -25,7 +23,7 @@ export const ReviewSchema = z.object({
     confidence: z.number().min(0).max(1),
     scope: z.object({ strategy: z.string().optional(), regime: z.string().optional(), direction: z.string().optional() }).default({}),
   })).max(3).default([]),
-});
+}).strict();
 export type Review = z.infer<typeof ReviewSchema>;
 
 export async function reviewTrade(
@@ -62,8 +60,7 @@ export async function reviewTrade(
   }
   store.db.prepare(
     "INSERT OR REPLACE INTO trade_reviews(trade_id,ts,outcome,result_r,observations,lesson_candidates) VALUES(?,?,?,?,?,?)",
-  ).run(tradeId, new Date().toISOString(), review.outcome, review.result_r,
-    JSON.stringify(review.observations), JSON.stringify(review.lesson_candidates));
+  ).run(tradeId, new Date().toISOString(), null, null, JSON.stringify(review.observations), JSON.stringify(review.lesson_candidates));
   // Lesson candidates stay provisional: natural-language claims cannot yet
   // be validated reliably against arbitrary trades without semantic leakage.
   for (const c of review.lesson_candidates) {
@@ -80,6 +77,6 @@ export async function reviewTrade(
     });
     logSystemEvent(store, "LESSON_CANDIDATE", { lessonId, engine: input.engine, strategy: t.strategy, version: t.strategy_version, state: "PROVISIONAL_NO_SEMANTIC_VALIDATION" });
   }
-  logSystemEvent(store, "REVIEW", { tradeId, outcome: review.outcome, lessonCandidates: review.lesson_candidates.length });
+  logSystemEvent(store, "REVIEW", { tradeId, lessonCandidates: review.lesson_candidates.length });
   return review;
 }

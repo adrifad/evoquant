@@ -24,7 +24,7 @@ export function scopedPerformance(store: Store, scope: {
       CASE WHEN SUM(CASE WHEN result_r<0 THEN ABS(result_r) ELSE 0 END)>0
         THEN SUM(CASE WHEN result_r>0 THEN result_r ELSE 0 END)/SUM(CASE WHEN result_r<0 THEN ABS(result_r) ELSE 0 END)
         WHEN SUM(CASE WHEN result_r>0 THEN result_r ELSE 0 END)>0 THEN NULL ELSE 0 END profit_factor
-    FROM trades WHERE status='CLOSED' AND result_r_basis='NET' AND result_r IS NOT NULL
+    FROM trades WHERE status='CLOSED' AND evolution_evidence_eligible=1 AND result_r_basis='NET' AND result_r IS NOT NULL
       AND (? IS NULL OR engine=?) AND strategy_core_version=? AND (? IS NULL OR strategy=?) AND (? IS NULL OR strategy_version=?)
       AND (? IS NULL OR instrument=?) AND (? IS NULL OR regime=?) AND (? IS NULL OR side=?)
     GROUP BY engine,strategy,strategy_core_version,strategy_version,instrument,regime,regime_axes,side
@@ -37,7 +37,7 @@ export function scopedPerformance(store: Store, scope: {
 export function regimeStats(store: Store, engine: TradingEngine = "SWING_15M", coreVersion: 1 | 2 = 1): Record<string, Record<string, Record<string, CellStats>>> {
   const rows = store.db.prepare(`
     SELECT strategy, strategy_core_version, strategy_version, regime, side, result_r FROM trades
-    WHERE status='CLOSED' AND result_r_basis='NET' AND engine=? AND strategy_core_version=? AND regime IS NOT NULL AND result_r IS NOT NULL`).all(engine, coreVersion) as
+    WHERE status='CLOSED' AND evolution_evidence_eligible=1 AND result_r_basis='NET' AND engine=? AND strategy_core_version=? AND regime IS NOT NULL AND result_r IS NOT NULL`).all(engine, coreVersion) as
     Array<{ strategy: string; strategy_core_version: number; strategy_version: number; regime: string; side: "LONG" | "SHORT"; result_r: number }>;
   const out: Record<string, Record<string, Record<string, CellStats>>> = {};
   for (const r of rows) {

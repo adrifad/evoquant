@@ -20,7 +20,7 @@ import type { RiskConfig, TradingConfig } from "../core/config.ts";
 import { createLogger } from "../core/logger.ts";
 import type { Store } from "../memory/db.ts";
 import { logSystemEvent } from "../memory/db.ts";
-import { nextDecisionId, openTrade, recordDecision, computeClosedMetrics, closeTrade, getOpenTrades } from "../memory/trades.ts";
+import { nextDecisionId, openTrade, recordDecision, computeClosedMetrics, closeTrade, getOpenTrades, markReconciliationPending } from "../memory/trades.ts";
 import { evaluateEntry } from "../risk/engine.ts";
 import { evaluateKillSwitch } from "../risk/limits.ts";
 import { evaluateGlobalEntryGate } from "../risk/global-entry-gate.ts";
@@ -44,6 +44,7 @@ import { isTradeOwnedBy } from "../memory/engines.ts";
 import { selectedEntryLeverage, serializeRiskEntry, reserveEntry, releaseEntry, unresolvedEntry } from "../core/runtime-risk.ts";
 import { entrySettingsFingerprint } from "../core/runtime-trading.ts";
 import { persistEntryCapital } from "../core/capital.ts";
+import { candidateStopRiskPct, portfolioOpenRisk } from "../risk/portfolio-open-risk.ts";
 
 const log = createLogger("executor");
 
@@ -204,13 +205,15 @@ async function finalizeFromExchange(d: ExecutorDeps, t: Record<string, unknown>,
   const tradeId = String(t.trade_id ?? "");
   if (!tradeId) return;
   await serializeTradeMutation(tradeId, async () => {
-    const current = d.store.db.prepare("SELECT * FROM trades WHERE trade_id=? AND status='OPEN'").get(tradeId) as Record<string, unknown> | undefined;
+    const current = d.store.db.prepare("SELECT * FROM trades WHERE trade_id=? AND status IN ('OPEN','RECONCILIATION_PENDING')").get(tradeId) as Record<string, unknown> | undefined;
     if (!current) return;
     await finalizeOpenTradeFromExchange(d, current, ex);
   });
 }
 
-async function finalizeOpenTradeFromExchange(d: ExecutorDeps, t: Record<string, unknown>, ex?: Position): Promise<void> {
+export async function finalizeOpenTradeFromExchange(d: ExecutorDeps, t: Record<string, unknown>, ex?: Position): Promise<void> {
+  const tradeId = String(t.trade_id ?? "");
+  if (!tradeId) return;
   // Exit print resolution (algo/external closes have NO local close order id):
   // symbol history fills ≥ entry → latest OPPOSITE-side fill is the exit.
   const closeId = String(t.ord_close_id ?? "");
@@ -219,16 +222,29 @@ async function finalizeOpenTradeFromExchange(d: ExecutorDeps, t: Record<string, 
   const exitSide = sideL ? "sell" : "buy";
   let exitFill: Awaited<ReturnType<typeof getFills>>[number] | undefined;
   let fills: Awaited<ReturnType<typeof getFills>> = [];
-  if (closeId) fills = await getFills(d.client, String(t.instrument), closeId).catch(() => []);
+  let fillLookupFailed = false;
+  if (closeId) {
+    try { fills = await getFills(d.client, String(t.instrument), closeId); }
+    catch { fillLookupFailed = true; }
+  }
   if (fills.length === 0) {
     const { getFillsHistory } = await import("../exchange/okx/orders.ts");
-    const sym = await getFillsHistory(d.client, String(t.instrument)).catch(() => []);
+    let sym: Awaited<ReturnType<typeof getFillsHistory>> = [];
+    try { sym = await getFillsHistory(d.client, String(t.instrument)); }
+    catch { fillLookupFailed = true; }
     fills = sym.filter((f) => Number(f.ts) >= entryMs);
     exitFill = fills.filter((f) => f.side === exitSide).sort((a, b) => Number(b.ts) - Number(a.ts))[0];
   } else {
-    exitFill = fills[0];
+    exitFill = fills.find((fill) => fill.side === exitSide);
   }
-  const exitPx = ex?.markPx ? Number(ex.markPx) : (exitFill ? Number(exitFill.fillPx) : Number(t.entry_px));
+  const exitPx = Number(exitFill?.fillPx);
+  if (!exitFill || !Number.isFinite(exitPx) || exitPx <= 0) {
+    const reason = fillLookupFailed ? "EXIT_FILL_LOOKUP_UNAVAILABLE" : "EXIT_FILL_NOT_PROVEN";
+    markReconciliationPending(d.store, tradeId, reason);
+    logSystemEvent(d.store, "STATE", { tradeId, reconciliation: "RECONCILIATION_PENDING", reason });
+    log.warn({ event: "reconcile:pending", tradeId, reason });
+    return;
+  }
   const contracts = Number(t.contracts);
   const meta = d.instruments[String(t.instrument)] ?? Object.values(d.instruments)[0];
   const ctVal = Number(meta?.ctVal ?? 0);
@@ -237,12 +253,31 @@ async function finalizeOpenTradeFromExchange(d: ExecutorDeps, t: Record<string, 
     side, entryPx: Number(t.entry_px), stopPx: Number(t.stop_px),
     initialStopPx: Number(t.initial_stop_px ?? t.stop_px), exitPx,
     contracts, ctVal, exitReason: fills.length ? "FILL_CONFIRM" : "RECONCILE",
-    entryTs: String(t.entry_ts), exitTs: new Date().toISOString(),
-    candlesWhileOpen: await getCandles(d.client, String(t.instrument), d.trading.timeframe, 200).then((cs) => cs.filter((c) => c.confirm === "1" && c.ts > Date.parse(String(t.entry_ts)))),
-    fees: fills.reduce((a, f) => a + Math.abs(Number(f.fee) || 0), 0), funding: 0, // positive-cost convention
+    entryTs: String(t.entry_ts), exitTs: new Date(Number(exitFill.ts)).toISOString(),
+    candlesWhileOpen: await excursionCandles(d, t, Date.parse(String(t.entry_ts)), Number(exitFill.ts)),
+    fees: fills.reduce((a, f) => a + Math.abs(Number(f.fee) || 0), 0), funding: null,
   });
   closeTrade(d.store, String(t.trade_id), m);
   log.info({ event: "trade:finalized_reconcile", tradeId: String(t.trade_id), resultR: m.resultR });
+}
+
+/** Uses confirmed bars only and never turns missing coverage into a zero excursion. */
+export async function excursionCandles(d: Pick<ExecutorDeps, "client" | "trading">, trade: Record<string, unknown>, entryMs: number, exitMs: number) {
+  const bar = (String(trade.engine) === "SCALP_5M" ? "1m" : String(trade.timeframe || d.trading.timeframe)) as import("../exchange/okx/market.ts").Bar;
+  try {
+    const interval = msForBar(bar);
+    const confirmed = (await getCandles(d.client, String(trade.instrument), bar, 300))
+      .filter((c) => c.confirm === "1");
+    // The returned window must cover both ends of the actual position lifetime.
+    // A partial recent window would otherwise make an incomplete excursion look exact.
+    const startCovered = confirmed.some((c) => c.ts <= entryMs && c.ts + interval >= entryMs);
+    const endCovered = confirmed.some((c) => c.ts <= exitMs && c.ts + interval >= exitMs);
+    if (!startCovered || !endCovered) return null;
+    const rows = confirmed.filter((c) => c.ts + interval >= entryMs && c.ts <= exitMs);
+    // Empty coverage means data availability is unknown. A legitimate zero excursion
+    // has at least one confirmed candle and therefore remains distinguishable.
+    return rows.length ? rows : null;
+  } catch { return null; }
 }
 
 // ---- main per-candle tick (§42) --------------------------------------------
@@ -441,9 +476,12 @@ export async function runTick(d: ExecutorDeps, ctx: TickContext, symbol: TickSym
     const freshEq = usdtEquity(freshBal);
     const freshBase = baseline(store, freshEq);
     const freshLocal = (getOpenTrades(store) as Array<Record<string, unknown>>);
+    if (freshLocal.some((trade) => String(trade.status) === "RECONCILIATION_PENDING")) {
+      logSystemEvent(store, "RISK_REJECT", { engine: "SWING_15M", instId, reason: "RECONCILIATION_PENDING" });
+      return { kill };
+    }
     const freshKeys = new Set(freshPoss.map((p) => `${p.instId}:${p.posSide}`));
-    const localKeys = new Set(freshLocal.filter((x) => String(x.status) === "OPEN")
-      .map((x) => `${String(x.instrument)}:${String(x.side).toLowerCase()}`));
+    const localKeys = new Set(freshLocal.map((x) => `${String(x.instrument)}:${String(x.side).toLowerCase()}`));
     const freshKill = evaluateKillSwitch({
       apiOk: true, positionMismatch: [...freshKeys].some((k) => !localKeys.has(k)) || [...localKeys].some((k) => !freshKeys.has(k)),
       orderFailuresRecent: consecutiveOrderFailures, clockDriftMs: Date.now() - await getServerTime(client), dbOk: true,
@@ -451,10 +489,6 @@ export async function runTick(d: ExecutorDeps, ctx: TickContext, symbol: TickSym
       dailyLossPct: freshBase.dayStartEquity > 0 ? ((freshBase.dayStartEquity - freshEq) / freshBase.dayStartEquity) * 100 : 0,
       drawdownPct: freshBase.peakEquity > 0 ? ((freshBase.peakEquity - freshEq) / freshBase.peakEquity) * 100 : 0,
     }, risk, store);
-    const freshGate = evaluateGlobalEntryGate({
-      killSwitchActive: freshKill, botState: getBotState(store), openPositions: freshPoss.length,
-      instrument: instId, instrumentOccupied: freshPoss.some((p) => p.instId === instId) || localKeys.size > 0 && [...localKeys].some((k) => k.startsWith(`${instId}:`)),
-    }, risk);
     const freshRisk = evaluateEntry({
       action: decision.decision, strategy: decision.strategy ?? undefined, confidence: calConf,
       regime: ctx.regime, instrument: instId,
@@ -462,9 +496,9 @@ export async function runTick(d: ExecutorDeps, ctx: TickContext, symbol: TickSym
         : Number.isFinite(f.atr14) && f.price ? (decision.suggested_stop_atr * f.atr14) / f.price : undefined,
     }, { equity: freshEq, dayStartEquity: freshBase.dayStartEquity, peakEquity: freshBase.peakEquity,
       openPositions: freshPoss.length, killSwitchActive: freshKill }, trading, risk);
-    if (!freshGate.allowed || !freshRisk.approved || entrySettingsFingerprint(trading, risk) !== settingsAtPreparation) {
+    if (!freshRisk.approved || entrySettingsFingerprint(trading, risk) !== settingsAtPreparation) {
       logSystemEvent(store, "RISK_EVENT", { race_guard: "entry skipped after refreshed global risk check", instId,
-        reason: entrySettingsFingerprint(trading, risk) !== settingsAtPreparation ? "ENTRY_SETTINGS_CHANGED" : freshGate.allowed ? freshRisk.reason : freshGate.reason });
+        reason: entrySettingsFingerprint(trading, risk) !== settingsAtPreparation ? "ENTRY_SETTINGS_CHANGED" : freshRisk.reason });
       return { kill };
     }
     // Re-size from refreshed equity so a concurrent account loss cannot leave a stale oversized order.
@@ -473,6 +507,18 @@ export async function runTick(d: ExecutorDeps, ctx: TickContext, symbol: TickSym
         leverage, instrument: meta }, risk, trading.sizing);
     } catch (szErr) {
       logSystemEvent(store, "RISK_EVENT", { sizing_rejected_after_refresh: szErr instanceof Error ? szErr.message : String(szErr), instId });
+      return { kill };
+    }
+    const portfolio = portfolioOpenRisk({ equity: freshEq, positions: freshPoss, trades: freshLocal, instruments: d.instruments });
+    const candidateRisk = candidateStopRiskPct(Number(sz.contracts) * Number(meta.ctVal) * Math.abs(f.price - stopPx), freshEq);
+    const freshGate = evaluateGlobalEntryGate({
+      killSwitchActive: freshKill, botState: getBotState(store), openPositions: freshPoss.length,
+      instrument: instId, instrumentOccupied: freshPoss.some((p) => p.instId === instId) || [...localKeys].some((k) => k.startsWith(`${instId}:`)),
+      portfolioOpenRiskPct: portfolio.riskPct, candidateRiskPct: candidateRisk,
+    }, risk);
+    if (!freshGate.allowed) {
+      logSystemEvent(store, "RISK_REJECT", { engine: "SWING_15M", instId, reason: freshGate.reason, checks: freshGate.checks,
+        portfolioOpenRiskPct: portfolio.riskPct, candidateRiskPct: candidateRisk });
       return { kill };
     }
       const clOpen = clId(side, "OPEN", instId);
@@ -608,7 +654,6 @@ async function closeOpenTradeOnExchange(d: ExecutorDeps, t: Record<string, unkno
     logSystemEvent(d.store, "RISK_EVENT", { close_order_not_filled: filled.state, tradeId: String(t.trade_id), ordId: placed.ordId });
     throw error; // keep the trade OPEN and its exchange-side protection intact
   }
-  const exitPx = Number(filled.avgPx) || Number(pos.markPx);
   // §27 fees: sum |fee| across this trade's fills (entry + close orders)
   let feesPaid = 0;
   for (const id of [String(t.ord_open_id ?? ""), placed.ordId]) {
@@ -619,16 +664,24 @@ async function closeOpenTradeOnExchange(d: ExecutorDeps, t: Record<string, unkno
       side: fx.side, posSide: fx.posSide, ts: fx.ts })));
     for (const fx of fs) feesPaid += Math.abs(Number(fx.fee) || 0);
   }
+  const exitFill = [...(await getFills(d.client, String(t.instrument), placed.ordId).catch(() => []))]
+    .find((fill) => fill.side === (side === "LONG" ? "sell" : "buy"));
+  const exitPx = Number(exitFill?.fillPx);
+  if (!exitFill || !Number.isFinite(exitPx) || exitPx <= 0) {
+    d.store.db.prepare("UPDATE trades SET cl_close_id=?, ord_close_id=? WHERE trade_id=?").run(clClose, placed.ordId, String(t.trade_id));
+    markReconciliationPending(d.store, String(t.trade_id), "EXIT_FILL_NOT_PROVEN");
+    logSystemEvent(d.store, "STATE", { tradeId: String(t.trade_id), reconciliation: "RECONCILIATION_PENDING", reason: "EXIT_FILL_NOT_PROVEN" });
+    return;
+  }
   const contracts = Number(t.contracts);
   const ctVal = Number(meta.ctVal);
-  const candles = await getCandles(d.client, String(t.instrument), d.trading.timeframe, 200);
   const m = computeClosedMetrics({
     side, entryPx: Number(t.entry_px), stopPx: Number(t.stop_px),
     initialStopPx: Number(t.initial_stop_px ?? t.stop_px), exitPx,
     contracts, ctVal, exitReason: reason,
-    entryTs: String(t.entry_ts), exitTs: new Date().toISOString(),
-    candlesWhileOpen: candles.filter((c) => c.confirm === "1" && c.ts > Date.parse(String(t.entry_ts))),
-    fees: feesPaid, funding: 0,
+    entryTs: String(t.entry_ts), exitTs: new Date(Number(exitFill.ts)).toISOString(),
+    candlesWhileOpen: await excursionCandles(d, t, Date.parse(String(t.entry_ts)), Number(exitFill.ts)),
+    fees: feesPaid, funding: null,
   });
   closeTrade(d.store, String(t.trade_id), { ...m });
   d.store.db.prepare("UPDATE trades SET cl_close_id=?, ord_close_id=? WHERE trade_id=?").run(clClose, placed.ordId, String(t.trade_id));

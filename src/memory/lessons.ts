@@ -72,7 +72,7 @@ export function recomputeLesson(store: Store, lessonId: string): void {
            COALESCE(SUM(CASE WHEN l.aligned=1 THEN 1 ELSE 0 END),0) AS agree_n,
            COUNT(*) AS n
     FROM lesson_evidence l JOIN trades t ON t.trade_id=l.trade_id
-    WHERE l.lesson_id=? AND t.status='CLOSED' AND t.result_r_basis='NET'`).get(lessonId) as { agree_r: number; agree_n: number; n: number };
+    WHERE l.lesson_id=? AND t.status='CLOSED' AND t.evolution_evidence_eligible=1 AND t.result_r_basis='NET'`).get(lessonId) as { agree_r: number; agree_n: number; n: number };
   const expectAgree = stats.agree_n ? stats.agree_r / stats.agree_n : 0;
   const agreeRate = total ? agree / total : 0;
   const conflictRate = total ? 1 - agreeRate : 0;
@@ -100,7 +100,7 @@ export function getActiveLessons(store: Store, instrument: string, engine: Tradi
 // trades whose features SUPPORT a lesson's implied filter (for evidence attach)
 export function tradesMatchingScope(store: Store, scope: { engine?: TradingEngine; strategy?: string; strategyVersion?: number; instrument?: string; regime?: string; direction?: string; regimeAxes?: string }, limit = 50): Array<Record<string, unknown>> {
   const rows = store.db.prepare(
-    `SELECT trade_id, result_r, entry_features FROM trades WHERE status='CLOSED' AND result_r_basis='NET'
+    `SELECT trade_id, result_r, entry_features FROM trades WHERE status='CLOSED' AND evolution_evidence_eligible=1 AND result_r_basis='NET'
      AND engine=? AND (? IS NULL OR strategy=?) AND (? IS NULL OR strategy_version=?)
      AND (? IS NULL OR instrument=?) AND (? IS NULL OR regime=?) AND (? IS NULL OR side=?) AND (? IS NULL OR regime_axes=?)
      ORDER BY exit_ts DESC LIMIT ?`,

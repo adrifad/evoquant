@@ -20,6 +20,11 @@ export function RiskPage({ status }: { status: ApiState<Row> }) {
   const halted = Boolean(s.emergencyHalted || s.killReason || s.botState === "RISK_HALTED" || s.botState === "ERROR");
   const riskState = halted ? "HALTED" : dailyPct === null || drawdown === null ? "UNKNOWN" : nearLimit ? "WARNING" : "SAFE";
   const riskEvents = asRows(eventsApi.data).filter(event => String(event.kind).includes("RISK") || event.kind === "STATE");
+  const portfolio = asRow(s.portfolioRisk) ?? {};
+  const portfolioRisk = asNumber(portfolio.riskPct);
+  const lossToStops = asNumber(portfolio.lossToStops);
+  const portfolioLimit = asNumber(limits.max_portfolio_open_risk_pct);
+  const availableSlots = asNumber(s.availablePositionSlots);
 
   return <div className="page">
     <PageHeading title="Risk" description="Deterministic controls and risk events remain separate from AI decisions." detail={<StatusBadge value={riskState}/>}/>
@@ -29,6 +34,9 @@ export function RiskPage({ status }: { status: ApiState<Row> }) {
       <Metric label="Current drawdown" value={formatPercent(drawdown, 2, false)} tone={drawdown !== null && drawdown > 0 ? "warning" : "neutral"} detail={drawdownLimit ? `${formatNumber(drawdownLimit)}% hard limit` : "Limit unavailable"}/>
       <Metric label="Daily loss" value={formatPercent(dailyPct, 2, false)} tone={dailyPct !== null && dailyPct > 0 ? "warning" : "neutral"} detail={dailyLimit ? `${formatNumber(dailyLimit)}% hard limit` : "Limit unavailable"}/>
       <Metric label="Open positions" value={`${open.length} / ${limits.max_concurrent_positions}`} detail="Shared across swing and scalp"/>
+      <Metric label="Portfolio open risk" value={portfolioRisk === null ? "Unavailable" : `${formatNumber(portfolioRisk, 2)}% / ${formatNumber(portfolioLimit, 2)}%`} detail="Loss at active protective stops"/>
+      <Metric label="Potential loss to stops" value={lossToStops === null ? "Unavailable" : formatNumber(lossToStops)} detail="Price risk before costs"/>
+      <Metric label="Available position slots" value={availableSlots === null ? "Unavailable" : formatNumber(availableSlots, 0)} detail="Shared across swing and scalp"/>
       <Metric label="Demo equity" value={formatNumber(s.equity)} detail="USDT account equity"/>
       <Metric label="Bot risk state" value={<StatusBadge value={riskState}/>} detail={`Bot state: ${asText(s.botState, "UNKNOWN")}`}/>
     </section>
@@ -40,6 +48,7 @@ export function RiskPage({ status }: { status: ApiState<Row> }) {
         <Field label="Maximum drawdown" value={`${formatNumber(limits.max_drawdown_pct)}%`}/>
         <Field label="Maximum leverage" value={`${formatNumber(limits.max_leverage, 0)}x`}/>
         <Field label="Maximum positions" value={formatNumber(limits.max_concurrent_positions, 0)}/>
+        <Field label="Portfolio open risk limit" value={`${formatNumber(limits.max_portfolio_open_risk_pct)}%`}/>
       </div>
     </Panel>
 
