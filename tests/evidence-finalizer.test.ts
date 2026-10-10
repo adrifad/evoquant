@@ -149,3 +149,25 @@ test("Reviewer cannot run while evidence is pending and becomes eligible after V
   assert.notEqual(await reviewTrade(process.cwd(), roles, store, "T1"), null);
   assert.equal(calls, 1);
 });
+
+test("metadata-pending evidence advances bounded retries and completes after exact metadata recovery", async t => {
+  const store = withStore(t); seedPending(store, "META");
+  const recovered: Record<string, typeof meta> = {};
+  const d: EvidenceFinalizerDeps = {
+    ...deps(store, (endpoint, query) => {
+      if (endpoint === "/api/v5/trade/fills") return fills(String(query?.ordId));
+      if (endpoint === "/api/v5/account/bills") return [];
+      if (endpoint === "/api/v5/market/candles") return confirmedCandles;
+      throw new Error(endpoint);
+    }), instruments: recovered,
+    hydrateInstrumentMetadata: async ([instrument]) => { if (instrument === symbol && recovered[symbol]) return; },
+  };
+  await finalizePendingEvidence(d);
+  assert.deepEqual(store.db.prepare("SELECT evidence_state,evidence_reason,evidence_attempts,evolution_evidence_eligible FROM trades WHERE trade_id='META'").get(),
+    { evidence_state: "EVIDENCE_PENDING", evidence_reason: "INSTRUMENT_METADATA_PENDING", evidence_attempts: 1, evolution_evidence_eligible: 0 });
+  recovered[symbol] = meta;
+  store.db.prepare("UPDATE trades SET evidence_next_retry_ts=NULL WHERE trade_id='META'").run();
+  assert.equal(await finalizePendingEvidence(d), 1);
+  assert.deepEqual(store.db.prepare("SELECT evidence_state,result_r_basis,evolution_evidence_eligible FROM trades WHERE trade_id='META'").get(),
+    { evidence_state: "VALID", result_r_basis: "NET", evolution_evidence_eligible: 1 });
+});

@@ -31,7 +31,7 @@ import { getWeights, maybeEvolveWeights, type SignalWeights } from "../learning/
 import { recomputeCalibration } from "../learning/confidence.ts";
 import { compareAndMaybePromote } from "../evaluation/champion-challenger.ts";
 import { DEFAULT_V2_COSTS } from "../evaluation/backtest.ts";
-import { processShadowCycle } from "../evaluation/shadow-challenger.ts";
+import { processShadowCycle, shadowManagementSymbols } from "../evaluation/shadow-challenger.ts";
 import { evaluateV2Lifecycle } from "../evaluation/v2-promotion.ts";
 import { familyForV2 } from "../strategy/identity.ts";
 import { parseEvolutionConfig } from "./evolution-config.ts";
@@ -91,8 +91,10 @@ async function main(): Promise<void> {
   await dynamicWatchlist.initialize();
   const workflowSymbols = () => (store.db.prepare(`SELECT DISTINCT instrument FROM trades
     WHERE status IN ('OPEN','RECONCILIATION_PENDING') OR (status='CLOSED' AND evidence_state='EVIDENCE_PENDING')`).all() as Array<{ instrument: string }>).map((row) => row.instrument);
-  dynamicWatchlist.setManagementSymbols(workflowSymbols());
-  await dynamicWatchlist.hydrateManagementMetadata(workflowSymbols());
+  const exchangeManagementSymbols = new Set<string>();
+  const managementSymbols = () => [...new Set([...workflowSymbols(), ...shadowManagementSymbols(store), ...exchangeManagementSymbols])];
+  dynamicWatchlist.setManagementSymbols(managementSymbols());
+  await dynamicWatchlist.hydrateManagementMetadata(managementSymbols());
   const instruments: Record<string, InstrumentInfo> = {};
   dynamicWatchlist.syncCatalog(instruments);
   const watchlist = dynamicWatchlist.currentActiveUniverse((getOpenTrades(store) as Array<Record<string, unknown>>).map((t) => String(t.instrument)));
@@ -100,12 +102,24 @@ async function main(): Promise<void> {
   if (watchlist.length === 0) throw new Error("no watchlist instruments have metadata (§43)");
   const runtimeTrading = new RuntimeTradingService({ store, trading, risk, instruments: dynamicWatchlist.currentEntryUniverse() });
   const deps = { client, trading, risk, store, instruments, watchlist };
+  let metadataEntryHalted = false;
   const syncDynamicUniverse = () => {
-    dynamicWatchlist.setManagementSymbols(workflowSymbols());
+    dynamicWatchlist.setManagementSymbols(managementSymbols());
     dynamicWatchlist.syncCatalog(instruments);
     dynamicWatchlist.applyRiskAllowlist(risk.hard_limits.allowed_symbols);
     runtimeTrading.setInstruments(dynamicWatchlist.currentEntryUniverse());
     watchlist.splice(0, watchlist.length, ...dynamicWatchlist.currentManagementUniverse());
+  };
+  const reconcileManagementMetadata = async (forceHydration = false): Promise<void> => {
+    dynamicWatchlist.setManagementSymbols(managementSymbols());
+    if (forceHydration) await dynamicWatchlist.hydrateManagementMetadata(dynamicWatchlist.currentManagementUniverse());
+    const unresolved = dynamicWatchlist.unresolvedManagementSymbols();
+    const realOpen = new Set((getOpenTrades(store) as Array<Record<string, unknown>>)
+      .filter((trade) => ["OPEN", "RECONCILIATION_PENDING"].includes(String(trade.status))).map((trade) => String(trade.instrument)));
+    for (const symbol of exchangeManagementSymbols) realOpen.add(symbol);
+    metadataEntryHalted = unresolved.some((symbol) => realOpen.has(symbol));
+    if (metadataEntryHalted) logSystemEvent(store, "STATE", { state: "STATE_UNCERTAIN", reason: "OPEN_POSITION_METADATA_UNAVAILABLE", symbols: unresolved.filter((symbol) => realOpen.has(symbol)) });
+    syncDynamicUniverse();
   };
   if (!runtimePolicy.evolutionEnabled) {
     logSystemEvent(store, "EVOLUTION_FROZEN", { reason: baselineMode ? "baseline_validation_mode" : "configuration_disabled",
@@ -148,10 +162,8 @@ async function main(): Promise<void> {
   }
   // An exchange position can outlive the daily entry selection. Restore exact
   // metadata before any monitoring, reconciliation, or accounting path runs.
-  const exchangeManagement = (await getPositions(client)).filter((position) => position.pos !== "0").map((position) => position.instId);
-  dynamicWatchlist.setManagementSymbols([...workflowSymbols(), ...exchangeManagement]);
-  await dynamicWatchlist.hydrateManagementMetadata(dynamicWatchlist.currentManagementUniverse());
-  syncDynamicUniverse();
+  for (const symbol of (await getPositions(client)).filter((position) => position.pos !== "0").map((position) => position.instId)) exchangeManagementSymbols.add(symbol);
+  await reconcileManagementMetadata(true);
   loadStrategies(store);
   setBotState(store, "RUNNING");
   log.info({ event: "bot_started", state: getBotState(store) });
@@ -181,7 +193,7 @@ async function main(): Promise<void> {
     getScan: () => lastScan,
     llmRoles,
     dynamicWatchlist: { projection: () => dynamicWatchlist.projection(), refreshManual: async () => {
-      const result = await dynamicWatchlist.refreshManual(); syncDynamicUniverse(); return result;
+      await dynamicWatchlist.refreshManual(); await reconcileManagementMetadata(true); return dynamicWatchlist.projection();
     } },
   });
 
@@ -229,7 +241,7 @@ async function main(): Promise<void> {
       for (const snap of snaps) persistMarketSnapshot(store, snapshotTs, snap.instrument, snap.features);
       if (anchorSnap) lastTick = { features: anchorSnap.features, regime: anchorSnap.regime, at: snapshotTs };
       // 2) deterministic pre-rank (§37 opportunity agent as scanner)
-      const entrySnaps = snaps.filter((snap) => dynamicWatchlist.currentEntryUniverse().includes(snap.instrument));
+      const entrySnaps = metadataEntryHalted ? [] : snaps.filter((snap) => dynamicWatchlist.currentEntryUniverse().includes(snap.instrument));
       const rows = strategyCoreVersion === 2
         ? scanCoreV2(entrySnaps, histories, activeV2Params, activeV2Versions, v2Weights(store, activeV2Versions), trading.strategy_core.enabled_families)
         : scanInstruments(entrySnaps, trading.strategies_enabled
@@ -330,7 +342,7 @@ async function main(): Promise<void> {
           const validationHistories = validationHistoriesFromTrading(histories);
           const tickSizes = new Map([...validationHistories.keys()].map((symbol) => [symbol, Number(instruments[symbol]?.tickSz)]));
           processShadowCycle(store, snaps.map((snapshot) => ({ ...snapshot, tickSize: Number(instruments[snapshot.instrument]?.tickSz) })),
-            histories, trading.timeframe, backtestCosts);
+            histories, trading.timeframe, backtestCosts, { entrySymbols: dynamicWatchlist.currentEntryUniverse() });
           evaluateV2Lifecycle(store, validationHistories, trading.timeframe, backtestCosts, {
             historicalMinTrades: evolution.promotion.historical_min_trades,
             outOfSampleMinTrades: evolution.promotion.out_of_sample_min_trades,
@@ -370,6 +382,7 @@ async function main(): Promise<void> {
   const intrabar = setInterval(async () => {
     try {
       const poss = (await getPositions(deps.client)).filter((p) => p.pos !== "0");
+      exchangeManagementSymbols.clear(); for (const pos of poss) exchangeManagementSymbols.add(pos.instId);
       const local = (getOpenTrades(store) as Array<Record<string, unknown>>)
         .filter((t) => isTradeOwnedBy(t, "SWING_15M"));
       if (poss.length === 0 || local.length === 0) return;
@@ -397,9 +410,17 @@ async function main(): Promise<void> {
   const evidenceFinalizer = setInterval(() => {
     if (finalizerRunning) return;
     finalizerRunning = true;
-    void finalizePendingEvidence({ client, store, instruments, trading }).catch((error) => {
+    void finalizePendingEvidence({ client, store, instruments, trading, hydrateInstrumentMetadata: async (symbols) => {
+      await dynamicWatchlist.hydrateManagementMetadata(symbols); syncDynamicUniverse();
+    } }).catch((error) => {
       log.warn({ event: "evidence_finalizer_error", error: error instanceof Error ? error.message : String(error) });
     }).finally(() => { finalizerRunning = false; });
+  }, 60_000);
+
+  const metadataRecovery = setInterval(() => {
+    void dynamicWatchlist.retryManagementMetadataDue().then(() => reconcileManagementMetadata()).catch((error) => {
+      log.warn({ event: "management_metadata_retry_error", error: error instanceof Error ? error.message : String(error) });
+    });
   }, 60_000);
 
   const sched = new CandleCloseScheduler(msForBar(trading.timeframe), tick);
@@ -410,7 +431,7 @@ async function main(): Promise<void> {
   const scheduleDynamicRefresh = () => {
     const next = Date.parse(dynamicWatchlist.projection().next_refresh);
     dynamicRefreshTimer = setTimeout(() => {
-      void dynamicWatchlist.refreshIfDue().then(syncDynamicUniverse).finally(scheduleDynamicRefresh);
+      void dynamicWatchlist.refreshIfDue().then(() => reconcileManagementMetadata(true)).finally(scheduleDynamicRefresh);
     }, Math.max(1_000, next - Date.now()));
   };
   scheduleDynamicRefresh();
@@ -424,14 +445,14 @@ async function main(): Promise<void> {
     scalpRunner = new ScalpRunner({
       client, trading, risk, store, instruments, cfg: scalpCfg,
       llm: llmRoles,
-      entryUniverse: () => dynamicWatchlist.currentEntryUniverse(),
+      entryUniverse: () => metadataEntryHalted ? [] : dynamicWatchlist.currentEntryUniverse(),
     });
     scalpRunner.start();
   }
 
   process.on("SIGINT", () => {
     log.warn({ event: "sigint_emergency_stop" });
-    void emergencyStop(deps).finally(() => { sched.stop(); clearInterval(intrabar); clearInterval(evidenceFinalizer); if (dynamicRefreshTimer) clearTimeout(dynamicRefreshTimer); scalpRunner?.stop(); store.close(); process.exit(0); });
+    void emergencyStop(deps).finally(() => { sched.stop(); clearInterval(intrabar); clearInterval(evidenceFinalizer); clearInterval(metadataRecovery); if (dynamicRefreshTimer) clearTimeout(dynamicRefreshTimer); scalpRunner?.stop(); store.close(); process.exit(0); });
   });
 }
 

@@ -93,10 +93,34 @@ test("automatic discovery runs once per UTC day, restart reuses snapshot, and co
   const before = f.counts(); const restarted = f.service(); await restarted.initialize();
   assert.equal(f.counts().universe, before.universe, "same-day restart performs zero full universe discovery calls");
   assert.equal(f.counts().tickers, before.tickers);
+  assert.equal(restarted.projection().statistics.selected, 2, "restart restores persisted discovery statistics");
+  assert.equal(restarted.projection().statistics.candleRequestsSucceeded, 2);
+  assert.equal(restarted.projection().config?.dynamic_slots, config.dynamic_slots);
+  assert.equal(restarted.projection().config?.min_trend_score, 0);
   f.setNow(new Date("2026-10-11T01:00:00.000Z"));
   const nextDay = f.service(); await nextDay.initialize();
   assert.equal(f.counts().universe, before.universe + 1, "the next UTC date triggers exactly one new discovery cycle");
   assert.ok(restarted.currentActiveUniverse(["SUI-USDT-SWAP"]).includes("SUI-USDT-SWAP"));
+});
+
+test("retry accounting accumulates logical client calls across the complete discovery job", async t => {
+  const root = mkdtempSync(path.join(os.tmpdir(), "evoq-dynamic-accounting-")); const store = openStore(root);
+  t.after(() => { store.close(); rmSync(root, { recursive: true, force: true }); });
+  const all = [...CORE_WATCHLIST.map(instrument), instrument("SUI-USDT-SWAP"), instrument("AVAX-USDT-SWAP")];
+  let pass = 0;
+  const client = { get: async <T>(url: string, query?: Record<string, unknown>) => {
+    if (url === "/api/v5/public/instruments") return (query?.instId ? all.filter(item => item.instId === query.instId) : all).map(item => ({ ...item, listTime: String(item.listTime) })) as T;
+    if (url === "/api/v5/market/tickers") return all.map(item => ticker(item.instId)) as T;
+    if (url === "/api/v5/market/candles") { if (pass++ < 2) throw new Error("timeout"); return candles(String(query?.instId).startsWith("AVAX") ? -1 : 1).map(raw) as T; }
+    throw new Error(url);
+  }, post: async () => { throw new Error("no mutation"); } } as unknown as OkxClient;
+  const service = new DynamicWatchlistService({ store, client, config, now: () => now, sleep: async () => {} });
+  await service.initialize();
+  assert.deepEqual(service.projection().statistics, {
+    ...service.projection().statistics, universeRequests: 2, tickerRequests: 2,
+    candleRequestsAttempted: 4, candleRequestsSucceeded: 2, candleRequestsFailed: 2,
+    totalHttpAttempts: 8, jobAttempts: 2,
+  });
 });
 
 test("failed daily discovery preserves prior dynamic selection as stale and manual refresh is audited", async t => {

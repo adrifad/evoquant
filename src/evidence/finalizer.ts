@@ -25,6 +25,8 @@ export interface EvidenceFinalizerDeps {
   instruments: Record<string, InstrumentInfo>;
   trading: TradingConfig;
   now?: () => number;
+  /** Exact metadata recovery is injected by runtime; never substitute another symbol. */
+  hydrateInstrumentMetadata?: (symbols: readonly string[]) => Promise<void>;
 }
 
 function finite(value: unknown): number | null {
@@ -89,7 +91,8 @@ function invalidEvidence(d: EvidenceFinalizerDeps, tradeId: string, reason: stri
   logSystemEvent(d.store, "STATE", { tradeId, evidence: "INVALID", reason });
 }
 
-function deferEvidence(d: EvidenceFinalizerDeps, t: Record<string, unknown>, reason: string, now: number, metrics: ClosedMetrics): void {
+type PendingMetrics = Pick<ClosedMetrics, "fees" | "funding" | "mfe" | "mae">;
+function deferEvidence(d: EvidenceFinalizerDeps, t: Record<string, unknown>, reason: string, now: number, metrics: PendingMetrics): void {
   const attempt = Number(t.evidence_attempts ?? 0) + 1;
   const accountingQuality = metrics.fees === null ? "FEE_PENDING" : metrics.funding === null ? "FUNDING_PENDING" : "COMPLETE";
   if (attempt >= RETRY_MAX_ATTEMPTS) {
@@ -126,12 +129,14 @@ async function finalizeOne(d: EvidenceFinalizerDeps, candidate: Record<string, u
     if (!t) return false;
     const entryPx = finite(t.entry_px); const exitPx = finite(t.exit_px); const contracts = finite(t.contracts);
     const entryMs = Date.parse(String(t.entry_ts)); const exitMs = Date.parse(String(t.exit_ts));
-    const meta = d.instruments[String(t.instrument)]; const ctVal = meta?.instId === String(t.instrument) ? finite(meta.ctVal) : null;
+    const instrument = String(t.instrument);
+    let meta = d.instruments[instrument];
+    if ((!meta || meta.instId !== instrument || finite(meta.ctVal) === null) && d.hydrateInstrumentMetadata) await d.hydrateInstrumentMetadata([instrument]);
+    meta = d.instruments[instrument]; const ctVal = meta?.instId === instrument ? finite(meta.ctVal) : null;
     const initialStop = finite(t.initial_stop_px ?? t.stop_px);
     if (ctVal === null || ctVal <= 0) {
-      d.store.db.prepare(`UPDATE trades SET evidence_state='EVIDENCE_PENDING', evolution_evidence_eligible=0,
-        evidence_reason='INSTRUMENT_METADATA_PENDING', evidence_next_retry_ts=? WHERE trade_id=? AND evidence_state='EVIDENCE_PENDING'`)
-        .run(new Date(now + retryDelayMs(Number(t.evidence_attempts ?? 0) + 1)).toISOString(), tradeId);
+      const known = (value: unknown): number | null => value === null || value === undefined ? null : finite(value);
+      deferEvidence(d, t, "INSTRUMENT_METADATA_PENDING", now, { fees: known(t.fees), funding: known(t.funding), mfe: known(t.mfe), mae: known(t.mae) });
       logSystemEvent(d.store, "STATE", { tradeId, evidence: "EVIDENCE_PENDING", reason: "INSTRUMENT_METADATA_PENDING" });
       return false;
     }

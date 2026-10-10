@@ -49,15 +49,37 @@ export class RuntimeTradingService {
     const raw = kvGet(this.store, RUNTIME_TRADING_KEY);
     const saved = raw === null ? { revision: 0, settings: SettingsSchema.parse(tradingSettings(this.trading)) }
       : StoredSchema.parse(JSON.parse(raw));
-    this.validateInstrument(saved.settings.instrument_id);
-    this.apply(saved.settings);
     this.revision = saved.revision;
+    this.apply(this.repairPrimaryInstrument(saved.settings, "NO_LONGER_ENTRY_ELIGIBLE"));
   }
   private allowedInstruments(): string[] {
     return this.instruments.filter((id) => this.risk.hard_limits.allowed_symbols.includes(id));
   }
-  /** Discovery updates this bounded runtime list; persisted settings are still validated on write. */
-  setInstruments(instruments: readonly string[]): void { this.instruments = [...new Set(instruments)]; }
+  /** Discovery updates this bounded runtime list and repairs a rotated primary. */
+  setInstruments(instruments: readonly string[]): void {
+    this.instruments = [...new Set(instruments)];
+    this.apply(this.repairPrimaryInstrument(tradingSettings(this.trading), "NO_LONGER_ENTRY_ELIGIBLE"));
+  }
+  private fallbackInstrument(): string | null {
+    const allowed = this.allowedInstruments();
+    if (allowed.includes(this.trading.instrument.id)) return this.trading.instrument.id;
+    if (allowed.includes("BTC-USDT-SWAP")) return "BTC-USDT-SWAP";
+    return allowed[0] ?? null;
+  }
+  /** Runtime selection is a UI anchor only; rotation never touches open trades. */
+  private repairPrimaryInstrument(settings: RuntimeTradingSettings, reason: "NO_LONGER_ENTRY_ELIGIBLE"): RuntimeTradingSettings {
+    if (this.allowedInstruments().includes(settings.instrument_id)) return settings;
+    const nextInstrument = this.fallbackInstrument();
+    if (!nextInstrument) throw new RuntimeTradingError(400, "INVALID_TRADING_INSTRUMENT", "No entry-eligible instrument is available.");
+    const next = { ...settings, instrument_id: nextInstrument };
+    const revision = this.revision + 1;
+    this.store.db.transaction(() => {
+      kvSet(this.store, RUNTIME_TRADING_KEY, JSON.stringify({ revision, settings: next }));
+      logFallback(this.store, settings.instrument_id, nextInstrument, reason, revision);
+    })();
+    this.revision = revision;
+    return next;
+  }
   private validateInstrument(id: string): void {
     if (!this.allowedInstruments().includes(id)) {
       throw new RuntimeTradingError(400, "INVALID_TRADING_INSTRUMENT", "Select an instrument in the available watchlist and risk allowlist.");
@@ -116,4 +138,8 @@ export class RuntimeTradingService {
     this.revision = result.revision;
     return this.snapshot();
   }
+}
+
+function logFallback(store: Store, oldInstrument: string, newInstrument: string, reason: string, revision: number): void {
+  store.db.prepare("INSERT INTO system_events(ts,kind,payload) VALUES(?,?,?)").run(new Date().toISOString(), "TRADING_PRIMARY_INSTRUMENT_FALLBACK", JSON.stringify({ oldInstrument, newInstrument, reason, revision }));
 }

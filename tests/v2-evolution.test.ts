@@ -13,7 +13,7 @@ import { evolutionReviewEligible, getV2EvolutionEvidence, validateV2Proposal, v2
 import { measureContributions } from "../src/learning/signal-weights.ts";
 import { calculateExecutionCostR, DEFAULT_V2_COSTS } from "../src/evaluation/backtest.ts";
 import { evaluateV2Lifecycle } from "../src/evaluation/v2-promotion.ts";
-import { processShadowCycle, shadowExperimentId } from "../src/evaluation/shadow-challenger.ts";
+import { processShadowCycle, shadowExperimentId, shadowManagementSymbols } from "../src/evaluation/shadow-challenger.ts";
 import { resolveRuntimePolicy } from "../src/core/runtime-policy.ts";
 import { runOncePerGlobalCycle } from "../src/core/global-cycle.ts";
 import type { Candle } from "../src/exchange/okx/types.ts";
@@ -179,6 +179,32 @@ test("shadow Challenger simulates next-open entry and exit in its own ledger wit
     "an exit during this cycle cannot create a same-candle replacement signal");
   assert.equal((db.db.prepare("SELECT COUNT(*) n FROM trades").get() as { n: number }).n, 0);
   assert.equal((db.db.prepare("SELECT COUNT(*) n FROM orders").get() as { n: number }).n, 0);
+  db.close();
+});
+
+test("rotated Dynamic symbols manage existing Shadow rows but cannot create new Shadow signals", () => {
+  const db = store(); ensureV2Registry(db);
+  const version = createV2Challenger(db, { strategy: "TREND_FOLLOWING_V2", parentVersion: 2,
+    params: { ...DEFAULT_V2_PARAMS.TREND_FOLLOWING_V2, max_extension_atr: 1.1 }, changedParameter: "max_extension_atr", oldValue: 1.2, newValue: 1.1,
+    hypothesis: "bounded rotation test", evidence: {} });
+  transitionV2Version(db, "TREND_FOLLOWING_V2", version, "SHADOW", "test");
+  const challenger = listV2Versions(db, "TREND_FOLLOWING_V2").find(row => row.version === version)!;
+  const champion = getV2Champions(db).TREND_FOLLOWING_V2;
+  const started = Date.parse(challenger.shadow_started_ts!);
+  const experiment = shadowExperimentId("TREND_FOLLOWING_V2", champion.version, version, challenger.shadow_started_ts!);
+  const symbol = "SUI-USDT-SWAP", signalTs = started + 1;
+  db.db.prepare(`INSERT INTO shadow_trades(shadow_trade_id,engine,strategy,strategy_core_version,strategy_version,shadow_role,shadow_experiment_id,instrument,side,status,signal_ts,last_processed_ts,signal_price,stop_atr,target_r,max_hold_bars,risk_distance,regime,regime_axes,entry_conditions,costs_json,tick_size)
+    VALUES(?, 'SWING_15M','TREND_FOLLOWING',2,?,'CHALLENGER',?,?,'LONG','PENDING',?,?,?,1,2,10,1,'BULL_TREND','{}','[]',?,0.01)`)
+    .run("SUI-PENDING", version, experiment, symbol, signalTs, signalTs, 100, JSON.stringify(DEFAULT_V2_COSTS));
+  assert.deepEqual(shadowManagementSymbols(db), [symbol]);
+  const history = new Map([[symbol, [candle(signalTs + 1, 100, 100.2, 99.8, 100)]]]);
+  processShadowCycle(db, [{ instrument: symbol, features: { ...feature(signalTs + 1), instrument: symbol }, tickSize: 0.01 }], history, "15m", DEFAULT_V2_COSTS, { entrySymbols: ["BTC-USDT-SWAP"] });
+  assert.equal((db.db.prepare("SELECT status FROM shadow_trades WHERE shadow_trade_id='SUI-PENDING'").get() as { status: string }).status, "OPEN");
+  assert.equal((db.db.prepare("SELECT COUNT(*) count FROM shadow_trades WHERE instrument=?").get(symbol) as { count: number }).count, 1, "removed symbol cannot open a new Shadow signal");
+  history.set(symbol, [...history.get(symbol)!, candle(signalTs + 2, 100, 103, 99.9, 102)]);
+  processShadowCycle(db, [{ instrument: symbol, features: { ...feature(signalTs + 2, 102), instrument: symbol }, tickSize: 0.01 }], history, "15m", DEFAULT_V2_COSTS, { entrySymbols: ["BTC-USDT-SWAP"] });
+  assert.equal((db.db.prepare("SELECT status FROM shadow_trades WHERE shadow_trade_id='SUI-PENDING'").get() as { status: string }).status, "CLOSED");
+  assert.deepEqual(shadowManagementSymbols(db), []);
   db.close();
 });
 

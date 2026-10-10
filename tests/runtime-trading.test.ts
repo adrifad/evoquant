@@ -112,6 +112,16 @@ test("updates preserve nested identities, audit each field, compare revisions an
   assert.equal(trading.environment, "demo");
 });
 
+test("watchlist rotation repairs the runtime primary without touching any position state", t => {
+  const { service, risk, store } = fixture(t);
+  service.update({ revision: 0, settings: { ...service.snapshot().settings, instrument_id: second } });
+  risk.hard_limits.allowed_symbols = [symbol];
+  service.setInstruments([symbol]);
+  assert.equal(service.snapshot().settings.instrument_id, symbol);
+  assert.equal((store.db.prepare("SELECT COUNT(*) count FROM trades").get() as { count: number }).count, 0);
+  assert.equal((store.db.prepare("SELECT COUNT(*) count FROM system_events WHERE kind='TRADING_PRIMARY_INSTRUMENT_FALLBACK'").get() as { count: number }).count, 1);
+});
+
 test("audit failure rolls back persistence, revision and every live setting", t => {
   const { service, store, trading } = fixture(t);
   const original = service.snapshot(), identity = trading.sizing;
@@ -125,7 +135,7 @@ test("audit failure rolls back persistence, revision and every live setting", t 
   assert.equal(kvGet(store, RUNTIME_TRADING_KEY), null);
 });
 
-test("restart restores trading settings and invalid persisted settings fail closed", t => {
+test("restart restores trading settings, rejects corrupt values, and repairs a rotated primary instrument", t => {
   const { service, store, risk, root } = fixture(t);
   const saved = service.update({ revision: 0, settings: { ...service.snapshot().settings,
     instrument_id: second, leverage_default: 2, position_pct: 0.1 } });
@@ -134,11 +144,17 @@ test("restart restores trading settings and invalid persisted settings fail clos
     const restarted = new RuntimeTradingService({ store: restartedStore, trading: loadTradingConfig(), risk, instruments: [symbol, second] });
     assert.deepEqual(restarted.snapshot(), saved);
   } finally { restartedStore.close(); }
-  for (const settings of [{ ...saved.settings, leverage_default: 11 },
-    { ...saved.settings, instrument_id: "NO_METADATA" }, { ...saved.settings, position_pct: Infinity }]) {
+  for (const settings of [{ ...saved.settings, leverage_default: 11 }, { ...saved.settings, position_pct: Infinity }]) {
     kvSet(store, RUNTIME_TRADING_KEY, JSON.stringify({ revision: 1, settings }));
     assert.throws(() => new RuntimeTradingService({ store, trading: loadTradingConfig(), risk, instruments: [symbol, second] }));
   }
+  kvSet(store, RUNTIME_TRADING_KEY, JSON.stringify({ revision: 1, settings: { ...saved.settings, instrument_id: "SUI-USDT-SWAP" } }));
+  const rotated = new RuntimeTradingService({ store, trading: loadTradingConfig(), risk, instruments: [symbol, second] });
+  assert.equal(rotated.snapshot().settings.instrument_id, symbol);
+  assert.equal(JSON.parse(kvGet(store, RUNTIME_TRADING_KEY)!).settings.instrument_id, symbol);
+  const fallback = store.db.prepare("SELECT kind,payload FROM system_events WHERE kind='TRADING_PRIMARY_INSTRUMENT_FALLBACK' ORDER BY id DESC LIMIT 1").get() as { kind: string; payload: string };
+  assert.equal(fallback.kind, "TRADING_PRIMARY_INSTRUMENT_FALLBACK");
+  assert.deepEqual(JSON.parse(fallback.payload), { oldInstrument: "SUI-USDT-SWAP", newInstrument: symbol, reason: "NO_LONGER_ENTRY_ELIGIBLE", revision: 2 });
   kvSet(store, RUNTIME_TRADING_KEY, "not json");
   assert.throws(() => new RuntimeTradingService({ store, trading: loadTradingConfig(), risk, instruments: [symbol, second] }));
 });

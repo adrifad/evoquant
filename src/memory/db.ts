@@ -221,6 +221,7 @@ CREATE TABLE IF NOT EXISTS dynamic_watchlist_runs (
 CREATE INDEX IF NOT EXISTS idx_dynamic_watchlist_runs_date ON dynamic_watchlist_runs(snapshot_date,generated_at DESC);
 CREATE TABLE IF NOT EXISTS dynamic_watchlist_snapshots (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
+  run_id INTEGER REFERENCES dynamic_watchlist_runs(id),
   snapshot_date TEXT NOT NULL,
   generated_at TEXT NOT NULL,
   source TEXT NOT NULL,
@@ -345,6 +346,16 @@ export function openStore(root: string): Store {
   if (!dynamicRunCols.has("candle_requests_succeeded")) db.exec("ALTER TABLE dynamic_watchlist_runs ADD COLUMN candle_requests_succeeded INTEGER NOT NULL DEFAULT 0");
   if (!dynamicRunCols.has("candle_requests_failed")) db.exec("ALTER TABLE dynamic_watchlist_runs ADD COLUMN candle_requests_failed INTEGER NOT NULL DEFAULT 0");
   if (!dynamicRunCols.has("total_http_attempts")) db.exec("ALTER TABLE dynamic_watchlist_runs ADD COLUMN total_http_attempts INTEGER NOT NULL DEFAULT 0");
+  const dynamicSnapshotCols = new Set((db.prepare("PRAGMA table_info(dynamic_watchlist_snapshots)").all() as Array<{ name: string }>).map((c) => c.name));
+  if (!dynamicSnapshotCols.has("run_id")) db.exec("ALTER TABLE dynamic_watchlist_snapshots ADD COLUMN run_id INTEGER REFERENCES dynamic_watchlist_runs(id)");
+  // Backfill only unambiguous historical pairs. New snapshots always carry an
+  // explicit run id, so restart statistics never depend on timestamp joins.
+  db.exec(`UPDATE dynamic_watchlist_snapshots AS snapshot SET run_id=(
+    SELECT run.id FROM dynamic_watchlist_runs AS run
+    WHERE run.status='SUCCESS' AND run.snapshot_date=snapshot.snapshot_date
+      AND run.source=snapshot.source AND run.generated_at=snapshot.generated_at
+    ORDER BY run.id DESC LIMIT 1
+  ) WHERE run_id IS NULL`);
   const v2VersionCols = new Set((db.prepare("PRAGMA table_info(strategy_v2_versions)").all() as Array<{ name: string }>).map((c) => c.name));
   if (!v2VersionCols.has("shadow_started_ts")) db.exec("ALTER TABLE strategy_v2_versions ADD COLUMN shadow_started_ts TEXT");
   const shadowCols = new Set((db.prepare("PRAGMA table_info(shadow_trades)").all() as Array<{ name: string }>).map((c) => c.name));

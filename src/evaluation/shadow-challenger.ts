@@ -8,6 +8,7 @@ import { completeV2Params, getV2Champions, listV2Versions, type V2StrategyVersio
 import { familyForV2 } from "../strategy/identity.ts";
 
 export interface ShadowSnapshot { instrument: string; features: FeatureSnapshot; tickSize?: number }
+export interface ShadowCycleOptions { entrySymbols?: readonly string[] }
 interface ShadowRow {
   shadow_trade_id: string; strategy: string; strategy_version: number; shadow_role: "CHAMPION" | "CHALLENGER";
   shadow_experiment_id: string; instrument: string; side: "LONG" | "SHORT";
@@ -20,7 +21,7 @@ interface ShadowRow {
 
 /** Counterfactual-only simulation. There is intentionally no exchange or LLM dependency. */
 export function processShadowCycle(store: Store, snapshots: ShadowSnapshot[], histories: ReadonlyMap<string, Candle[]>,
-  timeframe: string, costs: V2CostModel): number {
+  timeframe: string, costs: V2CostModel, options: ShadowCycleOptions = {}): number {
   void timeframe;
   let inserted = 0;
   const versions = listV2Versions(store);
@@ -33,11 +34,17 @@ export function processShadowCycle(store: Store, snapshots: ShadowSnapshot[], hi
     for (const snapshot of snapshots) {
       const candles = (histories.get(snapshot.instrument) ?? []).filter((c) => c.confirm === "1").slice().sort((a, b) => a.ts - b.ts);
       if (candles.length === 0) continue;
-      inserted += processVariant(store, champion, "CHAMPION", experimentId, shadowStartedTs, snapshot, candles, costs);
-      inserted += processVariant(store, challenger, "CHALLENGER", experimentId, shadowStartedTs, snapshot, candles, costs);
+      const entryAllowed = options.entrySymbols === undefined || options.entrySymbols.includes(snapshot.instrument);
+      inserted += processVariant(store, champion, "CHAMPION", experimentId, shadowStartedTs, snapshot, candles, costs, entryAllowed);
+      inserted += processVariant(store, challenger, "CHALLENGER", experimentId, shadowStartedTs, snapshot, candles, costs, entryAllowed);
     }
   }
   return inserted;
+}
+
+/** Pending/Open Shadow rows require market data even after entry-universe rotation. */
+export function shadowManagementSymbols(store: Store): string[] {
+  return (store.db.prepare("SELECT DISTINCT instrument FROM shadow_trades WHERE status IN ('PENDING','OPEN') ORDER BY instrument").all() as Array<{ instrument: string }>).map((row) => row.instrument);
 }
 
 export function shadowExperimentId(strategy: StrategyV2Id, championVersion: number, challengerVersion: number, startedTs: string): string {
@@ -45,14 +52,14 @@ export function shadowExperimentId(strategy: StrategyV2Id, championVersion: numb
 }
 
 function processVariant(store: Store, version: V2StrategyVersion, role: "CHAMPION" | "CHALLENGER",
-  experimentId: string, boundaryTs: number, snapshot: ShadowSnapshot, candles: Candle[], costs: V2CostModel): number {
+  experimentId: string, boundaryTs: number, snapshot: ShadowSnapshot, candles: Candle[], costs: V2CostModel, entryAllowed: boolean): number {
   const family = familyForV2(version.strategy);
   const occupiedAtCycleStart = !!store.db.prepare(`SELECT 1 FROM shadow_trades WHERE strategy=? AND strategy_core_version=2
     AND strategy_version=? AND shadow_role=? AND shadow_experiment_id=? AND instrument=? AND status IN ('PENDING','OPEN') LIMIT 1`)
     .get(family, version.version, role, experimentId, snapshot.instrument);
   processExisting(store, family, version.version, role, experimentId, snapshot.instrument, candles);
   // An exit on this candle does not permit a replacement signal until the next market cycle.
-  if (occupiedAtCycleStart || snapshot.features.ts < boundaryTs) return 0;
+  if (occupiedAtCycleStart || !entryAllowed || snapshot.features.ts < boundaryTs) return 0;
   const candidate = evaluateV2Setup(version.strategy, snapshot.features, candles,
     completeV2Params(version.strategy, version.params), version.version).candidate;
   if (!candidate || candidate.signalTs < boundaryTs) return 0;

@@ -40,10 +40,12 @@ async function fixture(t: test.TestContext, dynamicWatchlist?: { projection(): W
 test("watchlist API reports a persisted projection and manual refresh remains same-origin", async t => {
   let manual = 0;
   const projection = (): WatchlistProjection => ({ generated_at: "2026-10-10T00:15:00.000Z", stale: false, stale_age_ms: 0, next_refresh: "2026-10-11T00:15:00.000Z",
-    status: "CURRENT", core: [{ symbol, kind: "CORE" }], dynamic: [{ rank: 1, symbol: "SUI-USDT-SWAP", score: 81.2, trend_direction: "BULLISH", metrics: { momentum1hPct: 1, momentum4hPct: 3, adx14: 30, emaSeparationPct: 1, relativeVolume: 1.2, spreadPct: 0.1, liquidityUsdt: 2_000_000 }, status: "DYNAMIC" }], active: [symbol, "SUI-USDT-SWAP"], statistics: { discovered: 9, basic: 2, analyzed: 2, qualifying: 1, selected: 1, requestCount: 4, durationMs: 10 } });
+    status: "CURRENT", core: [{ symbol, kind: "CORE" }], dynamic: [{ rank: 1, symbol: "SUI-USDT-SWAP", score: 81.2, trend_direction: "BULLISH", metrics: { momentum1hPct: 1, momentum4hPct: 3, adx14: 30, emaSeparationPct: 1, relativeVolume: 1.2, spreadPct: 0.1, liquidityUsdt: 2_000_000 }, status: "DYNAMIC" }], active: [symbol, "SUI-USDT-SWAP"], config: { enabled: true, dynamic_slots: 5, max_total_symbols: 12, min_trend_score: 67, refresh_hour_utc: 0, refresh_minute_utc: 15 }, statistics: { discovered: 9, basic: 2, analyzed: 2, qualifying: 1, selected: 1, requestCount: 4, durationMs: 10 } });
   const f = await fixture(t, { projection, refreshManual: async () => { manual++; return projection(); } });
-  const get = await json<{ dynamic: Array<{ symbol: string }> }>(await f.request("/api/watchlist"));
+  const get = await json<{ dynamic: Array<{ symbol: string }>; config: { dynamic_slots: number; min_trend_score: number } }>(await f.request("/api/watchlist"));
   assert.equal(get.dynamic[0]!.symbol, "SUI-USDT-SWAP");
+  assert.equal(get.config.dynamic_slots, 5);
+  assert.equal(get.config.min_trend_score, 67);
   assert.equal((await f.request("/api/watchlist", { method: "POST", headers: { origin: "https://external.invalid" } })).status, 403);
   assert.equal((await f.request("/api/watchlist", { method: "POST" })).status, 200);
   assert.equal(manual, 1);
