@@ -15,7 +15,9 @@ import { logSystemEvent } from "../memory/db.ts";
 const RETRY_BASE_MS = 60_000;
 const RETRY_MAX_MS = 60 * 60_000;
 const RETRY_MAX_ATTEMPTS = 12;
-const FUNDING_SETTLEMENT_GRACE_MS = 60_000;
+// Account bills are eventually consistent. A three-minute grace avoids turning
+// a just-settled but not-yet-listed funding interval into a false zero.
+export const FUNDING_SETTLEMENT_GRACE_MS = 3 * 60_000;
 
 export interface EvidenceFinalizerDeps {
   client: OkxClient;
@@ -75,8 +77,9 @@ async function resolveFunding(d: EvidenceFinalizerDeps, t: Record<string, unknow
   if (now - exitMs < FUNDING_SETTLEMENT_GRACE_MS) return null;
   try {
     const bills = await getFundingBills(d.client, String(t.instrument), entryMs, exitMs, now);
-    if (bills.some((bill) => bill.ccy !== "USDT" || finite(bill.balChg) === null)) return null;
-    return bills.reduce((total, bill) => total + (finite(bill.balChg) ?? 0), 0);
+    if (bills.some((bill) => bill.ccy !== "USDT" || finite(bill.pnl) === null)) return null;
+    // OKX documents `pnl`, not balChg, as the authoritative funding payment.
+    return bills.reduce((total, bill) => total + (finite(bill.pnl) ?? 0), 0);
   } catch { return null; }
 }
 
@@ -123,9 +126,16 @@ async function finalizeOne(d: EvidenceFinalizerDeps, candidate: Record<string, u
     if (!t) return false;
     const entryPx = finite(t.entry_px); const exitPx = finite(t.exit_px); const contracts = finite(t.contracts);
     const entryMs = Date.parse(String(t.entry_ts)); const exitMs = Date.parse(String(t.exit_ts));
-    const meta = d.instruments[String(t.instrument)]; const ctVal = finite(meta?.ctVal);
+    const meta = d.instruments[String(t.instrument)]; const ctVal = meta?.instId === String(t.instrument) ? finite(meta.ctVal) : null;
     const initialStop = finite(t.initial_stop_px ?? t.stop_px);
-    if (entryPx === null || exitPx === null || contracts === null || contracts <= 0 || ctVal === null || ctVal <= 0
+    if (ctVal === null || ctVal <= 0) {
+      d.store.db.prepare(`UPDATE trades SET evidence_state='EVIDENCE_PENDING', evolution_evidence_eligible=0,
+        evidence_reason='INSTRUMENT_METADATA_PENDING', evidence_next_retry_ts=? WHERE trade_id=? AND evidence_state='EVIDENCE_PENDING'`)
+        .run(new Date(now + retryDelayMs(Number(t.evidence_attempts ?? 0) + 1)).toISOString(), tradeId);
+      logSystemEvent(d.store, "STATE", { tradeId, evidence: "EVIDENCE_PENDING", reason: "INSTRUMENT_METADATA_PENDING" });
+      return false;
+    }
+    if (entryPx === null || exitPx === null || contracts === null || contracts <= 0
       || initialStop === null || Math.abs(entryPx - initialStop) <= 0 || !Number.isFinite(entryMs) || !Number.isFinite(exitMs)) {
       invalidEvidence(d, tradeId, "DETERMINISTIC_EXIT_EVIDENCE_CORRUPT");
       return false;

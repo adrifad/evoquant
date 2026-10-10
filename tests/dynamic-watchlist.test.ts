@@ -5,13 +5,16 @@ import path from "node:path";
 import test from "node:test";
 import { loadTradingConfig } from "../src/core/config.ts";
 import { DynamicWatchlistService, CORE_WATCHLIST, rankDynamicCandidates } from "../src/market/dynamic-watchlist.ts";
+import { validationHistoriesFromTrading } from "../src/core/main.ts";
 import { openStore } from "../src/memory/db.ts";
 import type { Candle, InstrumentInfo } from "../src/exchange/okx/types.ts";
 import type { Ticker } from "../src/exchange/okx/market.ts";
 import type { OkxClient } from "../src/exchange/okx/client.ts";
 
 const now = new Date("2026-10-10T01:00:00.000Z");
-const config = structuredClone(loadTradingConfig().dynamic_watchlist);
+// Most fixture cases validate universe mechanics rather than final-score
+// qualification. Threshold behavior has its own explicit regression below.
+const config = { ...structuredClone(loadTradingConfig().dynamic_watchlist), filters: { ...structuredClone(loadTradingConfig().dynamic_watchlist).filters, min_trend_score: 0 } };
 const instrument = (instId: string): InstrumentInfo => ({ instId, tickSz: "0.001", lotSz: "1", minSz: "1", ctVal: "1", ctValCcy: "USDT", state: "live", settleCcy: "USDT", listTime: now.getTime() - 20 * 86_400_000 });
 const ticker = (instId: string, last = 100): Ticker => ({ instId, last, bidPx: last * 0.9995, askPx: last * 1.0005, ts: now.getTime(), volCcy24h: 50_000, vol24h: 50_000 });
 function candles(direction = 1): Candle[] {
@@ -50,6 +53,15 @@ test("selection is capped at eight dynamic names and the entry universe at fifte
   assert.equal(ranked.selected.length, 8);
   assert.equal(new Set(ranked.selected.map((entry) => entry.symbol)).size, 8);
   assert.ok(ranked.selected.every((entry) => !CORE_WATCHLIST.includes(entry.symbol as typeof CORE_WATCHLIST[number])));
+});
+
+test("minimum final trend score rejects weak candidates without filling slots", () => {
+  const ranked = rankDynamicCandidates([
+    { instrument: instrument("HIGH-USDT-SWAP"), ticker: ticker("HIGH-USDT-SWAP"), candles: candles(1) },
+    { instrument: instrument("LOW-USDT-SWAP"), ticker: ticker("LOW-USDT-SWAP"), candles: candles(1) },
+  ], { ...config, filters: { ...config.filters, min_trend_score: 60 } }, CORE_WATCHLIST, now);
+  assert.ok(ranked.selected.every((entry) => entry.score >= 60));
+  assert.ok((ranked.rejected.TREND_SCORE_TOO_LOW ?? 0) + ranked.selected.length === 2);
 });
 
 function fixture(t: test.TestContext) {
@@ -99,4 +111,55 @@ test("failed daily discovery preserves prior dynamic selection as stale and manu
   await service.refreshManual();
   const manual = f.store.db.prepare("SELECT source,status FROM dynamic_watchlist_runs WHERE source='MANUAL' ORDER BY id DESC LIMIT 1").get() as { source: string; status: string };
   assert.deepEqual(manual, { source: "MANUAL", status: "SUCCESS" });
+});
+
+test("disabled mode retains snapshots for audit but admits only core entries and still manages an old open symbol", async t => {
+  const f = fixture(t); const enabled = f.service(); await enabled.initialize();
+  const disabledConfig = { ...config, enabled: false };
+  const disabled = new DynamicWatchlistService({ store: f.store, client: { get: async () => { throw new Error("disabled must not discover"); }, post: async () => { throw new Error("no mutation"); } } as unknown as OkxClient, config: disabledConfig, now: () => now });
+  await disabled.initialize();
+  disabled.setManagementSymbols(["SUI-USDT-SWAP"]);
+  assert.deepEqual(disabled.currentEntryUniverse(), [...CORE_WATCHLIST]);
+  assert.ok(disabled.currentManagementUniverse().includes("SUI-USDT-SWAP"));
+  assert.equal(disabled.projection().status, "DISABLED");
+  assert.ok(disabled.projection().historical_dynamic?.some(entry => entry.symbol === "SUI-USDT-SWAP"));
+  await assert.rejects(() => disabled.refreshManual(), (error: unknown) => error instanceof Error && error.message === "DYNAMIC_WATCHLIST_DISABLED");
+});
+
+test("one candle failure is recorded per symbol while the daily discovery stays current", async t => {
+  const root = mkdtempSync(path.join(os.tmpdir(), "evoq-dynamic-partial-")); const store = openStore(root); t.after(() => { store.close(); rmSync(root, { recursive: true, force: true }); });
+  const all = [...CORE_WATCHLIST.map(instrument), instrument("SUI-USDT-SWAP"), instrument("AVAX-USDT-SWAP")];
+  const client = { get: async <T>(url: string, query?: Record<string, unknown>) => {
+    if (url === "/api/v5/public/instruments") return (query?.instId ? all.filter(item => item.instId === query.instId) : all).map(item => ({ ...item, listTime: String(item.listTime) })) as T;
+    if (url === "/api/v5/market/tickers") return all.map(item => ticker(item.instId)) as T;
+    if (url === "/api/v5/market/candles") { if (query?.instId === "AVAX-USDT-SWAP") throw new Error("timeout"); return candles(1).map(raw) as T; }
+    throw new Error(url);
+  }, post: async () => { throw new Error("no mutation"); } } as unknown as OkxClient;
+  const service = new DynamicWatchlistService({ store, client, config, now: () => now, sleep: async () => {} }); await service.initialize();
+  const p = service.projection();
+  assert.equal(p.status, "CURRENT");
+  assert.equal(p.statistics.candleRequestsFailed, 1);
+  assert.equal(p.statistics.candleRequestsSucceeded, 1);
+  assert.equal(p.statistics.partialFailure, true);
+  assert.ok(p.dynamic.every(entry => entry.symbol !== "AVAX-USDT-SWAP"));
+});
+
+test("exact persisted metadata is recovered for management without cross-symbol fallback", async t => {
+  const f = fixture(t); const service = f.service(); await service.initialize();
+  f.store.db.prepare("INSERT OR REPLACE INTO instruments(instId,instType,tickSz,lotSz,minSz,ctVal,ctValCcy,cached_ts) VALUES(?,?,?,?,?,?,?,?)")
+    .run("OLD-USDT-SWAP", "SWAP", "0.01", "2", "2", "7", "OLD", new Date().toISOString());
+  service.setManagementSymbols(["OLD-USDT-SWAP"]);
+  assert.deepEqual(await service.hydrateManagementMetadata(["OLD-USDT-SWAP"]), []);
+  const catalog: Record<string, InstrumentInfo> = {}; service.syncCatalog(catalog);
+  assert.equal(catalog["OLD-USDT-SWAP"]?.ctVal, "7");
+  assert.equal(catalog["OLD-USDT-SWAP"]?.instId, "OLD-USDT-SWAP");
+});
+
+test("short dynamic history cannot enter or shrink the stable Core validation universe", () => {
+  const hour = 3_600_000;
+  const coreHistory = Array.from({ length: 24 * 180 }, (_, index) => ({ ts: index * hour })) as Candle[];
+  const dynamicHistory = Array.from({ length: 24 * 3 }, (_, index) => ({ ts: index * hour })) as Candle[];
+  const validated = validationHistoriesFromTrading(new Map([["BTC-USDT-SWAP", coreHistory], ["SUI-USDT-SWAP", dynamicHistory]]));
+  assert.deepEqual([...validated.keys()], ["BTC-USDT-SWAP"]);
+  assert.equal(validated.get("BTC-USDT-SWAP")?.length, 24 * 180);
 });

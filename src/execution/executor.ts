@@ -246,7 +246,12 @@ export async function finalizeOpenTradeFromExchange(d: ExecutorDeps, t: Record<s
     return;
   }
   const contracts = Number(t.contracts);
-  const meta = d.instruments[String(t.instrument)] ?? Object.values(d.instruments)[0];
+  const meta = d.instruments[String(t.instrument)];
+  if (!meta || meta.instId !== String(t.instrument) || !Number.isFinite(Number(meta.ctVal)) || Number(meta.ctVal) <= 0) {
+    markReconciliationPending(d.store, tradeId, "INSTRUMENT_METADATA_PENDING");
+    logSystemEvent(d.store, "STATE", { tradeId, reconciliation: "RECONCILIATION_PENDING", reason: "INSTRUMENT_METADATA_PENDING" });
+    return;
+  }
   const ctVal = Number(meta?.ctVal ?? 0);
   const side = t.side === "LONG" ? "LONG" : "SHORT";
   const m = computeClosedMetrics({
@@ -328,9 +333,9 @@ export async function runTick(d: ExecutorDeps, ctx: TickContext, symbol: TickSym
   const instId = symbol.instId;
   const meta = symbol.meta;
   // §40 persistence: instrument metadata each tick (candles persisted in main)
-  store.db.prepare(`INSERT INTO instruments(instId,instType,tickSz,lotSz,minSz,ctVal,ctValCcy,cached_ts)
-    VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(instId) DO UPDATE SET cached_ts=excluded.cached_ts`)
-    .run(meta.instId, "SWAP", meta.tickSz, meta.lotSz, meta.minSz, meta.ctVal, meta.ctValCcy, new Date().toISOString());
+  store.db.prepare(`INSERT INTO instruments(instId,instType,tickSz,lotSz,minSz,ctVal,ctValCcy,state,settleCcy,listTime,cached_ts)
+    VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(instId) DO UPDATE SET tickSz=excluded.tickSz,lotSz=excluded.lotSz,minSz=excluded.minSz,ctVal=excluded.ctVal,ctValCcy=excluded.ctValCcy,state=excluded.state,settleCcy=excluded.settleCcy,listTime=excluded.listTime,cached_ts=excluded.cached_ts`)
+    .run(meta.instId, "SWAP", meta.tickSz, meta.lotSz, meta.minSz, meta.ctVal, meta.ctValCcy, meta.state ?? null, meta.settleCcy ?? null, meta.listTime ?? null, new Date().toISOString());
   const bal = await getBalance(client);
   const eq = usdtEquity(bal);
   const base = baseline(store, eq);
@@ -638,7 +643,11 @@ export async function closeTradeOnExchange(d: ExecutorDeps, t: Record<string, un
 
 async function closeOpenTradeOnExchange(d: ExecutorDeps, t: Record<string, unknown>, pos: Position, reason: string): Promise<void> {
   const side = String(t.side) as "LONG" | "SHORT";
-  const meta = d.instruments[String(t.instrument)] ?? Object.values(d.instruments)[0]!;
+  const meta = d.instruments[String(t.instrument)];
+  if (!meta || meta.instId !== String(t.instrument) || !Number.isFinite(Number(meta.lotSz)) || !Number.isFinite(Number(meta.minSz))) {
+    logSystemEvent(d.store, "STATE", { tradeId: String(t.trade_id), state: "STATE_UNCERTAIN", reason: "INSTRUMENT_METADATA_UNAVAILABLE" });
+    throw new Error("STATE_UNCERTAIN: exact instrument metadata unavailable for close");
+  }
   const clClose = clId(side, "CLOSE", String(t.instrument));
   const placed = await closePosition(d.client, {
     instId: String(t.instrument), posSide: side === "LONG" ? "long" : "short",

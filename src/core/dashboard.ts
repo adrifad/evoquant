@@ -34,7 +34,7 @@ import { evolutionFamilies, scannerProjection } from "./workstation.ts";
 import type { ScanRow } from "../strategy/scanner.ts";
 import { getCandles, type Bar } from "../exchange/okx/market.ts";
 import { portfolioOpenRisk } from "../risk/portfolio-open-risk.ts";
-import type { WatchlistProjection } from "../market/dynamic-watchlist.ts";
+import { DynamicWatchlistError, type WatchlistProjection } from "../market/dynamic-watchlist.ts";
 
 const log = createLogger("dashboard");
 const REPO_ROOT = path.resolve(import.meta.dirname, "../..");
@@ -290,7 +290,10 @@ export function startDashboard(cfg: DashboardConfig): DashboardServer {
       if (method === "GET") return send(200, cfg.dynamicWatchlist.projection());
       if (method === "POST") {
         try { return send(200, await cfg.dynamicWatchlist.refreshManual()); }
-        catch { return send(503, { error: "Dynamic watchlist refresh failed; the previous snapshot remains active." }); }
+        catch (error) {
+          if (error instanceof DynamicWatchlistError) return send(error.httpStatus, { error: error.code, stale_snapshot_preserved: error.staleSnapshotPreserved, status: error.code === "DYNAMIC_WATCHLIST_DISABLED" ? "DISABLED" : "STALE" });
+          return send(503, { error: "DYNAMIC_WATCHLIST_REFRESH_FAILED", stale_snapshot_preserved: true, status: "STALE" });
+        }
       }
       return send(405, { error: "Method not allowed." });
     }

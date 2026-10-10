@@ -87,6 +87,15 @@ once per UTC day (00:15 UTC by default), persists the selected metrics, and
 reuses the last successful snapshot after a discovery failure. A manual console
 refresh is explicitly audited.
 
+Dynamic discovery is an entry-universe concern. Historical, OOS, and rolling
+Champion/Challenger validation always use the stable Core Watchlist, so a new
+dynamic market cannot shorten the configured validation window or change a
+cached comparison merely by ranking today. Valid closed Demo trades from a
+dynamic market remain forward evidence after deterministic evidence validation.
+When Dynamic Watchlist is disabled, Core markets are the only new-entry
+universe; retained snapshots remain audit history and old open dynamic symbols
+remain in the management universe until their workflows finish.
+
 The **Strategy Scanner** is separate: it evaluates normal Strategy Core V2
 conditions only after a market is in the Core plus Dynamic universe. **Trending
 does not mean an entry signal.** Every selected dynamic instrument still has to

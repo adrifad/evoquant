@@ -42,13 +42,18 @@ import { runOncePerGlobalCycle } from "./global-cycle.ts";
 import { RoleLlmService } from "./llm-role-service.ts";
 import { createLogger } from "./logger.ts";
 import { startDashboard } from "./dashboard.ts";
-import { DynamicWatchlistService } from "../market/dynamic-watchlist.ts";
+import { CORE_WATCHLIST, DynamicWatchlistService } from "../market/dynamic-watchlist.ts";
 import YAML from "yaml";
 import { readFileSync } from "node:fs";
 import path from "node:path";
 
 const log = createLogger("main");
 const env = loadRepoEnv(REPO_ROOT);
+
+/** Stable Core-only input for historical/OOS/rolling V2 validation. */
+export function validationHistoriesFromTrading(histories: ReadonlyMap<string, Candle[]>): Map<string, Candle[]> {
+  return new Map([...histories].filter(([symbol]) => CORE_WATCHLIST.includes(symbol as typeof CORE_WATCHLIST[number])));
+}
 
 async function main(): Promise<void> {
   assertDemo(env); // §44
@@ -84,6 +89,10 @@ async function main(): Promise<void> {
   const dynamicWatchlist = new DynamicWatchlistService({ store, client, config: trading.dynamic_watchlist,
     core: trading.instruments?.watchlist ?? [trading.instrument.id] });
   await dynamicWatchlist.initialize();
+  const workflowSymbols = () => (store.db.prepare(`SELECT DISTINCT instrument FROM trades
+    WHERE status IN ('OPEN','RECONCILIATION_PENDING') OR (status='CLOSED' AND evidence_state='EVIDENCE_PENDING')`).all() as Array<{ instrument: string }>).map((row) => row.instrument);
+  dynamicWatchlist.setManagementSymbols(workflowSymbols());
+  await dynamicWatchlist.hydrateManagementMetadata(workflowSymbols());
   const instruments: Record<string, InstrumentInfo> = {};
   dynamicWatchlist.syncCatalog(instruments);
   const watchlist = dynamicWatchlist.currentActiveUniverse((getOpenTrades(store) as Array<Record<string, unknown>>).map((t) => String(t.instrument)));
@@ -92,11 +101,11 @@ async function main(): Promise<void> {
   const runtimeTrading = new RuntimeTradingService({ store, trading, risk, instruments: dynamicWatchlist.currentEntryUniverse() });
   const deps = { client, trading, risk, store, instruments, watchlist };
   const syncDynamicUniverse = () => {
+    dynamicWatchlist.setManagementSymbols(workflowSymbols());
     dynamicWatchlist.syncCatalog(instruments);
     dynamicWatchlist.applyRiskAllowlist(risk.hard_limits.allowed_symbols);
     runtimeTrading.setInstruments(dynamicWatchlist.currentEntryUniverse());
-    const open = (getOpenTrades(store) as Array<Record<string, unknown>>).map((t) => String(t.instrument));
-    watchlist.splice(0, watchlist.length, ...dynamicWatchlist.currentActiveUniverse(open));
+    watchlist.splice(0, watchlist.length, ...dynamicWatchlist.currentManagementUniverse());
   };
   if (!runtimePolicy.evolutionEnabled) {
     logSystemEvent(store, "EVOLUTION_FROZEN", { reason: baselineMode ? "baseline_validation_mode" : "configuration_disabled",
@@ -137,6 +146,12 @@ async function main(): Promise<void> {
     log.error({ event: "startup_failed", result: "trading disabled" });
     return;
   }
+  // An exchange position can outlive the daily entry selection. Restore exact
+  // metadata before any monitoring, reconciliation, or accounting path runs.
+  const exchangeManagement = (await getPositions(client)).filter((position) => position.pos !== "0").map((position) => position.instId);
+  dynamicWatchlist.setManagementSymbols([...workflowSymbols(), ...exchangeManagement]);
+  await dynamicWatchlist.hydrateManagementMetadata(dynamicWatchlist.currentManagementUniverse());
+  syncDynamicUniverse();
   loadStrategies(store);
   setBotState(store, "RUNNING");
   log.info({ event: "bot_started", state: getBotState(store) });
@@ -309,10 +324,14 @@ async function main(): Promise<void> {
           }
         }
         if (strategyCoreVersion === 2) {
-          const tickSizes = new Map(Object.entries(instruments).map(([symbol, meta]) => [symbol, Number(meta.tickSz)]));
+          // Historical, OOS, and rolling comparisons use only the stable Core
+          // universe. Dynamic instruments remain part of live scan/shadow and
+          // valid forward Demo evidence, but cannot shorten this window.
+          const validationHistories = validationHistoriesFromTrading(histories);
+          const tickSizes = new Map([...validationHistories.keys()].map((symbol) => [symbol, Number(instruments[symbol]?.tickSz)]));
           processShadowCycle(store, snaps.map((snapshot) => ({ ...snapshot, tickSize: Number(instruments[snapshot.instrument]?.tickSz) })),
             histories, trading.timeframe, backtestCosts);
-          evaluateV2Lifecycle(store, histories, trading.timeframe, backtestCosts, {
+          evaluateV2Lifecycle(store, validationHistories, trading.timeframe, backtestCosts, {
             historicalMinTrades: evolution.promotion.historical_min_trades,
             outOfSampleMinTrades: evolution.promotion.out_of_sample_min_trades,
             shadowForwardMinTrades: evolution.promotion.shadow_forward_min_trades,
@@ -329,7 +348,7 @@ async function main(): Promise<void> {
             automaticPromotionEnabled: evolution.automatic_promotion_enabled,
           }, tickSizes);
         } else if (evolution.automatic_promotion_enabled) {
-          compareAndMaybePromote(store, histories, trading.timeframe, {
+          compareAndMaybePromote(store, validationHistoriesFromTrading(histories), trading.timeframe, {
             minSampleEachSide: Math.max(evolution.minimum_validation_sample, evolution.constraints.champion_vs_challenger.min_sample_each_side),
             requireOutOfSample: evolution.constraints.champion_vs_challenger.requires_out_of_sample,
             requireWalkForward: evolution.constraints.champion_vs_challenger.requires_walk_forward,

@@ -13,7 +13,7 @@ import { DEFAULT_V2_PARAMS } from "../src/strategy/core-v2.ts";
 import { scannerProjection, type evolutionFamilies } from "../src/core/workstation.ts";
 import type { ScanRow } from "../src/strategy/scanner.ts";
 import type { ExecutorDeps } from "../src/execution/executor.ts";
-import type { WatchlistProjection } from "../src/market/dynamic-watchlist.ts";
+import { DynamicWatchlistError, type WatchlistProjection } from "../src/market/dynamic-watchlist.ts";
 
 const symbol = "BTC-USDT-SWAP";
 const json = <T>(response: Response): Promise<T> => response.json() as Promise<T>;
@@ -47,6 +47,22 @@ test("watchlist API reports a persisted projection and manual refresh remains sa
   assert.equal((await f.request("/api/watchlist", { method: "POST", headers: { origin: "https://external.invalid" } })).status, 403);
   assert.equal((await f.request("/api/watchlist", { method: "POST" })).status, 200);
   assert.equal(manual, 1);
+});
+
+test("manual watchlist failures stay non-successful and disclose preserved stale state", async t => {
+  const projection = (): WatchlistProjection => ({ generated_at: "2026-10-09T00:15:00.000Z", stale: true, stale_age_ms: 86_400_000, next_refresh: "2026-10-11T00:15:00.000Z", status: "STALE", core: [{ symbol, kind: "CORE" }], dynamic: [], active: [symbol], statistics: { discovered: 0, basic: 0, analyzed: 0, qualifying: 0, selected: 0, requestCount: 0, durationMs: 0 } });
+  const f = await fixture(t, { projection, refreshManual: async () => { throw new DynamicWatchlistError("DYNAMIC_WATCHLIST_REFRESH_FAILED", 503, true); } });
+  const response = await f.request("/api/watchlist", { method: "POST" });
+  assert.equal(response.status, 503);
+  assert.deepEqual(await json<{ error: string; stale_snapshot_preserved: boolean; status: string }>(response), { error: "DYNAMIC_WATCHLIST_REFRESH_FAILED", stale_snapshot_preserved: true, status: "STALE" });
+});
+
+test("disabled dynamic manual refresh is rejected explicitly", async t => {
+  const projection = (): WatchlistProjection => ({ generated_at: null, stale: false, stale_age_ms: null, next_refresh: "2026-10-11T00:15:00.000Z", status: "DISABLED", core: [{ symbol, kind: "CORE" }], dynamic: [], active: [symbol], statistics: { discovered: 0, basic: 0, analyzed: 0, qualifying: 0, selected: 0, requestCount: 0, durationMs: 0 } });
+  const f = await fixture(t, { projection, refreshManual: async () => { throw new DynamicWatchlistError("DYNAMIC_WATCHLIST_DISABLED", 409, false); } });
+  const response = await f.request("/api/watchlist", { method: "POST" });
+  assert.equal(response.status, 409);
+  assert.equal((await json<{ error: string }>(response)).error, "DYNAMIC_WATCHLIST_DISABLED");
 });
 
 test("risk API rejects ceilings, cross-origin writes and stale revisions; commits audited hot settings", async t => {

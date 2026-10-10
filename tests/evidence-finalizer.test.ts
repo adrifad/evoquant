@@ -28,7 +28,7 @@ function seedPending(store: ReturnType<typeof openStore>, id = "T1", engine = "S
     .run(id, engine, symbol, new Date(entryMs).toISOString(), new Date(exitMs).toISOString());
 }
 
-function deps(store: ReturnType<typeof openStore>, response: (endpoint: string, query?: Record<string, unknown>) => unknown, now = exitMs + 120_000): EvidenceFinalizerDeps {
+function deps(store: ReturnType<typeof openStore>, response: (endpoint: string, query?: Record<string, unknown>) => unknown, now = exitMs + 5 * 60_000): EvidenceFinalizerDeps {
   return {
     store, client: { get: async (endpoint: string, query?: Record<string, unknown>) => response(endpoint, query) } as never,
     instruments: { [symbol]: meta }, trading: { timeframe: "15m" } as never, now: () => now,
@@ -64,12 +64,29 @@ test("actual funding is included in deterministic NET PnL and R", async t => {
   const store = withStore(t); seedPending(store);
   await finalizePendingEvidence(deps(store, (endpoint, query) => {
     if (endpoint === "/api/v5/trade/fills") return fills(String(query?.ordId));
-    if (endpoint === "/api/v5/account/bills") return [{ billId: "B1", instId: symbol, ts: String(exitMs - 1), balChg: "-0.5", ccy: "USDT", type: "8" }];
+    if (endpoint === "/api/v5/account/bills") return [{ billId: "B1", instId: symbol, ts: String(exitMs - 1), pnl: "-0.5", balChg: "-0.47", ccy: "USDT", type: "8", subType: "173" }];
     if (endpoint === "/api/v5/market/candles") return confirmedCandles;
     throw new Error(endpoint);
   }));
   assert.deepEqual(store.db.prepare("SELECT funding,pnl,result_r,evidence_state FROM trades WHERE trade_id='T1'").get(),
     { funding: -0.5, pnl: 3.3, result_r: 1.65, evidence_state: "VALID" });
+});
+
+test("funding uses signed authoritative pnl, sums only the exact position interval and ignores balChg", async t => {
+  const store = withStore(t); seedPending(store);
+  await finalizePendingEvidence(deps(store, (endpoint, query) => {
+    if (endpoint === "/api/v5/trade/fills") return fills(String(query?.ordId));
+    if (endpoint === "/api/v5/account/bills") return [
+      { billId: "expense", instId: symbol, ts: String(entryMs + 1), pnl: "-0.50", balChg: "-0.47", ccy: "USDT", subType: "173" },
+      { billId: "income", instId: symbol, ts: String(exitMs - 1), pnl: "0.20", balChg: "0.19", ccy: "USDT", subType: "174" },
+      { billId: "outside", instId: symbol, ts: String(exitMs + 1), pnl: "99", balChg: "99", ccy: "USDT", subType: "174" },
+      { billId: "wrong", instId: "ETH-USDT-SWAP", ts: String(exitMs - 1), pnl: "99", balChg: "99", ccy: "USDT", subType: "174" },
+    ];
+    if (endpoint === "/api/v5/market/candles") return confirmedCandles;
+    throw new Error(endpoint);
+  }));
+  assert.deepEqual(store.db.prepare("SELECT funding,pnl,result_r,evidence_state FROM trades WHERE trade_id='T1'").get(),
+    { funding: -0.3, pnl: 3.5, result_r: 1.75, evidence_state: "VALID" });
 });
 
 test("temporary funding failure remains pending and never assumes zero", async t => {

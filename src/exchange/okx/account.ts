@@ -14,6 +14,8 @@ export interface FundingBill {
   billId: string;
   instId: string;
   ts: string;
+  /** OKX authoritative funding P&L for subtypes 173/174. */
+  pnl: string;
   balChg: string;
   ccy: string;
   type: string;
@@ -24,6 +26,7 @@ interface RawFundingBill {
   billId?: string;
   instId?: string;
   ts?: string;
+  pnl?: string;
   balChg?: string;
   ccy?: string;
   type?: string;
@@ -42,8 +45,9 @@ export async function getFundingBills(client: OkxClient, instId: string, begin: 
   }, true);
   return data.map((raw) => ({
     billId: String(raw.billId ?? ""), instId: String(raw.instId ?? ""), ts: String(raw.ts ?? ""),
-    balChg: String(raw.balChg ?? ""), ccy: String(raw.ccy ?? ""), type: String(raw.type ?? ""), subType: String(raw.subType ?? ""),
-  })).filter((bill) => bill.type === "8" || bill.subType === "173" || bill.subType === "174");
+    pnl: String(raw.pnl ?? ""), balChg: String(raw.balChg ?? ""), ccy: String(raw.ccy ?? ""), type: String(raw.type ?? ""), subType: String(raw.subType ?? ""),
+  })).filter((bill) => bill.instId === instId && Number.isFinite(Number(bill.ts)) && Number(bill.ts) >= begin && Number(bill.ts) <= end
+    && (bill.subType === "173" || bill.subType === "174"));
 }
 
 // Spec §7.7 — balance detail for one currency (all strings from OKX).

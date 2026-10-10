@@ -38,9 +38,10 @@ const TradingSchema = z.object({
       max_spread_pct: z.number().positive().max(2).default(0.15),
       min_liquidity_usdt: z.number().positive().max(1_000_000_000).default(1_000_000),
       candidate_analysis_limit: z.number().int().min(8).max(60).default(30),
-    }).default({ min_listing_age_days: 7, max_spread_pct: 0.15, min_liquidity_usdt: 1_000_000, candidate_analysis_limit: 30 }),
+      min_trend_score: z.number().min(0).max(100).default(60),
+    }).default({ min_listing_age_days: 7, max_spread_pct: 0.15, min_liquidity_usdt: 1_000_000, candidate_analysis_limit: 30, min_trend_score: 60 }),
   }).default({ enabled: true, dynamic_slots: 8, max_total_symbols: 15, refresh_hour_utc: 0, refresh_minute_utc: 15,
-    filters: { min_listing_age_days: 7, max_spread_pct: 0.15, min_liquidity_usdt: 1_000_000, candidate_analysis_limit: 30 } }),
+    filters: { min_listing_age_days: 7, max_spread_pct: 0.15, min_liquidity_usdt: 1_000_000, candidate_analysis_limit: 30, min_trend_score: 60 } }),
   // 5m hybrid scalp engine (§46 fee guard) — deterministic signals + LLM gate/supervisor
   scalp: z.object({
     enabled: z.boolean().default(false),

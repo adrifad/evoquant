@@ -210,6 +210,12 @@ CREATE TABLE IF NOT EXISTS dynamic_watchlist_runs (
   selected_count INTEGER NOT NULL DEFAULT 0,
   request_count INTEGER NOT NULL DEFAULT 0,
   duration_ms INTEGER NOT NULL DEFAULT 0,
+  universe_requests INTEGER NOT NULL DEFAULT 0,
+  ticker_requests INTEGER NOT NULL DEFAULT 0,
+  candle_requests_attempted INTEGER NOT NULL DEFAULT 0,
+  candle_requests_succeeded INTEGER NOT NULL DEFAULT 0,
+  candle_requests_failed INTEGER NOT NULL DEFAULT 0,
+  total_http_attempts INTEGER NOT NULL DEFAULT 0,
   error_reason TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_dynamic_watchlist_runs_date ON dynamic_watchlist_runs(snapshot_date,generated_at DESC);
@@ -236,7 +242,7 @@ CREATE TABLE IF NOT EXISTS dynamic_watchlist_entries (
 CREATE INDEX IF NOT EXISTS idx_dynamic_watchlist_entries_snapshot ON dynamic_watchlist_entries(snapshot_id,rank);
 CREATE TABLE IF NOT EXISTS instruments (
   instId TEXT PRIMARY KEY, instType TEXT, tickSz TEXT, lotSz TEXT, minSz TEXT,
-  ctVal TEXT, ctValCcy TEXT, cached_ts TEXT
+  ctVal TEXT, ctValCcy TEXT, state TEXT, settleCcy TEXT, listTime INTEGER, cached_ts TEXT
 );
 CREATE TABLE IF NOT EXISTS candles (
   instId TEXT NOT NULL, bar TEXT NOT NULL, ts INTEGER NOT NULL,
@@ -328,6 +334,17 @@ export function openStore(root: string): Store {
   if (!lessonCols.has("scope_strategy_version")) db.exec("ALTER TABLE lessons ADD COLUMN scope_strategy_version INTEGER");
   if (!lessonCols.has("scope_direction")) db.exec("ALTER TABLE lessons ADD COLUMN scope_direction TEXT");
   if (!lessonCols.has("scope_regime_axes")) db.exec("ALTER TABLE lessons ADD COLUMN scope_regime_axes TEXT");
+  const instrumentCols = new Set((db.prepare("PRAGMA table_info(instruments)").all() as Array<{ name: string }>).map((c) => c.name));
+  if (!instrumentCols.has("state")) db.exec("ALTER TABLE instruments ADD COLUMN state TEXT");
+  if (!instrumentCols.has("settleCcy")) db.exec("ALTER TABLE instruments ADD COLUMN settleCcy TEXT");
+  if (!instrumentCols.has("listTime")) db.exec("ALTER TABLE instruments ADD COLUMN listTime INTEGER");
+  const dynamicRunCols = new Set((db.prepare("PRAGMA table_info(dynamic_watchlist_runs)").all() as Array<{ name: string }>).map((c) => c.name));
+  if (!dynamicRunCols.has("universe_requests")) db.exec("ALTER TABLE dynamic_watchlist_runs ADD COLUMN universe_requests INTEGER NOT NULL DEFAULT 0");
+  if (!dynamicRunCols.has("ticker_requests")) db.exec("ALTER TABLE dynamic_watchlist_runs ADD COLUMN ticker_requests INTEGER NOT NULL DEFAULT 0");
+  if (!dynamicRunCols.has("candle_requests_attempted")) db.exec("ALTER TABLE dynamic_watchlist_runs ADD COLUMN candle_requests_attempted INTEGER NOT NULL DEFAULT 0");
+  if (!dynamicRunCols.has("candle_requests_succeeded")) db.exec("ALTER TABLE dynamic_watchlist_runs ADD COLUMN candle_requests_succeeded INTEGER NOT NULL DEFAULT 0");
+  if (!dynamicRunCols.has("candle_requests_failed")) db.exec("ALTER TABLE dynamic_watchlist_runs ADD COLUMN candle_requests_failed INTEGER NOT NULL DEFAULT 0");
+  if (!dynamicRunCols.has("total_http_attempts")) db.exec("ALTER TABLE dynamic_watchlist_runs ADD COLUMN total_http_attempts INTEGER NOT NULL DEFAULT 0");
   const v2VersionCols = new Set((db.prepare("PRAGMA table_info(strategy_v2_versions)").all() as Array<{ name: string }>).map((c) => c.name));
   if (!v2VersionCols.has("shadow_started_ts")) db.exec("ALTER TABLE strategy_v2_versions ADD COLUMN shadow_started_ts TEXT");
   const shadowCols = new Set((db.prepare("PRAGMA table_info(shadow_trades)").all() as Array<{ name: string }>).map((c) => c.name));

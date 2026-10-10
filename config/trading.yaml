@@ -30,6 +30,7 @@ dynamic_watchlist:
     # Estimated 24h USDT turnover = last price × OKX SWAP volCcy24h.
     min_liquidity_usdt: 1000000
     candidate_analysis_limit: 30
+    min_trend_score: 60
 
 timeframe: 15m
 
