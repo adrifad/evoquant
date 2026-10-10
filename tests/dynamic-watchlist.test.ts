@@ -44,12 +44,15 @@ test("deterministic rank keeps core out, accepts bullish and bearish quality tre
   assert.deepEqual(repeat.selected, result.selected);
 });
 
-test("selection is capped at eight dynamic names and the entry universe at fifteen", () => {
+test("selection is capped at the configured dynamic slot count", () => {
+  // Pin the cap inside the test: live config is operator-tunable (2026-10-10 raised
+  // dynamic_slots to 12), and this test guards the CAP LOGIC, not the current value.
+  const pinned = { ...config, dynamic_slots: 8 };
   const candidates = Array.from({ length: 12 }, (_, index) => {
     const item = instrument(`DYN${index}-USDT-SWAP`);
     return { instrument: item, ticker: ticker(item.instId, 100 + index), candles: candles(index % 2 ? -1 : 1) };
   });
-  const ranked = rankDynamicCandidates(candidates, config, CORE_WATCHLIST, now);
+  const ranked = rankDynamicCandidates(candidates, pinned, CORE_WATCHLIST, now);
   assert.equal(ranked.selected.length, 8);
   assert.equal(new Set(ranked.selected.map((entry) => entry.symbol)).size, 8);
   assert.ok(ranked.selected.every((entry) => !CORE_WATCHLIST.includes(entry.symbol as typeof CORE_WATCHLIST[number])));

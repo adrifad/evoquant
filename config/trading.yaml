@@ -20,8 +20,8 @@ instruments:
 # once-daily discovery universe; a trend score is never an entry instruction.
 dynamic_watchlist:
   enabled: true
-  dynamic_slots: 8
-  max_total_symbols: 15
+  dynamic_slots: 12        # operator 2026-10-10: wider discovery universe (schema max 12)
+  max_total_symbols: 20    # operator 2026-10-10: core 7 + dynamic up to 13
   refresh_hour_utc: 0
   refresh_minute_utc: 15
   filters:

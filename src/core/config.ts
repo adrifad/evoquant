@@ -29,8 +29,8 @@ const TradingSchema = z.object({
   instruments: z.object({ watchlist: z.array(z.string()).min(1).optional() }).optional(),
   dynamic_watchlist: z.object({
     enabled: z.boolean().default(true),
-    dynamic_slots: z.number().int().min(0).max(8).default(8),
-    max_total_symbols: z.number().int().min(7).max(15).default(15),
+    dynamic_slots: z.number().int().min(0).max(12).default(8),
+    max_total_symbols: z.number().int().min(7).max(20).default(15),
     refresh_hour_utc: z.number().int().min(0).max(23).default(0),
     refresh_minute_utc: z.number().int().min(0).max(59).default(15),
     filters: z.object({
