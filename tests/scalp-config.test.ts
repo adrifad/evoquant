@@ -11,6 +11,7 @@ test("production Scalp runtime receives the Moderate profile without changing si
     vol_burst_min: scalp.vol_burst_min, min_score: scalp.min_score,
     stop_atr_mult: scalp.stop_atr_mult, tp_r: scalp.tp_r, min_tp_pct: scalp.min_tp_pct,
     cooldown_s: scalp.cooldown_s, max_daily_trades: scalp.max_daily_trades,
+    max_candidate_attempts_per_cycle: scalp.max_candidate_attempts_per_cycle,
     stance_refresh_s: scalp.stance_refresh_s, llm_gate: scalp.llm_gate,
     position_pct: scalp.position_pct,
   }, {
@@ -18,7 +19,7 @@ test("production Scalp runtime receives the Moderate profile without changing si
     rsi_long_min: 48, rsi_long_max: 72, rsi_short_min: 28, rsi_short_max: 52,
     vol_burst_min: 1.1, min_score: 0.55,
     stop_atr_mult: 1.4, tp_r: 2, min_tp_pct: 0.25,
-    cooldown_s: 240, max_daily_trades: 20, stance_refresh_s: 900,
+    cooldown_s: 240, max_daily_trades: 20, max_candidate_attempts_per_cycle: 3, stance_refresh_s: 900,
     llm_gate: true, position_pct: 20,
   });
 });
@@ -29,4 +30,14 @@ test("Scalp config keeps bounded fields and rejects invalid EMA/RSI ordering", (
   assert.equal(ScalpConfigSchema.safeParse({ ...base, rsi_long_min: base.rsi_long_max }).success, false);
   assert.equal(ScalpConfigSchema.safeParse({ ...base, rsi_short_min: base.rsi_short_max }).success, false);
   assert.equal(ScalpConfigSchema.safeParse({ ...base, min_score: 1.5 }).success, false);
+});
+
+test("Scalp candidate-attempt cap defaults to 3 and accepts only integers from 1 through 5", () => {
+  assert.equal(ScalpConfigSchema.parse({}).max_candidate_attempts_per_cycle, 3);
+  for (const value of [1, 3, 5]) {
+    assert.equal(ScalpConfigSchema.safeParse({ ...loadTradingConfig().scalp!, max_candidate_attempts_per_cycle: value }).success, true);
+  }
+  for (const value of [0, 6, 2.5]) {
+    assert.equal(ScalpConfigSchema.safeParse({ ...loadTradingConfig().scalp!, max_candidate_attempts_per_cycle: value }).success, false);
+  }
 });

@@ -40,6 +40,7 @@ export const ScalpConfigSchema = z.object({
   max_hold_s: z.number().int().min(120).max(1800).default(900),
   cooldown_s: z.number().int().min(60).max(900).default(240),
   max_daily_trades: z.number().int().min(1).max(40).default(20),
+  max_candidate_attempts_per_cycle: z.number().int().min(1).max(5).default(3),
   llm_gate: z.boolean().default(true),
   stance_refresh_s: z.number().int().min(300).max(1800).default(900),
   fee_pct: z.number().min(0.02).max(0.1).default(0.05),

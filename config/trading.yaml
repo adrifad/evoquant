@@ -80,6 +80,7 @@ scalp:
   min_tp_pct: 0.25  # operational Demo starting point; fee guard remains active
   cooldown_s: 240
   max_daily_trades: 20
+  max_candidate_attempts_per_cycle: 3
   llm_gate: true
   stance_refresh_s: 900
 

@@ -10,6 +10,7 @@ import type { FeatureSnapshot } from "../src/market/features.ts";
 import { backtestScalp } from "../src/scalp/backtest.ts";
 import { scalpBlocker } from "../src/scalp/runner.ts";
 import { fetchStance, gateSignal, ScalpCandidateGateSchema, StanceSchema } from "../src/agents/scalp-agent.ts";
+import { latestConfirmedCandleClose } from "../src/scalp/candles.ts";
 
 const cfg: ScalpCfg = { ...SCALP_DEFAULTS, watchlist: ["BTC-USDT-SWAP"] };
 
@@ -87,6 +88,30 @@ test("confirmed sideways continuation can signal, but missing/opposite confirmat
   const short = evaluateSignal({ instrument: "X", closes1m: down, last5m: { close: shortPrice + 0.01 }, regime: "SIDEWAYS", features: feats() }, cfg, 1e9, {});
   assert.ok(short.signal, `expected qualified sideways short, got ${short.veto}`);
   assert.equal(short.signal!.direction, -1);
+});
+
+test("Sideways confirmation uses the latest confirmed signal candle and excludes an unconfirmed candle", () => {
+  const candle = (ts: number, close: number, confirm: "0" | "1"): Candle => ({
+    ts, o: close, h: close, l: close, c: close, vol: 100, volCcy: 1, confirm,
+  });
+  // Deliberately provide exchange data out of order; confirmation uses the sorted latest confirmed close.
+  const last5m = latestConfirmedCandleClose([
+    candle(Date.parse("2026-10-10T10:05:00Z"), 101, "1"),
+    candle(Date.parse("2026-10-10T10:15:00Z"), 110, "0"),
+    candle(Date.parse("2026-10-10T10:00:00Z"), 100, "1"),
+    candle(Date.parse("2026-10-10T10:10:00Z"), 102, "1"),
+  ]);
+  assert.deepEqual(last5m, { close: 102 });
+
+  const generated = candles(120, 100, 0.5, -0.28, 3.0);
+  const shift = generated.at(-1)!.c - 101.5;
+  const closesAt101_5 = generated.map((bar) => ({ ...bar, o: bar.o - shift, h: bar.h - shift, l: bar.l - shift, c: bar.c - shift }));
+  const previousConfirmed = evaluateSignal({ instrument: "X", closes1m: closesAt101_5,
+    last5m: { close: 101 }, regime: "SIDEWAYS", features: feats() }, cfg, 1e9, {});
+  assert.ok(previousConfirmed.signal, `previous confirmed close should pass, got ${previousConfirmed.veto}`);
+  const latestConfirmed = evaluateSignal({ instrument: "X", closes1m: closesAt101_5,
+    last5m, regime: "SIDEWAYS", features: feats() }, cfg, 1e9, {});
+  assert.equal(latestConfirmed.veto, "sideways-confirmation");
 });
 
 test("high/low volatility and unknown regimes reject Scalp entries", () => {

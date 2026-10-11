@@ -45,6 +45,7 @@ import { recordScanState, recordScalpScanResult } from "../market/scan-state.ts"
 import { recordCandidateAttempt, recordOpportunityMetric } from "../market/opportunity-funnel.ts";
 import { scanSymbolsIsolated } from "../market/isolated-scan.ts";
 import { runScalpCandidateQueue, type ScalpEntryOutcome } from "./candidate-queue.ts";
+import { latestConfirmedCandleClose } from "./candles.ts";
 
 const log = createLogger("scalp");
 const TF_TAG = "scalp";
@@ -128,7 +129,7 @@ export class ScalpRunner {
         return null;
       }
       const c15 = (await getCandles(this.d.client, sym, "15m", 80)).filter((c) => c.confirm === "1").sort((a, b) => a.ts - b.ts);
-      const c5 = (await getCandles(this.d.client, sym, this.d.cfg.signal_tf, 8)).filter((c) => c.confirm === "1").sort((a, b) => a.ts - b.ts);
+      const c5 = await getCandles(this.d.client, sym, this.d.cfg.signal_tf, 8);
       const c1 = (await getCandles(this.d.client, sym, this.d.cfg.base_tf, 140)).filter((c) => c.confirm === "1").sort((a, b) => a.ts - b.ts);
       if (c15.length < 60 || c1.length < 60) {
         if (recordScanFailures) recordOpportunityMetric(this.d.store, "SCALP_5M", "INSUFFICIENT_DATA");
@@ -138,7 +139,7 @@ export class ScalpRunner {
       }
       const features = buildFeatures(sym, [...c15].reverse());
       return { instrument: sym, features, regime: classifyRegime(features),
-        closes1m: c1, last5m: c5.length >= 2 ? { close: c5[c5.length - 2]!.c } : null };
+        closes1m: c1, last5m: latestConfirmedCandleClose(c5) };
     }, (sym, error) => {
       if (recordScanFailures) recordScanState(this.d.store, { engine: "SCALP_5M", instrument: sym,
         scannedAt: new Date().toISOString(), result: "FETCH_FAILED", reason: "market_data_fetch_failed" });
@@ -209,7 +210,7 @@ export class ScalpRunner {
       signals.sort((a, b) => b.score - a.score);
 
       const cycleId = `SCALP-${Date.now()}`;
-      await runScalpCandidateQueue(signals, async (sig, rank): Promise<ScalpEntryOutcome> => {
+      await runScalpCandidateQueue(signals, this.d.cfg.max_candidate_attempts_per_cycle, async (sig, rank): Promise<ScalpEntryOutcome> => {
         const trace = (gateResult: string | null, riskResult: string | null, finalResult: string, reason?: string) => {
           recordCandidateAttempt(this.d.store, { cycleId, engine: "SCALP_5M", rank,
             instrument: sig.instrument, strategy: "SCALP_V1", setupScore: sig.score,

@@ -12,10 +12,15 @@ export interface ScalpQueueResult {
 /** Try ranked Scalp signals until one opens, or a global safety/provider stop occurs. */
 export async function runScalpCandidateQueue<T>(
   candidates: readonly T[],
+  maxAttempts: number,
   attempt: (candidate: T, rank: number) => Promise<ScalpEntryOutcome>,
 ): Promise<ScalpQueueResult> {
+  if (!Number.isInteger(maxAttempts) || maxAttempts < 1 || maxAttempts > 5) {
+    throw new RangeError("Scalp maxAttempts must be an integer from 1 to 5");
+  }
   let attempted = 0;
-  for (let index = 0; index < candidates.length; index++) {
+  const attemptLimit = Math.min(candidates.length, maxAttempts);
+  for (let index = 0; index < attemptLimit; index++) {
     attempted++;
     const outcome = await attempt(candidates[index]!, index + 1);
     if (outcome.kind === "OPENED") return { result: "OPENED", attempted, ...(outcome.reason ? { reason: outcome.reason } : {}) };
