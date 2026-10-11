@@ -13,6 +13,7 @@ export interface ScalpCfg {
   vol_burst_min: number; min_score: number;
   stop_atr_mult: number; tp_r: number; min_tp_pct: number;   // fee guard retains a configured minimum TP move
   max_hold_s: number; cooldown_s: number; max_daily_trades: number;
+  max_candidate_attempts_per_cycle: number;
   llm_gate: boolean; stance_refresh_s: number;
   fee_pct: number;
   position_pct: number;
@@ -171,7 +172,7 @@ export const SCALP_DEFAULTS: ScalpCfg = {
   ema_fast: 9, ema_slow: 21, rsi_period: 7,
   rsi_long_min: 48, rsi_long_max: 72, rsi_short_min: 28, rsi_short_max: 52,
   vol_burst_min: 1.10, min_score: 0.55, stop_atr_mult: 1.4, tp_r: 2.0, min_tp_pct: 0.25,
-  max_hold_s: 900, cooldown_s: 240, max_daily_trades: 20,
+  max_hold_s: 900, cooldown_s: 240, max_daily_trades: 20, max_candidate_attempts_per_cycle: 3,
   llm_gate: true, stance_refresh_s: 900,
   fee_pct: 0.05, position_pct: 20,
 };
