@@ -21,6 +21,38 @@ export const ABSOLUTE_MAX = {
   maxPortfolioOpenRiskPct: 5.0,
 } as const;
 
+export const ScalpConfigSchema = z.object({
+  enabled: z.boolean().default(false),
+  base_tf: z.enum(["1m", "5m"]).default("1m"),
+  signal_tf: z.enum(["1m", "3m", "5m"]).default("5m"),
+  ema_fast: z.number().int().min(3).max(50).default(9),
+  ema_slow: z.number().int().min(6).max(120).default(21),
+  rsi_period: z.number().int().min(4).max(14).default(7),
+  rsi_long_min: z.number().min(40).max(60).default(48),
+  rsi_long_max: z.number().min(55).max(80).default(72),
+  rsi_short_min: z.number().min(20).max(45).default(28),
+  rsi_short_max: z.number().min(40).max(60).default(52),
+  vol_burst_min: z.number().min(1).max(3).default(1.1),
+  min_score: z.number().min(0.4).max(0.9).default(0.55),
+  stop_atr_mult: z.number().min(0.8).max(3).default(1.4),
+  tp_r: z.number().min(1.2).max(3).default(2.0),
+  min_tp_pct: z.number().min(0.1).max(1.5).default(0.25),
+  max_hold_s: z.number().int().min(120).max(1800).default(900),
+  cooldown_s: z.number().int().min(60).max(900).default(240),
+  max_daily_trades: z.number().int().min(1).max(40).default(20),
+  llm_gate: z.boolean().default(true),
+  stance_refresh_s: z.number().int().min(300).max(1800).default(900),
+  fee_pct: z.number().min(0.02).max(0.1).default(0.05),
+  position_pct: z.number().min(1).max(100).default(8),
+}).superRefine((v, ctx) => {
+  const check = (valid: boolean, path: keyof typeof v, message: string) => {
+    if (!valid) ctx.addIssue({ code: "custom", path: [path], message });
+  };
+  check(v.ema_fast < v.ema_slow, "ema_fast", "ema_fast must be less than ema_slow");
+  check(v.rsi_long_min < v.rsi_long_max, "rsi_long_min", "rsi_long_min must be less than rsi_long_max");
+  check(v.rsi_short_min < v.rsi_short_max, "rsi_short_min", "rsi_short_min must be less than rsi_short_max");
+});
+
 const TradingSchema = z.object({
   exchange: z.literal("okx"),
   environment: z.literal("demo"),
@@ -43,30 +75,7 @@ const TradingSchema = z.object({
   }).default({ enabled: true, dynamic_slots: 8, max_total_symbols: 15, refresh_hour_utc: 0, refresh_minute_utc: 15,
     filters: { min_listing_age_days: 7, max_spread_pct: 0.15, min_liquidity_usdt: 1_000_000, candidate_analysis_limit: 30, min_trend_score: 60 } }),
   // 5m hybrid scalp engine (§46 fee guard) — deterministic signals + LLM gate/supervisor
-  scalp: z.object({
-    enabled: z.boolean().default(false),
-    base_tf: z.enum(["1m", "5m"]).default("1m"),
-    signal_tf: z.enum(["1m", "3m", "5m"]).default("5m"),
-    ema_fast: z.number().int().min(3).max(50).default(9),
-    ema_slow: z.number().int().min(6).max(120).default(21),
-    rsi_period: z.number().int().min(4).max(14).default(7),
-    rsi_long_min: z.number().min(40).max(60).default(50),
-    rsi_long_max: z.number().min(60).max(75).default(68),
-    rsi_short_min: z.number().min(25).max(40).default(32),
-    rsi_short_max: z.number().min(40).max(60).default(50),
-    vol_burst_min: z.number().min(1).max(3).default(1.25),
-    min_score: z.number().min(0.4).max(0.9).default(0.6),
-    stop_atr_mult: z.number().min(0.8).max(3).default(1.4),
-    tp_r: z.number().min(1.2).max(3).default(2.0),
-    min_tp_pct: z.number().min(0.1).max(1.5).default(0.35),
-    max_hold_s: z.number().int().min(120).max(1800).default(900),
-    cooldown_s: z.number().int().min(60).max(900).default(240),
-    max_daily_trades: z.number().int().min(1).max(40).default(20),
-    llm_gate: z.boolean().default(true),
-    stance_refresh_s: z.number().int().min(300).max(1800).default(900),
-    fee_pct: z.number().min(0.02).max(0.1).default(0.05),
-    position_pct: z.number().min(1).max(100).default(8),
-  }).optional(),
+  scalp: ScalpConfigSchema.optional(),
   timeframe: z.enum(["1m", "3m", "5m", "15m", "30m", "1H", "2H", "4H", "6H", "12H", "1D", "1W"]),
   account: z.object({
     margin_mode: z.literal("isolated"),

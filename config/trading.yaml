@@ -66,8 +66,22 @@ scalp:
   base_tf: 1m
   signal_tf: 5m
   position_pct: 20         # scalp notional ~$20/position (smaller than 15m swing $55)
+  ema_fast: 9
+  ema_slow: 21
+  rsi_period: 7
+  rsi_long_min: 48
+  rsi_long_max: 72
+  rsi_short_min: 28
+  rsi_short_max: 52
+  vol_burst_min: 1.10
+  min_score: 0.55
+  stop_atr_mult: 1.4
+  tp_r: 2.0
+  min_tp_pct: 0.25  # operational Demo starting point; fee guard remains active
+  cooldown_s: 240
   max_daily_trades: 20
   llm_gate: true
+  stance_refresh_s: 900
 
 # Strategy selection is independent of the baseline safety overlay.
 strategy_core:
