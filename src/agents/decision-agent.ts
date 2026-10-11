@@ -24,8 +24,8 @@ export type Decision = z.infer<typeof DecisionSchema>;
 export const CandidateGateSchema = z.object({
   verdict: z.enum(["ALLOW", "DENY"]),
   confidence: z.number().min(0).max(1),
-  reasoning: z.array(z.string().max(280)).max(5).default([]),
-  risk_flags: z.array(z.string().max(120)).max(5).default([]),
+  reasoning: z.array(z.string().max(500)).max(5).default([]),
+  risk_flags: z.array(z.string().max(250)).max(5).default([]),
 }).strict();
 export type CandidateGate = z.infer<typeof CandidateGateSchema>;
 
