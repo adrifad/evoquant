@@ -13,6 +13,7 @@ import { evaluateGlobalEntryGate } from "../src/risk/global-entry-gate.ts";
 import { runTick, startupSafetySequence, synchronizeEntryLeverage, reconcileEntryReservation, type TickContext } from "../src/execution/executor.ts";
 import { prepareCapitalStore } from "../src/core/capital.ts";
 import { ScalpRunner } from "../src/scalp/runner.ts";
+import type { ScalpEntryOutcome } from "../src/scalp/candidate-queue.ts";
 import { SCALP_DEFAULTS, type ScalpSignal } from "../src/scalp/signals.ts";
 import { OkxApiError, type OkxClient } from "../src/exchange/okx/client.ts";
 import { OrderRejectedError } from "../src/exchange/okx/orders.ts";
@@ -209,7 +210,7 @@ function executionFixture(t: { after(fn: () => void): void }, onLeverage?: () =>
   setBotState(base.store, "RUNNING");
   setEmergencyHalted(base.store, false);
   const runner = new ScalpRunner({ ...deps, cfg: { ...SCALP_DEFAULTS, position_pct: 20 }, llm: {} as RoleLlmService });
-  const openScalp = (instrument = meta.instId) => (runner as unknown as { openScalp(s: ScalpSignal, f: FeatureSnapshot): Promise<void> })
+  const openScalp = (instrument = meta.instId) => (runner as unknown as { openScalp(s: ScalpSignal, f: FeatureSnapshot): Promise<ScalpEntryOutcome> })
     .openScalp({ ...signal, instrument }, { ...features, instrument });
   const ctx: TickContext = { features, regime: "TRENDING_BULLISH", strategies: [{ name: "TREND_FOLLOWING", version: 1 } as TickContext["strategies"][number]],
     decideFn: async () => ({ decision: "LONG", strategy: "TREND_FOLLOWING_V1", confidence: 1,
@@ -217,6 +218,21 @@ function executionFixture(t: { after(fn: () => void): void }, onLeverage?: () =>
   const openSwing = () => runTick(deps, ctx, { instId: meta.instId, meta });
   return { ...deps, writes, positions, behavior, openScalp, openSwing };
 }
+
+test("Scalp entry reports symbol-local rejection separately from a global bot stop", async (t) => {
+  const f = executionFixture(t);
+  f.risk.hard_limits.allowed_symbols = ["ETH-USDT-SWAP"];
+  const local = await f.openScalp();
+  assert.equal(local.kind, "CANDIDATE_REJECT");
+  assert.equal(local.reason, "SYMBOL_NOT_ALLOWED");
+  assert.equal(f.writes.some((w) => w.url.endsWith("/order")), false);
+
+  setBotState(f.store, "PAUSED");
+  const global = await f.openScalp("ETH-USDT-SWAP");
+  assert.equal(global.kind, "GLOBAL_STOP");
+  assert.equal(global.riskResult, "BOT_PAUSED");
+  assert.equal(f.writes.some((w) => w.url.endsWith("/order")), false);
+});
 
 test("startup never changes leverage and new-entry sync refuses an occupied instrument", async (t) => {
   const f = executionFixture(t);

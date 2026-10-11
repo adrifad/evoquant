@@ -11,7 +11,7 @@ export interface ScalpCfg {
   ema_fast: number; ema_slow: number; rsi_period: number;
   rsi_long_min: number; rsi_long_max: number; rsi_short_min: number; rsi_short_max: number;
   vol_burst_min: number; min_score: number;
-  stop_atr_mult: number; tp_r: number; min_tp_pct: number;   // fee guard: TP distance ≥ ~3×roundtrip fee
+  stop_atr_mult: number; tp_r: number; min_tp_pct: number;   // fee guard retains a configured minimum TP move
   max_hold_s: number; cooldown_s: number; max_daily_trades: number;
   llm_gate: boolean; stance_refresh_s: number;
   fee_pct: number;
@@ -70,11 +70,50 @@ export interface ScalpInput {
   features: FeatureSnapshot;                     // 15m features for veto rules
 }
 
+export const SIDEWAYS_MIN_SCORE = 0.70;
+export const SIDEWAYS_MIN_VOLUME_BURST = 1.25;
+
+export function scalpScoreAllowed(regime: Regime, score: number, cfg: ScalpCfg): boolean {
+  return score >= (regime === "SIDEWAYS" ? SIDEWAYS_MIN_SCORE : cfg.min_score);
+}
+
+export function scalpRsiAllowed(direction: 1 | -1, rsi: number, cfg: ScalpCfg): boolean {
+  return direction === 1
+    ? rsi >= cfg.rsi_long_min && rsi <= cfg.rsi_long_max
+    : rsi >= cfg.rsi_short_min && rsi <= cfg.rsi_short_max;
+}
+
+export function scalpVolumeAllowed(regime: Regime, burst: number, cfg: ScalpCfg): boolean {
+  return burst >= (regime === "SIDEWAYS" ? SIDEWAYS_MIN_VOLUME_BURST : cfg.vol_burst_min);
+}
+
+export function scalpDirectionAllowed(regime: Regime, direction: 1 | -1): boolean {
+  return regime === "SIDEWAYS"
+    || (regime === "TRENDING_BULLISH" && direction === 1)
+    || (regime === "TRENDING_BEARISH" && direction === -1);
+}
+
+export function sidewaysConfirmationAllowed(direction: 1 | -1, price: number, last5m?: { close: number } | null): boolean {
+  if (!last5m || !Number.isFinite(last5m.close)) return false;
+  return direction === 1 ? price >= last5m.close : price <= last5m.close;
+}
+
+export function feeGuardPasses(tpMovePct: number, minTpPct: number): boolean {
+  return Number.isFinite(tpMovePct) && tpMovePct + 1e-9 >= minTpPct;
+}
+
+export function stanceScoreFloor(stance: Stance): number | null {
+  if (stance === "DEFENSIVE") return null;
+  return stance === "AGGRESSIVE" ? 0.55 : 0.65;
+}
+
 export function evaluateSignal(inp: ScalpInput, cfg: ScalpCfg,
   nowS: number, lastExitBySym: Record<string, number>): { signal?: ScalpSignal; veto?: string } {
   const { instrument, closes1m: cs } = inp;
   if (cs.length < Math.max(cfg.ema_slow, 20)) return { veto: "warmup" };
-  if (!inp.regime.startsWith("TRENDING")) return { veto: `regime:${inp.regime}` };
+  if (inp.regime === "HIGH_VOLATILITY" || inp.regime === "LOW_VOLATILITY" || inp.regime === "UNKNOWN") {
+    return { veto: `regime:${inp.regime}` };
+  }
 
   const cooldownLeft = cfg.cooldown_s - (nowS - (lastExitBySym[instrument] ?? 0));
   if (cooldownLeft > 0) return { veto: `cooldown:${Math.ceil(cooldownLeft)}s` };
@@ -94,23 +133,26 @@ export function evaluateSignal(inp: ScalpInput, cfg: ScalpCfg,
   const smaV = vols.slice(-20).reduce((a, b) => a + b, 0) / Math.min(20, vols.length);
   const burst = smaV > 0 ? (vols.at(-1)! / smaV) : 0;
 
-  let direction: 0 | 1 | -1 = 0;
-  if (ef > es && r >= cfg.rsi_long_min && r <= cfg.rsi_long_max && burst >= cfg.vol_burst_min) direction = 1;
-  else if (ef < es && r <= cfg.rsi_short_max && r >= cfg.rsi_short_min && burst >= cfg.vol_burst_min) direction = -1;
-  if (!direction) return { veto: `no-setup(ef${ef > es ? ">" : "<"}es rsi=${r.toFixed(0)} burst=${burst.toFixed(2)})` };
+  let direction: 0 | 1 | -1 = ef > es ? 1 : ef < es ? -1 : 0;
+  if (!direction) return { veto: "ema" };
+  if (!scalpDirectionAllowed(inp.regime, direction)) return { veto: "ema:against_trend" };
+  if (!scalpRsiAllowed(direction, r, cfg)) return { veto: "rsi" };
+  const sideways = inp.regime === "SIDEWAYS";
+  if (!scalpVolumeAllowed(inp.regime, burst, cfg)) return { veto: sideways ? "sideways-volume" : "volume" };
 
   const trendAligned = !inp.last5m ||
     (direction === 1 ? price >= inp.last5m.close : price <= inp.last5m.close);
+  if (sideways && !sidewaysConfirmationAllowed(direction, price, inp.last5m)) return { veto: "sideways-confirmation" };
   const spread = Math.abs(ef - es) / price;
   const score = Math.min(1, (spread * 100) / 0.25 * 0.4 + ((burst - 1) / 0.5) * 0.35 + (trendAligned ? 0.25 : -0.35));
-  if (score < cfg.min_score) return { veto: `score:${score.toFixed(2)}<${cfg.min_score}` };
+  if (!scalpScoreAllowed(inp.regime, score, cfg)) return { veto: sideways ? "sideways-score" : "score" };
 
   const stopPx = direction === 1 ? price - atr * cfg.stop_atr_mult : price + atr * cfg.stop_atr_mult;
   const stopDist = Math.abs(price - stopPx);
   if (!(stopDist > 0)) return { veto: "stop-degenerate" };
   const tpDist = stopDist * cfg.tp_r;
-  // FEE GUARD: expected gross move must clear ≥ min_tp_pct (~3× taker roundtrip) (§46)
-  if ((tpDist / price) * 100 < cfg.min_tp_pct) return { veto: `fee-guard:tp=${((tpDist / price) * 100).toFixed(2)}%<${cfg.min_tp_pct}%` };
+  // FEE GUARD: Demo starting point remains >= 0.25% expected gross move (§46).
+  if (!feeGuardPasses((tpDist / price) * 100, cfg.min_tp_pct)) return { veto: "fee-guard" };
   const tpPx = direction === 1 ? price + tpDist : price - tpDist;
   return {
     signal: {
@@ -127,8 +169,8 @@ export type Stance = "AGGRESSIVE" | "NEUTRAL" | "DEFENSIVE";
 export const SCALP_DEFAULTS: ScalpCfg = {
   watchlist: [], signal_tf: "5m", base_tf: "1m",
   ema_fast: 9, ema_slow: 21, rsi_period: 7,
-  rsi_long_min: 50, rsi_long_max: 68, rsi_short_min: 32, rsi_short_max: 50,
-  vol_burst_min: 1.25, min_score: 0.6, stop_atr_mult: 1.4, tp_r: 2.0, min_tp_pct: 0.35,
+  rsi_long_min: 48, rsi_long_max: 72, rsi_short_min: 28, rsi_short_max: 52,
+  vol_burst_min: 1.10, min_score: 0.55, stop_atr_mult: 1.4, tp_r: 2.0, min_tp_pct: 0.25,
   max_hold_s: 900, cooldown_s: 240, max_daily_trades: 20,
   llm_gate: true, stance_refresh_s: 900,
   fee_pct: 0.05, position_pct: 20,
@@ -136,7 +178,7 @@ export const SCALP_DEFAULTS: ScalpCfg = {
 
 export function stanceAllows(stance: Stance, signal: ScalpSignal): GateOutcome {
   if (stance === "DEFENSIVE") return { allow: false, reason: "stance:DEFENSIVE" };
-  const floor = stance === "AGGRESSIVE" ? 0.55 : 0.72;
+  const floor = stanceScoreFloor(stance)!;
   if (signal.score < floor) return { allow: false, reason: `stance:${stance} needs score≥${floor}, got ${signal.score.toFixed(2)}` };
   return { allow: true, confidence: signal.score, reason: "policy" };
 }

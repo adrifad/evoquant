@@ -42,8 +42,9 @@ import type { Position } from "../exchange/okx/types.ts";
 import { isTradeOwnedBy } from "../memory/engines.ts";
 import { candidateStopRiskPct, portfolioOpenRisk } from "../risk/portfolio-open-risk.ts";
 import { recordScanState, recordScalpScanResult } from "../market/scan-state.ts";
-import { recordOpportunityMetric } from "../market/opportunity-funnel.ts";
+import { recordCandidateAttempt, recordOpportunityMetric } from "../market/opportunity-funnel.ts";
 import { scanSymbolsIsolated } from "../market/isolated-scan.ts";
+import { runScalpCandidateQueue, type ScalpEntryOutcome } from "./candidate-queue.ts";
 
 const log = createLogger("scalp");
 const TF_TAG = "scalp";
@@ -164,16 +165,23 @@ export class ScalpRunner {
     try {
       const nowS = Math.floor(Date.now() / 1000);
       await this.ensureStance(nowS);
-      if (this.stance === "DEFENSIVE") { recordOpportunityMetric(this.d.store, "SCALP_5M", "STANCE_REJECT"); log.info({ event: "scalp_skip_defensive" }); return; }
+      if (this.stance === "DEFENSIVE") {
+        recordOpportunityMetric(this.d.store, "SCALP_5M", "STANCE_REJECT", "DEFENSIVE");
+        log.info({ event: "scalp_skip_defensive" });
+      }
 
       const dayStart = dayStartIso();
       const today = (this.d.store.db.prepare(
         "SELECT COUNT(*) n FROM trades WHERE timeframe=? AND entry_ts>=?").get(TF_TAG, dayStart) as { n: number }).n;
       if (!dailyAllows(today, this.d.cfg.max_daily_trades)) {
+        recordOpportunityMetric(this.d.store, "SCALP_5M", "RISK_REJECT", "DAILY_TRADE_CAP");
         log.info({ event: "scalp_daily_cap", today }); return;
       }
       const openAll = getOpenTrades(this.d.store) as Array<Record<string, unknown>>;
-      if (openAll.length >= this.d.risk.hard_limits.max_concurrent_positions) return;
+      if (openAll.length >= this.d.risk.hard_limits.max_concurrent_positions) {
+        recordOpportunityMetric(this.d.store, "SCALP_5M", "RISK_REJECT", "POSITION_LIMIT");
+        return;
+      }
 
       const snaps = await this.symbolContexts(true);
       const signals: ScalpSignal[] = [];
@@ -200,32 +208,60 @@ export class ScalpRunner {
       }
       signals.sort((a, b) => b.score - a.score);
 
-      // Deterministic policy first. The shared role service owns request budgets.
-      for (const sig of signals) {
-        if (openAll.length + this.inFlight.size >= this.d.risk.hard_limits.max_concurrent_positions) break;
-        if (openAll.some((t) => String(t.instrument) === sig.instrument)) continue; // one/symbol (shared)
-        if (this.inFlight.has(sig.instrument)) continue;
+      const cycleId = `SCALP-${Date.now()}`;
+      await runScalpCandidateQueue(signals, async (sig, rank): Promise<ScalpEntryOutcome> => {
+        const trace = (gateResult: string | null, riskResult: string | null, finalResult: string, reason?: string) => {
+          recordCandidateAttempt(this.d.store, { cycleId, engine: "SCALP_5M", rank,
+            instrument: sig.instrument, strategy: "SCALP_V1", setupScore: sig.score,
+            gateResult, riskResult, finalResult, ...(reason ? { reason } : {}) });
+        };
+        if (openAll.length + this.inFlight.size >= this.d.risk.hard_limits.max_concurrent_positions) {
+          trace(null, "MAX_CONCURRENT_POSITIONS", "GLOBAL_STOP", "MAX_CONCURRENT_POSITIONS");
+          return { kind: "GLOBAL_STOP", reason: "MAX_CONCURRENT_POSITIONS", riskResult: "MAX_CONCURRENT_POSITIONS" };
+        }
+        if (openAll.some((t) => String(t.instrument) === sig.instrument) || this.inFlight.has(sig.instrument)) {
+          trace(null, "INSTRUMENT_ALREADY_OCCUPIED", "CANDIDATE_REJECT", "SYMBOL_OCCUPIED");
+          return { kind: "CANDIDATE_REJECT", reason: "SYMBOL_OCCUPIED", riskResult: "INSTRUMENT_ALREADY_OCCUPIED" };
+        }
         const pol = stanceAllows(this.stance, sig);
-        if (!pol.allow) { log.info({ event: "scalp_policy_deny", inst: sig.instrument, reason: pol.reason }); continue; }
-        if (!this.d.cfg.llm_gate) { log.info({ event: "scalp_skip_gate_disabled" }); break; }
+        if (!pol.allow) {
+          const dimension = this.stance === "DEFENSIVE" ? "DEFENSIVE" : "NEUTRAL_SCORE";
+          recordOpportunityMetric(this.d.store, "SCALP_5M", "STANCE_REJECT", dimension);
+          trace(null, null, "STANCE_REJECT", dimension);
+          log.info({ event: "scalp_policy_deny", inst: sig.instrument, reason: pol.reason });
+          return { kind: "CANDIDATE_REJECT", reason: dimension };
+        }
+        if (!this.d.cfg.llm_gate) {
+          trace(null, null, "GLOBAL_STOP", "LLM_GATE_DISABLED");
+          log.info({ event: "scalp_skip_gate_disabled" });
+          return { kind: "GLOBAL_STOP", reason: "LLM_GATE_DISABLED" };
+        }
         const snap = snaps.find((s) => s.instrument === sig.instrument)!;
         const g = await gateSignal(this.d.llm, sig, this.d.cfg, {
           stance: this.stance, regime: snap.regime, atrPct15m: snap.features.atrPct, spreadOk: true,
         });
         if (!g.allow) {
-          const error = g.reason.includes("fail-closed");
-          const latestRun = error ? this.d.store.db.prepare(`SELECT status FROM llm_runs WHERE role='scalp' AND context_ref='scalp_candidate_gate'
-            ORDER BY id DESC LIMIT 1`).get() as { status?: string } | undefined : undefined;
-          recordOpportunityMetric(this.d.store, "SCALP_5M", error ? "GATE_ERROR" : "GATE_DENY", latestRun?.status ?? "");
-          if (latestRun?.status === "BUDGET_EXHAUSTED") recordOpportunityMetric(this.d.store, "SCALP_5M", "BUDGET_EXHAUSTED");
+          if (g.unavailable) {
+            const latestRun = this.d.store.db.prepare(`SELECT status FROM llm_runs WHERE role='scalp' AND context_ref='scalp_candidate_gate'
+              ORDER BY id DESC LIMIT 1`).get() as { status?: string } | undefined;
+            const failure = safeLlmFailureDimension(latestRun?.status);
+            recordOpportunityMetric(this.d.store, "SCALP_5M", "GATE_ERROR", failure);
+            if (latestRun?.status === "BUDGET_EXHAUSTED") recordOpportunityMetric(this.d.store, "SCALP_5M", "BUDGET_EXHAUSTED");
+            trace("ERROR", null, "GLOBAL_STOP", failure);
+            log.info({ event: "scalp_llm_unavailable_stop", inst: sig.instrument, status: failure });
+            return { kind: "GLOBAL_STOP", reason: failure };
+          }
+          recordOpportunityMetric(this.d.store, "SCALP_5M", "GATE_DENY", "DENY");
+          trace("DENY", null, "GATE_DENY", "DENY");
           log.info({ event: "scalp_llm_deny", inst: sig.instrument, reason: g.reason.slice(0, 120) });
-          continue;
+          return { kind: "CANDIDATE_REJECT", reason: "GATE_DENY" };
         }
         recordOpportunityMetric(this.d.store, "SCALP_5M", "GATE_ALLOW");
         log.info({ event: "scalp_llm_allow", inst: sig.instrument, conf: g.confidence });
-        await this.openScalp(sig, snaps.find((s) => s.instrument === sig.instrument)!.features);
-        if (signals.length > 0) break; // ≤1 new scalp per candle
-      }
+        const outcome = await this.openScalp(sig, snap.features);
+        trace("ALLOW", outcome.riskResult ?? null, outcome.kind, outcome.reason);
+        return outcome;
+      });
     } catch (e) {
       log.error({ event: "scalp_tick_error", error: e instanceof Error ? e.message : String(e) });
     } finally { this.ticking = false; }
@@ -233,13 +269,17 @@ export class ScalpRunner {
 
   // ---------- deterministic entry with LLM-approved context ----------
 
-  private async openScalp(sig: ScalpSignal, features: FeatureSnapshot): Promise<void> {
+  private async openScalp(sig: ScalpSignal, features: FeatureSnapshot): Promise<ScalpEntryOutcome> {
     return serializeRiskEntry(this.d.store, () => this.openScalpSerialized(sig, features));
   }
 
-  private async openScalpSerialized(sig: ScalpSignal, features: FeatureSnapshot): Promise<void> {
+  private async openScalpSerialized(sig: ScalpSignal, features: FeatureSnapshot): Promise<ScalpEntryOutcome> {
     const { client, store, cfg, risk, instruments } = this.d;
-    const meta = instruments[sig.instrument]!;
+    const meta = instruments[sig.instrument];
+    if (!meta || !(Number(meta.ctVal) > 0)) {
+      recordOpportunityMetric(store, "SCALP_5M", "RISK_REJECT", "INSTRUMENT_METADATA");
+      return { kind: "GLOBAL_STOP", reason: "INSTRUMENT_METADATA_UNAVAILABLE", riskResult: "STATE_UNCERTAIN" };
+    }
     try {
       const usdt = (await getPositions(client)).filter((p) => p.pos !== "0");
       const bal = await getBalance(client);
@@ -271,9 +311,12 @@ export class ScalpRunner {
           localOpen.some((t) => String(t.instrument) === sig.instrument),
       }, risk);
       if (!gate.allowed) {
-        recordOpportunityMetric(store, "SCALP_5M", "RISK_REJECT", gate.reason);
+        const dimension = scalpRiskBlocker(gate.reason);
+        recordOpportunityMetric(store, "SCALP_5M", "RISK_REJECT", dimension);
         log.info({ event: "scalp_global_risk_reject", inst: sig.instrument, reason: gate.reason });
-        return;
+        return gate.reason === "INSTRUMENT_ALREADY_OCCUPIED" || gate.reason === "INSTRUMENT_NOT_ALLOWED"
+          ? { kind: "CANDIDATE_REJECT", reason: dimension, riskResult: gate.reason }
+          : { kind: "GLOBAL_STOP", reason: dimension, riskResult: gate.reason };
       }
       this.inFlight.add(sig.instrument);
       const side = sig.direction === 1 ? "LONG" : "SHORT";
@@ -284,7 +327,8 @@ export class ScalpRunner {
         { mode: "percent_of_equity", position_pct: cfg.position_pct });
       } catch (e) {
         recordOpportunityMetric(store, "SCALP_5M", "RISK_REJECT", "SIZING_REJECTED");
-        log.info({ event: "scalp_sizing_reject", inst: sig.instrument, error: e instanceof Error ? e.message.slice(0, 80) : "" }); return;
+        log.info({ event: "scalp_sizing_reject", inst: sig.instrument, error: e instanceof Error ? e.message.slice(0, 80) : "" });
+        return { kind: "CANDIDATE_REJECT", reason: "SIZING_REJECTED", riskResult: "SIZING_REJECTED" };
       }
       const settingsAtPreparation = entrySettingsFingerprint(this.d.trading, risk);
       const leverage = await synchronizeEntryLeverage(this.d, sig.instrument);
@@ -300,7 +344,7 @@ export class ScalpRunner {
         recordOpportunityMetric(store, "SCALP_5M", "RISK_REJECT", "RECONCILIATION_PENDING");
         log.info({ event: "scalp_global_risk_reject", inst: sig.instrument, reason: "RECONCILIATION_PENDING", stage: "pre_order" });
         logSystemEvent(store, "RISK_REJECT", { engine: "SCALP_5M", instId: sig.instrument, reason: "RECONCILIATION_PENDING" });
-        return;
+        return { kind: "GLOBAL_STOP", reason: "RECONCILIATION_PENDING", riskResult: "RECONCILIATION_PENDING" };
       }
       const finalLocalKeys = new Set(finalLocal.map((t) => `${String(t.instrument)}:${String(t.side).toLowerCase()}`));
       const finalExchangeKeys = new Set(finalPositions.map((p) => `${p.instId}:${p.posSide}`));
@@ -314,16 +358,19 @@ export class ScalpRunner {
         drawdownPct: finalBase.peakEquity > 0 ? ((finalBase.peakEquity - finalEquity) / finalBase.peakEquity) * 100 : 0,
       }, risk, store);
       if (entrySettingsFingerprint(this.d.trading, risk) !== settingsAtPreparation) {
+        recordOpportunityMetric(store, "SCALP_5M", "RISK_REJECT", "SETTINGS_CHANGED");
         log.info({ event: "scalp_global_risk_reject", inst: sig.instrument,
           reason: "ENTRY_SETTINGS_CHANGED", stage: "pre_order" });
-        return;
+        return { kind: "GLOBAL_STOP", reason: "SETTINGS_CHANGED", riskResult: "ENTRY_SETTINGS_CHANGED" };
       }
       try {
         sz = sizePosition({ equity: finalEquity, entryPrice: sig.price, stopPrice: sig.stopPx,
           leverage, instrument: meta }, risk,
         { mode: "percent_of_equity", position_pct: cfg.position_pct });
       } catch (e) {
-        log.info({ event: "scalp_sizing_reject", inst: sig.instrument, stage: "pre_order", error: e instanceof Error ? e.message.slice(0, 80) : "" }); return;
+        recordOpportunityMetric(store, "SCALP_5M", "RISK_REJECT", "SIZING_REJECTED");
+        log.info({ event: "scalp_sizing_reject", inst: sig.instrument, stage: "pre_order", error: e instanceof Error ? e.message.slice(0, 80) : "" });
+        return { kind: "CANDIDATE_REJECT", reason: "SIZING_REJECTED", riskResult: "SIZING_REJECTED" };
       }
       const portfolio = portfolioOpenRisk({ equity: finalEquity, positions: finalPositions, trades: finalLocal, instruments: this.d.instruments });
       const candidateRisk = candidateStopRiskPct(Number(sz.contracts) * Number(meta.ctVal) * Math.abs(sig.price - sig.stopPx), finalEquity);
@@ -334,11 +381,14 @@ export class ScalpRunner {
         portfolioOpenRiskPct: portfolio.riskPct, candidateRiskPct: candidateRisk,
       }, risk);
       if (!finalGate.allowed) {
-        recordOpportunityMetric(store, "SCALP_5M", "RISK_REJECT", finalGate.reason);
+        const dimension = scalpRiskBlocker(finalGate.reason);
+        recordOpportunityMetric(store, "SCALP_5M", "RISK_REJECT", dimension);
         log.info({ event: "scalp_global_risk_reject", inst: sig.instrument, reason: finalGate.reason, stage: "pre_order" });
         logSystemEvent(store, "RISK_REJECT", { engine: "SCALP_5M", instId: sig.instrument, reason: finalGate.reason,
           checks: finalGate.checks, portfolioOpenRiskPct: portfolio.riskPct, candidateRiskPct: candidateRisk });
-        return;
+        return finalGate.reason === "INSTRUMENT_ALREADY_OCCUPIED" || finalGate.reason === "INSTRUMENT_NOT_ALLOWED"
+          ? { kind: "CANDIDATE_REJECT", reason: dimension, riskResult: finalGate.reason }
+          : { kind: "GLOBAL_STOP", reason: dimension, riskResult: finalGate.reason };
       }
       recordOpportunityMetric(store, "SCALP_5M", "RISK_PASS");
       const clOpen = clId(side, "OPEN", sig.instrument);
@@ -390,9 +440,15 @@ export class ScalpRunner {
       recordOpportunityMetric(store, "SCALP_5M", "POSITION_OPENED");
       log.info({ event: "scalp_open", tradeId, inst: sig.instrument, side, ct: sz.contracts,
         notional: Math.round(sz.notionalUsdt * 100) / 100, fills: fills.length });
+      return { kind: "OPENED", reason: "POSITION_OPENED", riskResult: "RISK_PASS" };
     } catch (e) {
-      this.consecutiveOrderFailures++;
       log.error({ event: "scalp_open_failed", inst: sig.instrument, error: e instanceof Error ? e.message.slice(0, 140) : String(e) });
+      if (e instanceof Error && e.message === "entry leverage: instrument already occupied") {
+        recordOpportunityMetric(store, "SCALP_5M", "RISK_REJECT", "SYMBOL_OCCUPIED");
+        return { kind: "CANDIDATE_REJECT", reason: "SYMBOL_OCCUPIED", riskResult: "INSTRUMENT_ALREADY_OCCUPIED" };
+      }
+      this.consecutiveOrderFailures++;
+      return { kind: "GLOBAL_STOP", reason: "EXCHANGE_OR_EXECUTION_FAILURE", riskResult: "GLOBAL_STOP" };
     } finally { this.inFlight.delete(sig.instrument); }
   }
 
@@ -439,8 +495,45 @@ export class ScalpRunner {
   }
 }
 
-function scalpBlocker(reason: string | undefined): string {
+export function scalpBlocker(reason: string | undefined): string {
   if (!reason) return "no_setup";
-  const match = /^(regime|cooldown|bad-data|warmup|atr15|no-setup|score|stop-degenerate|fee-guard)/.exec(reason);
-  return match?.[1] ?? "other";
+  if (reason.startsWith("regime:")) return "regime";
+  if (reason.startsWith("atr15")) return "atr15";
+  if (reason.startsWith("ema")) return "ema";
+  if (reason.startsWith("rsi")) return "rsi";
+  if (reason.startsWith("volume")) return "volume";
+  if (reason.startsWith("score")) return "score";
+  if (reason.startsWith("sideways-score")) return "sideways-score";
+  if (reason.startsWith("sideways-volume")) return "sideways-volume";
+  if (reason.startsWith("sideways-confirmation")) return "sideways-confirmation";
+  if (reason.startsWith("fee-guard")) return "fee-guard";
+  if (reason.startsWith("cooldown")) return "cooldown";
+  if (reason.startsWith("warmup")) return "warmup";
+  if (reason.startsWith("bad-data")) return "bad-data";
+  if (reason.startsWith("stop-degenerate")) return "stop-geometry";
+  return "other";
+}
+
+function scalpRiskBlocker(reason: string): string {
+  if (reason.startsWith("KILL_SWITCH_ACTIVE")) return "KILL_SWITCH";
+  if (reason.startsWith("BOT_")) return "BOT_STATE";
+  if (reason === "MAX_CONCURRENT_POSITIONS") return "POSITION_LIMIT";
+  if (reason === "INSTRUMENT_ALREADY_OCCUPIED") return "SYMBOL_OCCUPIED";
+  if (reason === "INSTRUMENT_NOT_ALLOWED") return "SYMBOL_NOT_ALLOWED";
+  if (reason.startsWith("PORTFOLIO_OPEN_RISK")) return "PORTFOLIO_RISK";
+  if (reason === "RECONCILIATION_PENDING") return "RECONCILIATION";
+  if (reason.startsWith("STATE_UNCERTAIN")) return "STATE_UNCERTAIN";
+  return "GLOBAL_RISK";
+}
+
+function safeLlmFailureDimension(status?: string): string {
+  if (status === "BUDGET_EXHAUSTED") return "BUDGET_EXHAUSTED";
+  if (status === "RATE_LIMIT") return "RATE_LIMIT";
+  if (status === "TIMEOUT") return "TIMEOUT";
+  if (status === "AUTHENTICATION_FAILED") return "AUTHENTICATION_FAILED";
+  if (status === "INVALID_RESPONSE") return "INVALID_RESPONSE";
+  if (status === "NETWORK_ERROR") return "NETWORK_ERROR";
+  if (status === "HTTP_ERROR") return "HTTP_ERROR";
+  if (status === "PROVIDER_ERROR") return "PROVIDER_ERROR";
+  return "LLM_UNAVAILABLE";
 }
