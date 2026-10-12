@@ -13,7 +13,7 @@ import { scanInstruments, scanCoreV2, pickEntry, type ScanRow } from "../strateg
 import { attemptRankedCandidates } from "../strategy/candidate-queue.ts";
 import { type TradeCandidate, parseStrategyV2Params, type StrategyV2Id, type StrategyV2Params } from "../strategy/core-v2.ts";
 import { ensureV2Registry, getV2ChampionParams, getV2ChampionVersions, getV2Champions } from "../strategy/v2-registry.ts";
-import { startupSafetySequence, runTick, emergencyStop, getLastKillReason, persistCandles, priceTrigger } from "../execution/executor.ts";
+import { startupSafetySequence, runTick, emergencyStop, getLastKillReason, resetLastKillReason, sweepUnprovenExits, persistCandles, priceTrigger } from "../execution/executor.ts";
 import { closeTradeOnExchange } from "../execution/executor.ts";
 import { getPositions } from "../exchange/okx/account.ts";
 import { getOpenTrades } from "../memory/trades.ts";
@@ -201,6 +201,9 @@ async function main(): Promise<void> {
   const tick = async (): Promise<void> => {
     if (ticking) { log.info({ event: "tick_skipped_overlapping" }); return; } // mutex: 15m ticks can overrun while LLM is slow
     ticking = true;
+    // The kill reason reported by /api/status must describe THIS cycle, not the
+    // last executed runTick (which may be hours old when nothing is open).
+    resetLastKillReason();
     try {
       const strategies = loadStrategies(store);
       const activeV2Params = strategyCoreVersion === 2 ? getV2ChampionParams(store) : configuredV2Params;
@@ -328,6 +331,10 @@ async function main(): Promise<void> {
         }
       }
       pruneOpportunityTelemetry(store);
+      // Heal zombie exits first: a RECONCILIATION_PENDING close (fill unreadable
+      // at close time) would otherwise block every entry gate forever, because
+      // no other path revisits rows that are neither OPEN nor CLOSED.
+      await sweepUnprovenExits(deps);
       // Resolve delayed exchange accounting and confirmed-candle coverage before
       // an LLM ever sees the trade as learning evidence.
       await finalizePendingEvidence({ client, store, instruments, trading });

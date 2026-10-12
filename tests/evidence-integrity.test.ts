@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { ReviewSchema } from "../src/agents/reviewer-agent.ts";
-import { excursionCandles, finalizeOpenTradeFromExchange, type ExecutorDeps } from "../src/execution/executor.ts";
+import { excursionCandles, finalizeOpenTradeFromExchange, sweepUnprovenExits, resetLastKillReason, getLastKillReason, type ExecutorDeps } from "../src/execution/executor.ts";
 import { openStore } from "../src/memory/db.ts";
 import { closeTrade, computeClosedMetrics } from "../src/memory/trades.ts";
 import { evaluateGlobalEntryGate } from "../src/risk/global-entry-gate.ts";
@@ -112,4 +112,46 @@ test("five shared slots and the portfolio stop-risk cap reject a sixth or excess
   const snapshot = portfolioOpenRisk({ equity: 1_000, positions: [{ posId: "P", instId: symbol, posSide: "long", pos: "2", avgPx: "100", markPx: "100", lever: "3", upl: "0", mgnMode: "isolated" }],
     trades: [{ instrument: symbol, side: "LONG", stop_px: 83 }], instruments: { [symbol]: instrument } });
   assert.deepEqual(snapshot, { known: true, lossToStops: 34, riskPct: 3.4000000000000004, unavailable: [] });
+});
+
+function zombieExit(store: ReturnType<typeof openStore>, tradeId = "SCP-ZOMBIE") {
+  store.db.prepare(`INSERT INTO trades(trade_id,engine,status,instrument,timeframe,side,strategy,strategy_version,regime,contracts,
+    entry_px,entry_ts,stop_px,initial_stop_px,take_profit_px,ord_open_id,ord_close_id,cl_close_id)
+    VALUES(?,'SCALP_5M','RECONCILIATION_PENDING',?,'scalp','LONG','SCALP_V1',1,'TRENDING_BULLISH','1',?, ?,1.397,1.397,1.425,'OPEN-Z','CLOSE-Z','CL-Z')`)
+    .run(tradeId, symbol, 1.4, new Date(entryMs).toISOString());
+  store.db.prepare("UPDATE trades SET evidence_state='RECONCILIATION_PENDING', evidence_reason='EXIT_FILL_NOT_PROVEN' WHERE trade_id=?").run(tradeId);
+}
+
+test("zombie exit sweep heals RECONCILIATION_PENDING once the exchange fill is readable", async t => {
+  const store = withStore(t); zombieExit(store);
+  const exitFill = [{ instId: symbol, tradeId: "FZ", ordId: "CLOSE-Z", fillPx: "140", fillSz: "1", side: "sell", posSide: "long", execType: "T", ts: String(exitMs), fee: "-0.01", feeCcy: "USDT" }];
+  const healed = await sweepUnprovenExits(depsFor(store, (endpoint, query) => {
+    if (endpoint === "/api/v5/account/positions") return [];
+    if (endpoint === "/api/v5/trade/fills" && query?.ordId === "CLOSE-Z") return [];
+    if (endpoint === "/api/v5/trade/fills-history") return exitFill;
+    if (endpoint === "/api/v5/market/candles") return [];
+    throw new Error(`unexpected endpoint ${endpoint}`);
+  }));
+  assert.equal(healed, 1);
+  const row = store.db.prepare("SELECT status,exit_px,exit_reason FROM trades WHERE trade_id='SCP-ZOMBIE'").get() as Record<string, unknown>;
+  assert.deepEqual(row, { status: "CLOSED", exit_px: 140, exit_reason: "FILL_CONFIRM" });
+});
+
+test("zombie exit sweep never touches rows the exchange still holds", async t => {
+  const store = withStore(t); zombieExit(store, "SCP-LIVE");
+  const healed = await sweepUnprovenExits(depsFor(store, (endpoint) => {
+    if (endpoint === "/api/v5/account/positions") return [{ instId: symbol, posSide: "long", pos: "1", avgPx: "100", markPx: "105", lever: "5", upl: "5" }];
+    throw new Error(`unexpected endpoint ${endpoint}`);
+  }));
+  assert.equal(healed, 0);
+  assert.equal((store.db.prepare("SELECT status FROM trades WHERE trade_id='SCP-LIVE'").get() as { status: string }).status, "RECONCILIATION_PENDING");
+});
+
+test("zombie exit sweep is inert without candidates and reports per-cycle kill reason", async t => {
+  const store = withStore(t);
+  const healed = await sweepUnprovenExits(depsFor(store, () => { throw new Error("exchange must not be queried"); }));
+  assert.equal(healed, 0);
+  // kill reason is per-cycle state: the global tick resets it before any runTick can stale-cache an old reason.
+  resetLastKillReason();
+  assert.equal(getLastKillReason(), null);
 });

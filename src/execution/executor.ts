@@ -52,6 +52,10 @@ const log = createLogger("executor");
 export function getLastKillReason(): string | null {
   return lastKillReason;
 }
+/** Reset at the start of every global tick: the kill reason describes THIS
+ * cycle. Without a reset it freezes on the last runTick value, so a bot that
+ * healed hours ago still reports the old reason in /api/status. */
+export function resetLastKillReason(): void { lastKillReason = null; }
 let lastKillReason: string | null = null;
 
 export interface ExecutorDeps {
@@ -210,6 +214,46 @@ async function finalizeFromExchange(d: ExecutorDeps, t: Record<string, unknown>,
     if (!current) return;
     await finalizeOpenTradeFromExchange(d, current, ex);
   });
+}
+
+/** Zombie-exit sweep: a close order that filled but whose exit fill was not yet
+ * readable gets EXIT_FILL_NOT_PROVEN. That row no longer counts as OPEN, so the
+ * per-symbol monitor never revisits it — while its RECONCILIATION_PENDING status
+ * keeps blocking every entry gate. Re-finalize such rows once per global cycle
+ * until the exchange fill is proven or the retry cap defers them for good. */
+const EXIT_SWEEP_MAX_ATTEMPTS = 12;
+const exitSweepAttempts = new Map<string, number>();
+export async function sweepUnprovenExits(d: ExecutorDeps): Promise<number> {
+  const stale = d.store.db.prepare(
+    `SELECT trade_id,instrument,side FROM trades WHERE status='RECONCILIATION_PENDING'
+     AND evidence_reason IN ('EXIT_FILL_NOT_PROVEN','EXIT_FILL_LOOKUP_UNAVAILABLE')`).all() as
+    Array<{ trade_id: string; instrument: string; side: string }>;
+  if (stale.length === 0) { exitSweepAttempts.clear(); return 0; }
+  const liveKeys = new Set((await getPositions(d.client)).filter((p) => p.pos !== "0")
+    .map((p) => `${p.instId}:${p.posSide}`));
+  let healed = 0;
+  for (const row of stale) {
+    const tradeId = row.trade_id;
+    // While the exchange still holds this side, the monitor path owns the trade.
+    if (liveKeys.has(`${row.instrument}:${String(row.side).toLowerCase()}`)) continue;
+    const attempts = (exitSweepAttempts.get(tradeId) ?? 0) + 1;
+    if (attempts > EXIT_SWEEP_MAX_ATTEMPTS) continue;
+    exitSweepAttempts.set(tradeId, attempts);
+    await serializeTradeMutation(tradeId, async () => {
+      const current = d.store.db.prepare("SELECT * FROM trades WHERE trade_id=? AND status='RECONCILIATION_PENDING'").get(tradeId) as Record<string, unknown> | undefined;
+      if (!current) return;
+      await finalizeOpenTradeFromExchange(d, current, undefined);
+    });
+    const after = d.store.db.prepare("SELECT status FROM trades WHERE trade_id=?").get(tradeId) as { status: string } | undefined;
+    if (after && after.status !== "RECONCILIATION_PENDING") {
+      healed++;
+      exitSweepAttempts.delete(tradeId);
+      log.info({ event: "reconcile:sweep_healed", tradeId, status: after.status, attempts });
+    } else {
+      log.warn({ event: "reconcile:sweep_deferred", tradeId, attempts });
+    }
+  }
+  return healed;
 }
 
 export async function finalizeOpenTradeFromExchange(d: ExecutorDeps, t: Record<string, unknown>, ex?: Position): Promise<void> {
