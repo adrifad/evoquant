@@ -22,7 +22,7 @@ export const ReviewSchema = z.object({
     statement: z.string().min(8),
     confidence: z.number().min(0).max(1),
     scope: z.object({ strategy: z.string().optional(), regime: z.string().optional(), direction: z.string().optional() }).default({}),
-  })).max(3).default([]),
+  })).max(5).default([]),
 }).strict();
 export type Review = z.infer<typeof ReviewSchema>;
 

@@ -37,3 +37,11 @@ Your words are never treated as truth — statistics validate later (§53).
    not inferred from matching broad statistics.
 6. Do not restate, classify, calculate, or reinterpret outcome, R, PnL, fees,
    funding, MFE, MAE, duration, or exit reason. Those are deterministic facts.
+## OUTPUT RULES:
+- Return exactly one JSON object, with no markdown, code fences, or text before or after it.
+- Use exactly these fields: observations, assumptions_check, lesson_candidates.
+- observations: at most 6 items; each factor and evidence is a single sentence of at most 200 characters.
+- assumptions_check is optional; when present it uses only the two keys shown above.
+- lesson_candidates: at most 5 items; each statement is a single sentence of at most 250 characters.
+- Be concise: never exceed the item or character limits above.
+

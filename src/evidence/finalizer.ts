@@ -53,14 +53,34 @@ async function resolveFees(d: EvidenceFinalizerDeps, t: Record<string, unknown>)
       if (results.some((rows) => rows.length === 0)) return null;
       fills = results.flat();
     } else {
-      const entryMs = Date.parse(String(t.entry_ts));
-      const exitMs = Date.parse(String(t.exit_ts));
-      const side = String(t.side) === "LONG" ? "buy" : "sell";
-      const history = await getFillsHistory(d.client, instrument);
-      fills = history.filter((fill) => Number(fill.ts) >= entryMs && Number(fill.ts) <= exitMs);
-      const hasEntry = fills.some((fill) => fill.side === side);
-      const hasExit = fills.some((fill) => fill.side !== side);
-      if (!hasEntry || !hasExit) return null;
+      // One known order id: query it directly — deterministic, immune to the
+      // entry_ts clock skew that drops the entry fill from a time window
+      // (TRD-1361950904: fill 224 ms before the local entry_ts).
+      const known = ids[0];
+      const direct = await getFills(d.client, instrument, known);
+      if (direct.length > 0) {
+        fills = direct;
+      } else {
+        // Order may be older than the recent-fills window; fall back to
+        // fills-history filtered by that order id, then by a widened time
+        // window (±5 min) when the entry_ts clock offset is the culprit.
+        const entryMs = Date.parse(String(t.entry_ts));
+        const exitMs = Date.parse(String(t.exit_ts));
+        const side = String(t.side) === "LONG" ? "buy" : "sell";
+        const history = await getFillsHistory(d.client, instrument);
+        const byOrder = history.filter((fill) => fill.ordId === known);
+        if (byOrder.length > 0) {
+          fills = byOrder;
+        } else {
+          const pad = 5 * 60_000;
+          fills = history.filter((fill) =>
+            Number(fill.ts) >= entryMs - pad && Number(fill.ts) <= exitMs + pad
+            && (Number(fill.ts) <= exitMs || fill.side !== side));
+          const hasEntry = fills.some((fill) => fill.side === side);
+          const hasExit = fills.some((fill) => fill.side !== side);
+          if (!hasEntry || !hasExit) return null;
+        }
+      }
     }
   } catch { return null; }
   if (fills.some((fill) => fill.feeCcy !== "USDT" || finite(fill.fee) === null)) return null;
