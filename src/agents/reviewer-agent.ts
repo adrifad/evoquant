@@ -74,8 +74,9 @@ export async function reviewTrade(
         ...(typeof t.regime_axes === "string" ? { regimeAxes: t.regime_axes } : {}),
       },
       confidence: Math.min(c.confidence, 0.5), // §28 rule 3: single trade ≤0.5
+      sourceTradeId: tradeId,
     });
-    logSystemEvent(store, "LESSON_CANDIDATE", { lessonId, engine: input.engine, strategy: t.strategy, version: t.strategy_version, state: "PROVISIONAL_NO_SEMANTIC_VALIDATION" });
+    logSystemEvent(store, "LESSON_CANDIDATE", { lessonId, sourceTradeId: tradeId, engine: input.engine, strategy: t.strategy, version: t.strategy_version, state: "PROVISIONAL_NO_SEMANTIC_VALIDATION" });
   }
   logSystemEvent(store, "REVIEW", { tradeId, lessonCandidates: review.lesson_candidates.length });
   return review;

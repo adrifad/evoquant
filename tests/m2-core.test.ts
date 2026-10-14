@@ -298,10 +298,17 @@ test("engine migration preserves legacy trades and is idempotent", () => {
     { trade_id: "legacy-scalp", engine: "SCALP_5M", result_r_basis: "LEGACY_GROSS", strategy_core_version: 1 },
     { trade_id: "legacy-swing", engine: "SWING_15M", result_r_basis: "LEGACY_GROSS", strategy_core_version: 1 },
   ]);
+  const tradeColumns = new Set((store.db.prepare("PRAGMA table_info(trades)").all() as Array<{ name: string }>).map((column) => column.name));
+  const lessonColumns = new Set((store.db.prepare("PRAGMA table_info(lessons)").all() as Array<{ name: string }>).map((column) => column.name));
+  assert.equal(tradeColumns.has("accounting_reconcile_attempts"), true);
+  assert.equal(tradeColumns.has("accounting_reconcile_next_retry_ts"), true);
+  assert.equal(lessonColumns.has("source_trade_id"), true);
   store.close();
   const reopened = openStore(root);
   assert.equal((reopened.db.prepare("SELECT COUNT(*) c FROM trades").get() as { c: number }).c, 2);
   assert.equal((reopened.db.prepare("SELECT engine FROM trades WHERE trade_id='legacy-scalp'").get() as { engine: string }).engine, "SCALP_5M");
+  assert.equal((reopened.db.prepare("PRAGMA table_info(lessons)").all() as Array<{ name: string }>).filter((column) => column.name === "source_trade_id").length, 1,
+    "new migration columns survive repeated openStore calls without duplication");
   reopened.close();
 });
 
@@ -333,12 +340,12 @@ test("market snapshots retain the same timestamp for multiple instruments", () =
 
 test("lesson evidence transitions (§29/§30)", () => {
   const st = openStore(tmpRoot());
+  const id = upsertLesson(st, { statement: "breakouts underperform in low volume", scope: { strategy: "BREAKOUT", instrument: "BTC-USDT-SWAP", regime: "SIDEWAYS" }, confidence: 0.4 });
   // seed 12 closed losing trades in scope
   for (let i = 0; i < 12; i++) {
     st.db.prepare(`INSERT INTO trades(trade_id,status,evidence_state,evolution_evidence_eligible,result_r_basis,instrument,timeframe,side,strategy,strategy_version,regime,contracts,result_r,exit_ts)
-      VALUES('TRD-L' || ${i},'CLOSED','VALID',1,'NET','BTC-USDT-SWAP','15m','LONG','BREAKOUT',1,'SIDEWAYS','0.01',${i < 9 ? -0.5 : 0.5},'2026-10-01T00:00:00Z')`).run();
+      VALUES('TRD-L' || ${i},'CLOSED','VALID',1,'NET','BTC-USDT-SWAP','15m','LONG','BREAKOUT',1,'SIDEWAYS','0.01',${i < 9 ? -0.5 : 0.5},'2026-10-15T00:00:00Z')`).run();
   }
-  const id = upsertLesson(st, { statement: "breakouts underperform in low volume", scope: { strategy: "BREAKOUT", instrument: "BTC-USDT-SWAP", regime: "SIDEWAYS" }, confidence: 0.4 });
   for (let i = 0; i < 12; i++) addLessonEvidence(st, id, `TRD-L${i}`, i < 9);
   recomputeLesson(st, id);
   const l = st.db.prepare("SELECT status, observations FROM lessons WHERE lesson_id=?").get(id) as { status: string; observations: number };

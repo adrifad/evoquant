@@ -42,13 +42,13 @@ const feat = (p: Partial<Record<string, number>> = {}): string =>
 // §31 — a strong-signal sample must actually MOVE weights, and directionally
 function seedTrades(st: ReturnType<typeof openStore>, n: number, winRate: number): void {
   const ins = st.db.prepare(`INSERT INTO trades(trade_id,status,evidence_state,evolution_evidence_eligible,result_r_basis,instrument,timeframe,side,strategy,strategy_version,regime,contracts,result_r,entry_features,exit_ts)
-    VALUES(?, 'CLOSED','VALID',1,'NET','BTC-USDT-SWAP','15m','LONG','TREND_FOLLOWING',1,'TRENDING_BULLISH','0.01', ?, ?, '2026-10-01T00:00:00Z')`);
+    VALUES(?, 'CLOSED','VALID',1,'NET','BTC-USDT-SWAP','15m','LONG','TREND_FOLLOWING',1,'TRENDING_BULLISH','0.01', ?, ?, ?)`);
   for (let i = 0; i < n; i++) {
     const win = (i % 10) < Math.round(winRate * 10);
     // winners: high trend/volume; losers: low — contributions become measurable
     const f = win ? feat({ emaSpreadPct: 0.8, volumeRatio: 1.6, rsi14: 62, atrPct: 0.5 })
                   : feat({ emaSpreadPct: 0.1, volumeRatio: 0.6, rsi14: 45, atrPct: 1.4 });
-    ins.run(`W${i}`, win ? 1 : -0.5, f);
+    ins.run(`W${i}`, win ? 1 : -0.5, f, new Date(Date.now() + (i + 1) * 1000).toISOString());
   }
 }
 
@@ -124,9 +124,9 @@ test("strategy evolution runs at interval of closed trades (§34 schedule gate)"
 
 test("lesson expectancy uses only ALIGNED trades (§30 correctness)", () => {
   const st = openStore(tmpRoot());
-  seedTrades(st, 5, 1.0); // all wins result_r = 1
   const { upsertLesson, addLessonEvidence, recomputeLesson } = { ...lessons };
   const id = upsertLesson(st, { statement: "x underperforms", scope: { strategy: "TREND_FOLLOWING", instrument: "BTC-USDT-SWAP" }, confidence: 0.3 });
+  seedTrades(st, 5, 1.0); // all wins result_r = 1 and exit after lesson creation
   for (let i = 0; i < 5; i++) addLessonEvidence(st, id, `W${i}`, i < 2); // only first 2 aligned
   recomputeLesson(st, id);
   const row = st.db.prepare("SELECT expectancy_r, wins, observations FROM lessons WHERE lesson_id=?").get(id) as { expectancy_r: number; wins: number; observations: number };

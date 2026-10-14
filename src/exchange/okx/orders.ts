@@ -140,6 +140,7 @@ function mapFill(raw: Record<string, string>): Fill {
   return {
     instId: raw.instId ?? "",
     tradeId: raw.tradeId ?? "",
+    ...(raw.billId !== undefined ? { billId: raw.billId } : {}),
     ordId: raw.ordId ?? "",
     ...(raw.clOrdId !== undefined ? { clOrdId: raw.clOrdId } : {}),
     fillPx: raw.fillPx ?? "",
@@ -157,7 +158,7 @@ function mapFill(raw: Record<string, string>): Fill {
 export async function getFills(client: OkxClient, instId?: string, ordId?: string): Promise<Fill[]> {
   const data = await client.get<Array<Record<string, string>>>(
     "/api/v5/trade/fills",
-    { instType: "SWAP", ...(instId ? { instId } : {}), ...(ordId ? { ordId } : {}) },
+    { instType: "SWAP", limit: 100, ...(instId ? { instId } : {}), ...(ordId ? { ordId } : {}) },
     true,
   );
   return data.map(mapFill);
@@ -171,6 +172,46 @@ export async function getFillsHistory(client: OkxClient, instId?: string): Promi
     true,
   );
   return data.map(mapFill);
+}
+
+export interface CompleteFillHistory {
+  fills: Fill[];
+  complete: boolean;
+  pages: number;
+}
+
+/**
+ * Read historical fills for one exact order. OKX returns at most 100 rows and
+ * paginates this endpoint with billId. A bounded scan that reaches its page
+ * cap is explicitly incomplete; callers must not treat it as fee proof.
+ */
+export async function getFillsHistoryForOrder(
+  client: OkxClient,
+  instId: string,
+  ordId: string,
+  maxPages = 20,
+): Promise<CompleteFillHistory> {
+  const pageSize = 100;
+  const fills: Fill[] = [];
+  const seen = new Set<string>();
+  let after: string | undefined;
+  for (let page = 1; page <= maxPages; page++) {
+    const data = await client.get<Array<Record<string, string>>>(
+      "/api/v5/trade/fills-history",
+      { instType: "SWAP", instId, ordId, limit: pageSize, ...(after ? { after } : {}) },
+      true,
+    );
+    const rows = data.map(mapFill);
+    for (const fill of rows) {
+      const key = `${fill.instId}:${fill.ordId}:${fill.tradeId}:${fill.ts}`;
+      if (!seen.has(key)) { seen.add(key); fills.push(fill); }
+    }
+    if (rows.length < pageSize) return { fills, complete: true, pages: page };
+    const next = rows.at(-1)?.billId;
+    if (!next || next === after) return { fills, complete: false, pages: page };
+    after = next;
+  }
+  return { fills, complete: false, pages: maxPages };
 }
 
 // spec §10/§11/§13 — close a position side: opposite order side, same posSide
