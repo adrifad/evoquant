@@ -11,6 +11,8 @@ import { summarize } from "../evaluation/performance.ts";
 import { DEFAULT_V2_PARAMS, StrategyV2ParamsSchema, type StrategyV2Id, type StrategyV2Params } from "../strategy/core-v2.ts";
 import { createV2Challenger, getV2Champions, listV2Versions, V2_STRATEGIES } from "../strategy/v2-registry.ts";
 import { familyForV2 } from "../strategy/identity.ts";
+import { evolutionReviewDue, getEvolutionReviewState, markEvolutionReviewAttempt, markEvolutionReviewComplete,
+  markEvolutionReviewFailure } from "./evolution-review-state.ts";
 
 export const ProposalSchema = z.object({
   proposals: z.array(z.object({
@@ -43,6 +45,16 @@ export function getV2EvolutionEvidence(store: Store, strategy: StrategyV2Id, ver
     FROM trades WHERE status='CLOSED' AND evidence_state='VALID' AND evolution_evidence_eligible=1 AND result_r_basis='NET' AND engine=? AND strategy=?
       AND strategy_core_version=2 AND strategy_version=? ORDER BY exit_ts`)
     .all(engine, familyForV2(strategy), version) as ClosedEvidence[];
+}
+
+export function getVerifiedV2Lessons(store: Store, strategy: StrategyV2Id, version: number,
+  engine: TradingEngine = "SWING_15M"): Array<Record<string, unknown>> {
+  return store.db.prepare(`SELECT lesson_id,statement,scope_engine,scope_strategy,scope_strategy_version,scope_regime,
+      scope_direction,scope_regime_axes,confidence,observations,expectancy_r FROM lessons
+    WHERE status='VERIFIED' AND scope_engine=? AND (scope_strategy IS NULL OR scope_strategy=?)
+      AND (scope_strategy_version IS NULL OR scope_strategy_version=?)
+    ORDER BY confidence DESC,observations DESC LIMIT 10`)
+    .all(engine, familyForV2(strategy), version) as Array<Record<string, unknown>>;
 }
 
 export function evolutionReviewEligible(sample: number, lastReviewed: number, minimumSample: number, interval: number): boolean {
@@ -84,16 +96,24 @@ export async function maybeEvolveV2Strategies(root: string, roles: RoleLlmServic
   const champions = getV2Champions(store);
   const evidenceByStrategy = new Map<StrategyV2Id, ClosedEvidence[]>();
   const ready: StrategyV2Id[] = [];
+  const now = Date.now();
   for (const strategy of V2_STRATEGIES) {
     if (listV2Versions(store, strategy).some((version) => version.status === "CHALLENGER" || version.status === "SHADOW")) continue;
     const champion = champions[strategy];
     const evidence = getV2EvolutionEvidence(store, strategy, champion.version, engine);
     evidenceByStrategy.set(strategy, evidence);
-    const stateKey = v2EvolutionStateKey(engine, strategy, champion.version);
-    const lastCount = Number(kvGet(store, stateKey) ?? "0");
-    if (evolutionReviewEligible(evidence.length, lastCount, evolution.minimumSample, evolution.intervalTrades)) ready.push(strategy);
+    const scope = v2EvolutionReviewScope(strategy, champion.version);
+    const state = getEvolutionReviewState(store, engine, scope);
+    const lastCount = state?.last_success_trade_count ?? Number(kvGet(store, v2EvolutionStateKey(engine, strategy, champion.version)) ?? "0");
+    const due = state
+      ? evolutionReviewDue(state, evidence.length, evolution.minimumSample, evolution.intervalTrades, now)
+      : evolutionReviewEligible(evidence.length, lastCount, evolution.minimumSample, evolution.intervalTrades);
+    if (due) ready.push(strategy);
   }
   if (ready.length === 0) return 0;
+
+  for (const strategy of ready) markEvolutionReviewAttempt(store, engine, v2EvolutionReviewScope(strategy, champions[strategy].version),
+    evidenceByStrategy.get(strategy)?.length ?? 0, now);
 
   logSystemEvent(store, "EVOLUTION_TRIGGERED", { engine, strategies: ready, intervalTrades: evolution.intervalTrades });
   const prompt = readFileSync(path.join(root, "prompts/evolution-v2.md"), "utf8");
@@ -123,31 +143,55 @@ export async function maybeEvolveV2Strategies(root: string, roles: RoleLlmServic
         strategy: familyForV2(strategy), strategyCoreVersion: 2, strategyVersion: champion.version,
       }),
       shadow_challenger_summary: shadows,
-      machine_verified_lessons: [], // Natural-language hypotheses stay provisional until a structured validator exists.
+      machine_verified_lessons: getVerifiedV2Lessons(store, strategy, champion.version, engine),
       evidence_cutoff_ts: latestEvidenceExitTs(trades),
     }];
   }));
-  const result = await roles.json("evolution", prompt, JSON.stringify({ engine, strategies: strategyEvidence,
-    constraints: { max_parameter_changes_per_challenger: evolution.maxParamChanges,
-      max_parameter_delta_pct: evolution.maxParamDeltaPct, minimum_closed_trade_sample: evolution.minimumSample } }), ProposalSchema, "v2_strategy_evolution");
-  let created = 0;
-  for (const strategy of ready) {
-    const tradeCount = evidenceByStrategy.get(strategy)?.length ?? 0;
-    kvSet(store, v2EvolutionStateKey(engine, strategy, champions[strategy].version), String(tradeCount));
+  let result: z.infer<typeof ProposalSchema> | null;
+  try {
+    result = await roles.json("evolution", prompt, JSON.stringify({ engine, strategies: strategyEvidence,
+      constraints: { max_parameter_changes_per_challenger: evolution.maxParamChanges,
+        max_parameter_delta_pct: evolution.maxParamDeltaPct, minimum_closed_trade_sample: evolution.minimumSample } }), ProposalSchema, "v2_strategy_evolution");
+  } catch {
+    result = null;
+    logSystemEvent(store, "EVOLUTION_REVIEW_FAILED", { engine, strategies: ready, reason: "PROPOSAL_GENERATION_EXCEPTION" });
   }
-  if (!result || result.proposals.length === 0) {
-    logSystemEvent(store, "EVOLUTION_NO_CHANGE", { engine, strategies: ready, reason: result?.no_change_reason ?? "invalid_or_unavailable_model_response" });
+  let created = 0;
+  if (!result) {
+    const failure = "PROPOSAL_GENERATION_UNAVAILABLE_OR_INVALID";
+    for (const strategy of ready) markV2ReviewFailure(store, engine, strategy, champions[strategy].version,
+      evidenceByStrategy.get(strategy)?.length ?? 0, failure, now);
+    logSystemEvent(store, "EVOLUTION_REVIEW_FAILED", { engine, strategies: ready, reason: failure });
+    return 0;
+  }
+  if (result.proposals.length === 0) {
+    for (const strategy of ready) markV2ReviewComplete(store, engine, strategy, champions[strategy].version,
+      evidenceByStrategy.get(strategy)?.length ?? 0, "NO_CHANGE", now);
+    logSystemEvent(store, "EVOLUTION_NO_CHANGE", { engine, strategies: ready, reason: result.no_change_reason ?? "valid_no_proposal" });
     return 0;
   }
   const seen = new Set<StrategyV2Id>();
+  const outcomes = new Map<StrategyV2Id, "NO_CHANGE" | "REJECTED" | "CHALLENGER_CREATED">(ready.map(strategy => [strategy, "NO_CHANGE"]));
+  const failures = new Map<StrategyV2Id, string>();
   for (const proposal of result.proposals) {
+    if (!ready.includes(proposal.strategy)) continue;
     const champion = champions[proposal.strategy];
     let reason: string | undefined;
-    if (!ready.includes(proposal.strategy)) reason = "strategy has not reached its evolution evidence interval";
     if (seen.has(proposal.strategy)) reason = "only one proposal per strategy family is accepted per cycle";
     const evidence = strategyEvidence[proposal.strategy];
-    const review = reason ? null : await reviewWithCritic(root, roles, store, proposal, evidence);
+    let review: Awaited<ReturnType<typeof reviewWithCritic>> | null = null;
+    if (!reason) {
+      try { review = await reviewWithCritic(root, roles, store, proposal, evidence); }
+      catch {
+        const failure = "CRITIC_WORKFLOW_EXCEPTION";
+        failures.set(proposal.strategy, failure);
+        logSystemEvent(store, "EVOLUTION_REVIEW_FAILED", { engine, strategy: proposal.strategy, reason: failure });
+        continue;
+      }
+    }
     if (!review?.proposal) reason ??= review?.reason ?? "Critic unavailable or rejected proposal";
+    if (review?.transientFailure) failures.set(proposal.strategy, review.reason ?? "CRITIC_UNAVAILABLE_OR_INVALID");
+    else if (reason) outcomes.set(proposal.strategy, "REJECTED");
     if (reason || !review || !review.proposal) {
       logSystemEvent(store, "EVOLUTION_PROPOSAL_REJECTED", { engine, strategy: proposal.strategy,
         parentVersion: proposal.parent_version, changedParameter: proposal.changed_parameter, reason,
@@ -159,6 +203,7 @@ export async function maybeEvolveV2Strategies(root: string, roles: RoleLlmServic
       changedParameter: acceptedProposal.changed_parameter, oldValue: acceptedProposal.old_value, newValue: acceptedProposal.new_value },
     champion, evolution.maxParamChanges, evolution.maxParamDeltaPct);
     if (!validation.ok || !validation.params) {
+      outcomes.set(proposal.strategy, "REJECTED");
       logSystemEvent(store, "EVOLUTION_PROPOSAL_REJECTED", { engine, strategy: acceptedProposal.strategy,
         parentVersion: acceptedProposal.parent_version, changedParameter: acceptedProposal.changed_parameter,
         criticVerdict: review.verdict, criticConfidence: review.confidence, revisionRound: review.revisionRound,
@@ -183,32 +228,54 @@ export async function maybeEvolveV2Strategies(root: string, roles: RoleLlmServic
         criticModel: roles.resolve("critic").config.model, criticVerdict: review.verdict,
         criticConfidence: review.confidence, revisionRound: review.revisionRound });
       created++;
-    } catch (e) {
+      outcomes.set(proposal.strategy, "CHALLENGER_CREATED");
+    } catch {
+      failures.set(proposal.strategy, "CHALLENGER_PERSISTENCE_FAILED");
       logSystemEvent(store, "EVOLUTION_PROPOSAL_REJECTED", { engine, strategy: acceptedProposal.strategy,
         parentVersion: acceptedProposal.parent_version, changedParameter: acceptedProposal.changed_parameter,
-        reason: e instanceof Error ? e.message : "immutable registry rejected proposal" });
+        reason: "immutable registry rejected proposal" });
     }
   }
-  if (created === 0 && result.proposals.length > 0) logSystemEvent(store, "EVOLUTION_NO_CHANGE", { engine, strategies: ready, reason: "all proposals rejected" });
+  for (const strategy of ready) {
+    const version = champions[strategy].version;
+    const count = evidenceByStrategy.get(strategy)?.length ?? 0;
+    const failure = failures.get(strategy);
+    if (failure) markV2ReviewFailure(store, engine, strategy, version, count, failure, now);
+    else markV2ReviewComplete(store, engine, strategy, version, count, outcomes.get(strategy) ?? "NO_CHANGE", now);
+  }
+  if (created === 0 && result.proposals.length > 0) logSystemEvent(store, "EVOLUTION_NO_CHANGE", { engine, strategies: ready, reason: "all proposals rejected or produced no Challenger" });
   return created;
+}
+
+export function v2EvolutionReviewScope(strategy: StrategyV2Id, version: number): string { return `v2:${strategy}:core2:v${version}`; }
+function markV2ReviewComplete(store: Store, engine: TradingEngine, strategy: StrategyV2Id, version: number, count: number,
+  outcome: "NO_CHANGE" | "REJECTED" | "CHALLENGER_CREATED", now: number): void {
+  markEvolutionReviewComplete(store, engine, v2EvolutionReviewScope(strategy, version), count, outcome, now);
+  kvSet(store, v2EvolutionStateKey(engine, strategy, version), String(count));
+}
+function markV2ReviewFailure(store: Store, engine: TradingEngine, strategy: StrategyV2Id, version: number, count: number,
+  reason: string, now: number): void {
+  markEvolutionReviewFailure(store, engine, v2EvolutionReviewScope(strategy, version), reason, now);
+  logSystemEvent(store, "EVOLUTION_REVIEW_RETRY_SCHEDULED", { engine, strategy, championVersion: version,
+    evidenceTrades: count, nextRetry: getEvolutionReviewState(store, engine, v2EvolutionReviewScope(strategy, version))?.next_retry_ts });
 }
 
 type ProposalSchemaType = z.infer<typeof ProposalSchema>["proposals"][number];
 
 async function reviewWithCritic(root: string, roles: RoleLlmService, store: Store, proposal: ProposalSchemaType, evidence: unknown): Promise<{
   proposal: ProposalSchemaType | null; verdict: CriticVerdict["verdict"] | "UNAVAILABLE"; confidence: number | null;
-  revisionRound: number; reason: string | null;
+  revisionRound: number; reason: string | null; transientFailure: boolean;
 }> {
   let current = proposal;
   const criticModel = roles.resolve("critic").config.maxRevisionRounds;
   const first = await critiqueV2Proposal(root, roles, { proposal: current, aggregatedEvidence: evidence, revisionRound: 0 });
-  if (!first) return { proposal: null, verdict: "UNAVAILABLE", confidence: null, revisionRound: 0, reason: "Critic unavailable or invalid" };
+  if (!first) return { proposal: null, verdict: "UNAVAILABLE", confidence: null, revisionRound: 0, reason: "Critic unavailable or invalid", transientFailure: true };
   logSystemEvent(store, "CRITIC_REVIEW", { strategy: current.strategy, parentVersion: current.parent_version,
     changedParameter: current.changed_parameter, verdict: first.verdict, confidence: first.confidence,
     revisionRound: 0, criticModel: roles.resolve("critic").config.model, issues: first.issues });
-  if (first.verdict === "ACCEPT") return { proposal: current, verdict: first.verdict, confidence: first.confidence, revisionRound: 0, reason: null };
-  if (first.verdict === "REJECT") return { proposal: null, verdict: first.verdict, confidence: first.confidence, revisionRound: 0, reason: first.issues.join("; ") || "Critic rejected proposal" };
-  if (criticModel < 1) return { proposal: null, verdict: first.verdict, confidence: first.confidence, revisionRound: 0, reason: "Critic revision disabled" };
+  if (first.verdict === "ACCEPT") return { proposal: current, verdict: first.verdict, confidence: first.confidence, revisionRound: 0, reason: null, transientFailure: false };
+  if (first.verdict === "REJECT") return { proposal: null, verdict: first.verdict, confidence: first.confidence, revisionRound: 0, reason: first.issues.join("; ") || "Critic rejected proposal", transientFailure: false };
+  if (criticModel < 1) return { proposal: null, verdict: first.verdict, confidence: first.confidence, revisionRound: 0, reason: "Critic revision disabled", transientFailure: false };
 
   const evolutionPrompt = readFileSync(path.join(root, "prompts/evolution-v2.md"), "utf8");
   const revision = await roles.json("evolution", evolutionPrompt, JSON.stringify({
@@ -218,18 +285,18 @@ async function reviewWithCritic(root: string, roles: RoleLlmService, store: Stor
   }), ProposalSchema, "v2_proposal_revision");
   if (!revision || revision.proposals.length !== 1 || revision.proposals[0]?.strategy !== proposal.strategy
     || revision.proposals[0]?.parent_version !== proposal.parent_version) {
-    return { proposal: null, verdict: "REVISE", confidence: first.confidence, revisionRound: 1, reason: "Evolution did not return one revision for the same parent and strategy" };
+    return { proposal: null, verdict: "REVISE", confidence: first.confidence, revisionRound: 1, reason: "Evolution did not return one revision for the same parent and strategy", transientFailure: !revision };
   }
   current = revision.proposals[0];
   const finalReview = await critiqueV2Proposal(root, roles, { proposal: current, aggregatedEvidence: evidence, revisionRound: 1,
     previousCritique: { issues: first.issues, reasoning_summary: first.reasoning_summary } });
-  if (!finalReview) return { proposal: null, verdict: "UNAVAILABLE", confidence: null, revisionRound: 1, reason: "Critic unavailable after revision" };
+  if (!finalReview) return { proposal: null, verdict: "UNAVAILABLE", confidence: null, revisionRound: 1, reason: "Critic unavailable after revision", transientFailure: true };
   logSystemEvent(store, "CRITIC_REVIEW", { strategy: current.strategy, parentVersion: current.parent_version,
     changedParameter: current.changed_parameter, verdict: finalReview.verdict, confidence: finalReview.confidence,
     revisionRound: 1, criticModel: roles.resolve("critic").config.model, issues: finalReview.issues });
   if (finalReview.verdict !== "ACCEPT") return { proposal: null, verdict: finalReview.verdict, confidence: finalReview.confidence,
-    revisionRound: 1, reason: finalReview.issues.join("; ") || "Critic did not accept the single revision" };
-  return { proposal: current, verdict: finalReview.verdict, confidence: finalReview.confidence, revisionRound: 1, reason: null };
+    revisionRound: 1, reason: finalReview.issues.join("; ") || "Critic did not accept the single revision", transientFailure: false };
+  return { proposal: current, verdict: finalReview.verdict, confidence: finalReview.confidence, revisionRound: 1, reason: null, transientFailure: false };
 }
 
 function normalizedMfe(trade: ClosedEvidence): number { const risk = Math.abs(Number(trade.entry_px) - Number(trade.initial_stop_px)); return risk > 0 ? Number(trade.mfe ?? 0) / risk : 0; }

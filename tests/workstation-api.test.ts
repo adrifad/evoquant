@@ -66,6 +66,27 @@ test("opportunity funnel API exposes persisted 24h/7d engine aggregates", async 
   assert.equal(week.windowHours, 168);
 });
 
+test("loss attribution API excludes incomplete accounting from trusted results", async t => {
+  const f = await fixture(t);
+  const now = new Date().toISOString();
+  const add = f.store.db.prepare(`INSERT INTO trades(trade_id,engine,result_r_basis,status,evidence_state,evolution_evidence_eligible,
+    accounting_quality,instrument,timeframe,side,strategy,strategy_core_version,strategy_version,regime,contracts,entry_ts,exit_ts,
+    pnl,fees,funding,result_r,mfe,mae,duration_s,exit_reason) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
+  add.run("LOSS-API-VALID", "SCALP_5M", "NET", "CLOSED", "VALID", 1, "COMPLETE", "BTC-USDT-SWAP", "scalp", "SHORT",
+    "SCALP", 1, 1, "SIDEWAYS", "1", now, now, -3, 1, 0.5, -0.3, 1, 2, 300, "SL");
+  add.run("LOSS-API-PENDING", "SCALP_5M", "PENDING", "CLOSED", "EVIDENCE_PENDING", 0, "FUNDING_PENDING", "ETH-USDT-SWAP", "scalp", "LONG",
+    "SCALP", 1, 1, "UNKNOWN", "1", now, now, null, 1, null, null, null, null, 300, "SL");
+  const result = await json<{ accounting: { closedTrades: number; completeValidNetTrades: number; byEvidenceState: Record<string, number> };
+    overall: { tradeCount: number; totalNetPnlUsdt: number }; unavailable: string[] }>(await f.request("/api/loss-attribution?window=30d"));
+  assert.equal(result.accounting.closedTrades, 2);
+  assert.equal(result.accounting.completeValidNetTrades, 1);
+  assert.equal(result.accounting.byEvidenceState.EVIDENCE_PENDING, 1);
+  assert.equal(result.overall.tradeCount, 1);
+  assert.equal(result.overall.totalNetPnlUsdt, -3);
+  assert.ok(result.unavailable.includes("gate_decision_causality"));
+  assert.equal((await f.request("/api/loss-attribution?window=forever")).status, 400);
+});
+
 test("manual watchlist failures stay non-successful and disclose preserved stale state", async t => {
   const projection = (): WatchlistProjection => ({ generated_at: "2026-10-09T00:15:00.000Z", stale: true, stale_age_ms: 86_400_000, next_refresh: "2026-10-11T00:15:00.000Z", status: "STALE", core: [{ symbol, kind: "CORE" }], dynamic: [], active: [symbol], statistics: { discovered: 0, basic: 0, analyzed: 0, qualifying: 0, selected: 0, requestCount: 0, durationMs: 0 } });
   const f = await fixture(t, { projection, refreshManual: async () => { throw new DynamicWatchlistError("DYNAMIC_WATCHLIST_REFRESH_FAILED", 503, true); } });

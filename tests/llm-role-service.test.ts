@@ -8,6 +8,7 @@ import { RoleLlmService, roleEnvironmentUpdates } from "../src/core/llm-role-ser
 import { openStore } from "../src/memory/db.ts";
 import { REPO_ROOT } from "../src/core/env.ts";
 import { fetchStance } from "../src/agents/scalp-agent.ts";
+import type { LlmRole } from "../src/core/llm-roles.ts";
 
 const OkSchema = z.object({ ok: z.boolean() });
 
@@ -232,6 +233,110 @@ test("role health preserves safe structured-output failure classes", async () =>
   } finally { f.close(); }
 });
 
+test("role ledger correlates one schema repair and records safe repair outcome", async () => {
+  let calls = 0;
+  const f = fixture({ LLM_GATE_BASE_URL: "https://gate.test/v1", LLM_GATE_API_KEY: "fake-gate-secret" }, async () => {
+    calls++;
+    const content = calls === 1 ? '{"verdict":"DENY","confidence":"bad","reasoning":[],"risk_flags":[]}'
+      : '{"verdict":"DENY","confidence":0.8,"reasoning":[],"risk_flags":[]}';
+    return new Response(JSON.stringify({ choices: [{ message: { content } }], usage: { prompt_tokens: 10, completion_tokens: 4 } }));
+  });
+  try {
+    const { CandidateGateSchema } = await import("../src/agents/decision-agent.ts");
+    const result = await f.service.json("gate", "gate", "private market context fixture", CandidateGateSchema, "candidate_gate");
+    assert.equal(result?.verdict, "DENY");
+    const run = f.store.db.prepare(`SELECT status,provider_requests,correlation_id,schema_repair_attempts,
+      schema_repair_succeeded,initial_failure_reason,input_tokens,output_tokens FROM llm_runs WHERE role='gate'`).get() as Record<string, unknown>;
+    assert.deepEqual(run, { status: "SUCCESS", provider_requests: 2, correlation_id: run.correlation_id,
+      schema_repair_attempts: 1, schema_repair_succeeded: 1, initial_failure_reason: "SCHEMA_MISMATCH", input_tokens: 20, output_tokens: 8 });
+    assert.equal(typeof run.correlation_id, "string");
+    const requests = f.store.db.prepare("SELECT correlation_id,request_kind,retry FROM llm_provider_requests ORDER BY id").all() as Array<Record<string, unknown>>;
+    assert.equal(requests.length, 2);
+    assert.equal(requests[0]?.request_kind, "PRIMARY");
+    assert.equal(requests[1]?.request_kind, "SCHEMA_REPAIR");
+    assert.equal(requests[0]?.correlation_id, run.correlation_id);
+    const diagnostic = f.service.diagnostics().gate;
+    assert.equal(diagnostic.schemaRepairAttempts24h, 1);
+    assert.equal(diagnostic.schemaRepairSuccesses24h, 1);
+    const health = f.service.settings().find(role => role.role === "gate");
+    assert.equal(health?.providerRequestsToday, 2);
+    assert.equal(health?.inputTokensToday, 20);
+    assert.equal(health?.outputTokensToday, 8);
+    const persisted = JSON.stringify({ runs: f.store.db.prepare("SELECT * FROM llm_runs").all(), events: f.store.db.prepare("SELECT payload FROM system_events").all() });
+    assert.equal(persisted.includes("fake-gate-secret"), false);
+    assert.equal(persisted.includes("private market context fixture"), false, "the raw request content is not stored in run diagnostics");
+  } finally { f.close(); }
+});
+
+test("one bounded schema repair validates production output contracts for all five roles", async () => {
+  const fixtures: Array<{ model: string; bad: unknown; good: unknown }> = [
+    { model: "gate-probe", bad: { verdict: "DENY", confidence: "bad", reasoning: [], risk_flags: [] }, good: { verdict: "DENY", confidence: 0.8, reasoning: [], risk_flags: [] } },
+    { model: "scalp-probe", bad: { stance: "DEFENSIVE", confidence: "bad", reason: "veto" }, good: { stance: "DEFENSIVE", confidence: 0.8, reason: "veto" } },
+    { model: "scalp-probe", bad: { verdict: "DENY", confidence: "bad", reason: "veto" }, good: { verdict: "DENY", confidence: 0.8, reason: "veto" } },
+    { model: "reviewer-probe", bad: { observations: [{ factor: "x", effect: "invented", evidence: "fixture" }], lesson_candidates: [] }, good: { observations: [], assumptions_check: { thesis_correct: [], thesis_failed: [] }, lesson_candidates: [] } },
+    { model: "evolution-probe", bad: { proposals: [], no_change_reason: null, extra: true }, good: { proposals: [], no_change_reason: "No bounded change is supported." } },
+    { model: "critic-probe", bad: { verdict: "REJECT", confidence: "bad", issues: [], reasoning_summary: [] }, good: { verdict: "REJECT", confidence: 0.8, issues: [], reasoning_summary: [] } },
+  ];
+  let requestIndex = 0;
+  const env: Record<string, string> = {};
+  for (const [role, model] of [["GATE", "gate-probe"], ["SCALP", "scalp-probe"], ["REVIEWER", "reviewer-probe"], ["EVOLUTION", "evolution-probe"], ["CRITIC", "critic-probe"]]) {
+    env[`LLM_${role}_BASE_URL`] = `https://${String(role).toLowerCase()}.test/v1`;
+    env[`LLM_${role}_API_KEY`] = `secret-${String(role).toLowerCase()}`;
+    env[`LLM_${role}_MODEL`] = String(model);
+  }
+  const f = fixture(env, async (_url, init) => {
+    const body = JSON.parse(String(init?.body)) as { model: string };
+    const selected = fixtures[Math.floor(requestIndex / 2)];
+    assert.equal(body.model, selected?.model);
+    const response = selected?.[requestIndex % 2 === 0 ? "bad" : "good"];
+    requestIndex++;
+    return new Response(JSON.stringify({ choices: [{ message: { content: JSON.stringify(response) } }] }));
+  });
+  try {
+    const { CandidateGateSchema } = await import("../src/agents/decision-agent.ts");
+    const { StanceSchema, ScalpCandidateGateSchema } = await import("../src/agents/scalp-agent.ts");
+    const { ReviewSchema } = await import("../src/agents/reviewer-agent.ts");
+    const { ProposalSchema } = await import("../src/agents/v2-evolution.ts");
+    const { CriticSchema } = await import("../src/agents/critic-agent.ts");
+    const cases: Array<[LlmRole, z.ZodType<unknown>, string]> = [
+      ["gate", CandidateGateSchema, "diagnostic_schema_gate"],
+      ["scalp", StanceSchema, "diagnostic_schema_scalp_stance"],
+      ["scalp", ScalpCandidateGateSchema, "diagnostic_schema_scalp_gate"],
+      ["reviewer", ReviewSchema, "diagnostic_schema_reviewer"],
+      ["evolution", ProposalSchema, "diagnostic_schema_evolution"],
+      ["critic", CriticSchema, "diagnostic_schema_critic"],
+    ];
+    for (const [role, schema, context] of cases) {
+      const value = await f.service.json(role, "schema fixture", "harmless diagnostic", schema, context);
+      assert.ok(value, `${role}:${context} should pass its production schema after at most one format repair`);
+    }
+    assert.equal(requestIndex, 12);
+    assert.equal(f.service.diagnostics().gate.schemaRepairSuccesses24h, 1);
+    assert.equal(f.service.diagnostics().scalp.schemaRepairSuccesses24h, 2);
+    assert.equal(f.service.diagnostics().reviewer.schemaRepairSuccesses24h, 1);
+    assert.equal(f.service.diagnostics().evolution.schemaRepairSuccesses24h, 1);
+    assert.equal(f.service.diagnostics().critic.schemaRepairSuccesses24h, 1);
+  } finally { f.close(); }
+});
+
+test("schema repair is denied by exhausted provider-request budget and is never retried again", async () => {
+  let requests = 0;
+  const f = fixture({ LLM_GATE_BASE_URL: "https://gate.test/v1", LLM_GATE_API_KEY: "gate-secret",
+    LLM_GATE_MAX_CALLS_PER_HOUR: "1" }, async () => {
+    requests++;
+    return new Response(JSON.stringify({ choices: [{ message: { content: '{"verdict":"DENY","confidence":"invalid","reasoning":[],"risk_flags":[]}' } }] }));
+  });
+  try {
+    const { CandidateGateSchema } = await import("../src/agents/decision-agent.ts");
+    const result = await f.service.json("gate", "system", "user", CandidateGateSchema, "budget_repair");
+    assert.equal(result, null);
+    assert.equal(requests, 1);
+    const run = f.store.db.prepare("SELECT status,provider_requests,schema_repair_attempts FROM llm_runs WHERE role='gate'").get();
+    assert.deepEqual(run, { status: "BUDGET_EXHAUSTED", provider_requests: 1, schema_repair_attempts: 0 });
+    assert.equal((f.store.db.prepare("SELECT COUNT(*) count FROM llm_provider_requests WHERE role='gate'").get() as { count: number }).count, 1);
+  } finally { f.close(); }
+});
+
 test("new role health has no request or failure history", () => {
   const f = fixture({ LLM_GATE_BASE_URL: "https://gate.test/v1", LLM_GATE_API_KEY: "key" }, async () => successResponse());
   try {
@@ -307,6 +412,7 @@ test("llm run ledger migration exists and contains no secret column", () => {
   const f = fixture({}, async () => successResponse());
   try {
     const columns = (f.store.db.prepare("PRAGMA table_info(llm_runs)").all() as Array<{ name: string }>).map((column) => column.name);
-    assert.deepEqual(columns, ["id", "ts", "role", "provider", "model", "status", "latency_ms", "input_tokens", "output_tokens", "error_class", "context_ref", "provider_requests", "http_status", "failure_reason"]);
+    assert.deepEqual(columns, ["id", "ts", "role", "provider", "model", "status", "latency_ms", "input_tokens", "output_tokens", "error_class", "context_ref",
+      "correlation_id", "schema_repair_attempts", "schema_repair_succeeded", "initial_failure_reason", "provider_requests", "http_status", "failure_reason"]);
   } finally { f.close(); }
 });

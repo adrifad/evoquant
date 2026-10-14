@@ -102,6 +102,36 @@ test("temporary funding failure remains pending and never assumes zero", async t
   assert.deepEqual(reviewerEligibleTradeIds(store), []);
 });
 
+test("missing exact instrument metadata increments bounded evidence retries and later finalizes", async t => {
+  const store = withStore(t); seedPending(store, "META");
+  let now = exitMs + 5 * 60_000;
+  const base = deps(store, (endpoint, query) => {
+    if (endpoint === "/api/v5/trade/fills") return fills(String(query?.ordId));
+    if (endpoint === "/api/v5/account/bills") return [];
+    if (endpoint === "/api/v5/market/candles") return confirmedCandles;
+    throw new Error(endpoint);
+  }, now);
+  base.instruments = {};
+  base.now = () => now;
+  assert.equal(await finalizePendingEvidence(base), 0);
+  let row = store.db.prepare("SELECT evidence_state,evidence_attempts,evidence_reason,evidence_next_retry_ts FROM trades WHERE trade_id='META'").get() as {
+    evidence_state: string; evidence_attempts: number; evidence_reason: string; evidence_next_retry_ts: string;
+  };
+  assert.deepEqual({ ...row, evidence_next_retry_ts: null }, { evidence_state: "EVIDENCE_PENDING", evidence_attempts: 1,
+    evidence_reason: "INSTRUMENT_METADATA_PENDING", evidence_next_retry_ts: null });
+  assert.equal(Date.parse(row.evidence_next_retry_ts), now + 60_000);
+  now += 60_000;
+  assert.equal(await finalizePendingEvidence(base), 0);
+  row = store.db.prepare("SELECT evidence_state,evidence_attempts,evidence_reason,evidence_next_retry_ts FROM trades WHERE trade_id='META'").get() as typeof row;
+  assert.equal(row.evidence_attempts, 2);
+  assert.equal(Date.parse(row.evidence_next_retry_ts), now + 120_000);
+  now += 120_000;
+  base.instruments = { [symbol]: meta };
+  assert.equal(await finalizePendingEvidence(base), 1);
+  assert.deepEqual(store.db.prepare("SELECT evidence_state,evidence_attempts,result_r_basis,evolution_evidence_eligible FROM trades WHERE trade_id='META'").get(),
+    { evidence_state: "VALID", evidence_attempts: 2, result_r_basis: "NET", evolution_evidence_eligible: 1 });
+});
+
 test("a scalp waits for its current 1m candle then finalizes idempotently", async t => {
   const store = withStore(t); seedPending(store, "S1", "SCALP_5M");
   let confirmed = false;

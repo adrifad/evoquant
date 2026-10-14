@@ -149,9 +149,11 @@ async function finalizeOne(d: EvidenceFinalizerDeps, candidate: Record<string, u
     const meta = d.instruments[String(t.instrument)]; const ctVal = meta?.instId === String(t.instrument) ? finite(meta.ctVal) : null;
     const initialStop = finite(t.initial_stop_px ?? t.stop_px);
     if (ctVal === null || ctVal <= 0) {
+      const attempt = Math.min(2_147_483_647, Number(t.evidence_attempts ?? 0) + 1);
       d.store.db.prepare(`UPDATE trades SET evidence_state='EVIDENCE_PENDING', evolution_evidence_eligible=0,
-        evidence_reason='INSTRUMENT_METADATA_PENDING', evidence_next_retry_ts=? WHERE trade_id=? AND evidence_state='EVIDENCE_PENDING'`)
-        .run(new Date(now + retryDelayMs(Number(t.evidence_attempts ?? 0) + 1)).toISOString(), tradeId);
+        evidence_attempts=?, evidence_reason='INSTRUMENT_METADATA_PENDING', evidence_next_retry_ts=?
+        WHERE trade_id=? AND evidence_state='EVIDENCE_PENDING'`)
+        .run(attempt, new Date(now + retryDelayMs(attempt)).toISOString(), tradeId);
       logSystemEvent(d.store, "STATE", { tradeId, evidence: "EVIDENCE_PENDING", reason: "INSTRUMENT_METADATA_PENDING" });
       return false;
     }

@@ -18,17 +18,19 @@ export function recordDecision(
   store: Store,
   d: {
     decisionId: string; ts: string; instrument: string; decision: string;
+    gateResult?: "ALLOW" | "DENY" | "ERROR" | "NOT_EVALUATED" | undefined;
     strategy?: string | undefined; regime: string; rawConfidence?: number | undefined; calibratedConfidence?: number | undefined;
     thesis?: string[] | undefined; riskVerdict: unknown;
   },
 ): void {
   store.db
     .prepare(
-      `INSERT INTO decisions(decision_id,ts,instrument,decision,strategy,regime,raw_confidence,calibrated_confidence,thesis,risk_verdict)
-       VALUES(@decisionId,@ts,@instrument,@decision,@strategy,@regime,@rawConfidence,@calibratedConfidence,@thesis,@riskVerdict)`,
+      `INSERT INTO decisions(decision_id,ts,instrument,decision,gate_result,strategy,regime,raw_confidence,calibrated_confidence,thesis,risk_verdict)
+       VALUES(@decisionId,@ts,@instrument,@decision,@gateResult,@strategy,@regime,@rawConfidence,@calibratedConfidence,@thesis,@riskVerdict)`,
     )
     .run({
       ...d,
+      gateResult: d.gateResult ?? null,
       strategy: d.strategy ?? null,
       rawConfidence: d.rawConfidence ?? null,
       calibratedConfidence: d.calibratedConfidence ?? null,

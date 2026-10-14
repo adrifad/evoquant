@@ -36,6 +36,7 @@ import { getCandles, type Bar } from "../exchange/okx/market.ts";
 import { portfolioOpenRisk } from "../risk/portfolio-open-risk.ts";
 import { DynamicWatchlistError, type WatchlistProjection } from "../market/dynamic-watchlist.ts";
 import { getOpportunityFunnel, getRecentCandidateAttempts } from "../market/opportunity-funnel.ts";
+import { buildLossAttribution } from "../memory/loss-attribution.ts";
 
 const log = createLogger("dashboard");
 const REPO_ROOT = path.resolve(import.meta.dirname, "../..");
@@ -175,6 +176,14 @@ export function startDashboard(cfg: DashboardConfig): DashboardServer {
       const rows = store.db.prepare("SELECT trade_id,instrument,side,strategy,strategy_core_version,strategy_version,regime,entry_px,initial_stop_px,stop_px,take_profit_px,exit_px,result_r,result_r_basis,pnl,fees,funding,accounting_quality,evidence_state,evidence_reason,evolution_evidence_eligible,duration_s,exit_reason,exit_ts,status,calibrated_confidence,contracts,entry_ts,leverage,mfe,mae,planned_risk_pct FROM trades ORDER BY COALESCE(exit_ts,entry_ts) DESC LIMIT 100").all() as Array<Record<string, unknown>>;
       const exchange = await exchangeSnapshot();
       return send(200, rows.map(t => projectTrade(t, exchange.positions, finite(exchange.balance?.details.find(d => d.ccy === "USDT")?.eq))));
+    }
+    if (p === "/api/loss-attribution") {
+      if (method !== "GET") return send(405, { error: "Method not allowed." });
+      const window = url.searchParams.get("window") ?? "30d";
+      const duration = window === "24h" ? 24 * 60 * 60_000 : window === "7d" ? 7 * 24 * 60 * 60_000 : window === "30d" ? 30 * 24 * 60 * 60_000 : null;
+      if (window !== "all" && duration === null) return send(400, { error: "window must be 24h, 7d, 30d, or all." });
+      const since = duration === null ? null : new Date(Date.now() - duration).toISOString();
+      return send(200, buildLossAttribution(store, since));
     }
     if (method === "GET" && p.startsWith("/api/trades/")) {
       const tradeId = decodeURIComponent(p.slice("/api/trades/".length));

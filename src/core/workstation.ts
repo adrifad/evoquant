@@ -1,7 +1,8 @@
 import type { Store } from "../memory/db.ts";
 import { kvGet } from "../memory/db.ts";
 import { getV2Champions, listV2Versions, V2_STRATEGIES } from "../strategy/v2-registry.ts";
-import { getV2EvolutionEvidence, v2EvolutionStateKey } from "../agents/v2-evolution.ts";
+import { getV2EvolutionEvidence, v2EvolutionReviewScope, v2EvolutionStateKey } from "../agents/v2-evolution.ts";
+import { getEvolutionReviewState } from "../agents/evolution-review-state.ts";
 import { summarize } from "../evaluation/performance.ts";
 import { familyForV2 } from "../strategy/identity.ts";
 import type { ScanRow } from "../strategy/scanner.ts";
@@ -85,13 +86,18 @@ export function evolutionFamilies(store: Store, minimum: number, interval: numbe
   return V2_STRATEGIES.map(strategy => {
     const champion = champions[strategy];
     const evidence = getV2EvolutionEvidence(store, strategy, champion.version);
-    const last = Number(kvGet(store, v2EvolutionStateKey("SWING_15M", strategy, champion.version)) ?? 0);
+    const reviewState = getEvolutionReviewState(store, "SWING_15M", v2EvolutionReviewScope(strategy, champion.version));
+    const last = reviewState?.last_success_trade_count ?? Number(kvGet(store, v2EvolutionStateKey("SWING_15M", strategy, champion.version)) ?? 0);
     const versions = listV2Versions(store, strategy);
     const challenger = versions.find(v => v.status === "CHALLENGER" || v.status === "SHADOW") ?? null;
     const evaluation = challenger ? store.db.prepare("SELECT * FROM strategy_v2_evaluations WHERE strategy=? AND challenger_version=? ORDER BY id DESC LIMIT 1").get(strategy, challenger.version) : null;
     const target = Math.max(minimum, last + interval);
     return { family: familyForV2(strategy), champion, challenger, versions, sample: evidence.length,
       nextReview: target, remaining: Math.max(0, target - evidence.length), lastReviewed: last,
+      review: reviewState ? { lastOutcome: reviewState.last_outcome, lastAttemptAt: reviewState.last_attempt_ts,
+        lastSuccessAt: reviewState.last_success_ts, lastNoChangeAt: reviewState.last_no_change_ts,
+        lastFailureAt: reviewState.last_failure_ts, lastFailureReason: reviewState.last_failure_reason,
+        failureCount: reviewState.failure_count, nextRetryAt: reviewState.next_retry_ts } : null,
       performance: evidence.length ? summarize(evidence.map(row => row.result_r)) : null, evaluation };
   });
 }

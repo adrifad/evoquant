@@ -3,19 +3,23 @@ import assert from "node:assert/strict";
 import { mkdtempSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { openStore } from "../src/memory/db.ts";
+import { kvGet, kvSet, openStore } from "../src/memory/db.ts";
 import { DEFAULT_V2_PARAMS, type StrategyV2Id } from "../src/strategy/core-v2.ts";
 import { evaluateV2Setup } from "../src/strategy/core-v2.ts";
 import { identityForV2 } from "../src/strategy/identity.ts";
 import { closeTrade, openTrade } from "../src/memory/trades.ts";
 import { createV2Challenger, ensureV2Registry, getV2Champions, listV2Versions, transitionV2Version } from "../src/strategy/v2-registry.ts";
-import { evolutionReviewEligible, getV2EvolutionEvidence, validateV2Proposal, v2EvolutionStateKey } from "../src/agents/v2-evolution.ts";
+import { evolutionReviewEligible, getVerifiedV2Lessons, getV2EvolutionEvidence, maybeEvolveV2Strategies,
+  validateV2Proposal, v2EvolutionReviewScope, v2EvolutionStateKey } from "../src/agents/v2-evolution.ts";
 import { measureContributions } from "../src/learning/signal-weights.ts";
+import { upsertLesson } from "../src/memory/lessons.ts";
 import { calculateExecutionCostR, DEFAULT_V2_COSTS } from "../src/evaluation/backtest.ts";
 import { evaluateV2Lifecycle } from "../src/evaluation/v2-promotion.ts";
 import { processShadowCycle, shadowExperimentId } from "../src/evaluation/shadow-challenger.ts";
 import { resolveRuntimePolicy } from "../src/core/runtime-policy.ts";
 import { runOncePerGlobalCycle } from "../src/core/global-cycle.ts";
+import { evolutionReviewDue, getEvolutionReviewState, markEvolutionReviewAttempt, markEvolutionReviewComplete,
+  markEvolutionReviewFailure } from "../src/agents/evolution-review-state.ts";
 import type { Candle } from "../src/exchange/okx/types.ts";
 import type { FeatureSnapshot } from "../src/market/features.ts";
 import type { V2PromotionCriteria } from "../src/evaluation/v2-promotion.ts";
@@ -83,6 +87,105 @@ test("V2 proposals validate each family schema and only permit one bounded param
     changedParameter: "max_extension_atr", oldValue: 1.2, newValue: 1.5 }, { version: 2, params: trend }, 1, 10).ok, false);
   assert.equal(validateV2Proposal({ strategy: "TREND_FOLLOWING_V2", parentVersion: 2,
     changedParameter: "max_extension_atr", oldValue: 1.2, newValue: 1.1 }, { version: 2, params: trend }, 2, 10).ok, false);
+});
+
+test("Evolution distinguishes failed attempts from completed no-change reviews and retries with bounded backoff", () => {
+  const db = store();
+  const now = Date.parse("2026-10-14T12:00:00.000Z");
+  const scope = "v2:TREND_FOLLOWING_V2:core2:v2";
+  assert.equal(evolutionReviewDue(null, 20, 20, 15, now), true);
+  markEvolutionReviewAttempt(db, "SWING_15M", scope, 20, now);
+  markEvolutionReviewFailure(db, "SWING_15M", scope, "PROPOSAL_GENERATION_UNAVAILABLE_OR_INVALID", now);
+  let state = getEvolutionReviewState(db, "SWING_15M", scope)!;
+  assert.equal(state.last_success_trade_count, 0, "a failed model response cannot consume the completed-review checkpoint");
+  assert.equal(state.last_outcome, "FAILED");
+  assert.equal(state.next_retry_ts, new Date(now + 60_000).toISOString());
+  assert.equal(state.last_failure_reason, "PROPOSAL_GENERATION_UNAVAILABLE_OR_INVALID");
+  assert.equal(evolutionReviewDue(state, 20, 20, 15, now + 59_999), false);
+  assert.equal(evolutionReviewDue(state, 20, 20, 15, now + 60_000), true);
+
+  markEvolutionReviewAttempt(db, "SWING_15M", scope, 20, now + 60_000);
+  markEvolutionReviewComplete(db, "SWING_15M", scope, 20, "NO_CHANGE", now + 60_000);
+  state = getEvolutionReviewState(db, "SWING_15M", scope)!;
+  assert.equal(state.last_success_trade_count, 20);
+  assert.equal(state.last_outcome, "NO_CHANGE");
+  assert.equal(state.last_no_change_ts, new Date(now + 60_000).toISOString());
+  assert.equal(state.last_failure_reason, "PROPOSAL_GENERATION_UNAVAILABLE_OR_INVALID", "recovery preserves prior failure history");
+  assert.equal(state.next_retry_ts, null);
+  assert.equal(evolutionReviewDue(state, 20, 20, 15, now + 60_000), false);
+  db.close();
+});
+
+test("V2 evolution consumes only statistically verified lessons scoped to the active engine and strategy", () => {
+  const db = store();
+  const make = (statement: string, engine: "SWING_15M" | "SCALP_5M", strategy: string) => upsertLesson(db, {
+    statement, scope: { engine, strategy, strategyVersion: 2 }, confidence: 0.8,
+  });
+  const relevant = make("Verified trend evidence", "SWING_15M", "TREND_FOLLOWING");
+  const wrongEngine = make("Scalp evidence", "SCALP_5M", "TREND_FOLLOWING");
+  const wrongFamily = make("Breakout evidence", "SWING_15M", "BREAKOUT");
+  db.db.prepare("UPDATE lessons SET status='VERIFIED',observations=30,expectancy_r=0.4 WHERE lesson_id IN (?,?,?)")
+    .run(relevant, wrongEngine, wrongFamily);
+  const rows = getVerifiedV2Lessons(db, "TREND_FOLLOWING_V2", 2, "SWING_15M");
+  assert.deepEqual(rows.map(row => row.lesson_id), [relevant]);
+  db.close();
+});
+
+function seedActiveChampionEvidence(db: ReturnType<typeof store>, count: number): { strategy: StrategyV2Id; version: number } {
+  ensureV2Registry(db);
+  const strategy = "TREND_FOLLOWING_V2" as const;
+  const version = getV2Champions(db)[strategy].version;
+  const insert = db.db.prepare(`INSERT INTO trades(trade_id,engine,result_r_basis,status,evidence_state,evolution_evidence_eligible,
+    accounting_quality,instrument,timeframe,side,strategy,strategy_core_version,strategy_version,regime,regime_axes,contracts,
+    entry_px,initial_stop_px,exit_px,entry_ts,exit_ts,exit_reason,fees,funding,pnl,result_r,mfe,mae,duration_s,entry_features)
+    VALUES(?,'SWING_15M','NET','CLOSED','VALID',1,'COMPLETE','BTC-USDT-SWAP','15m','LONG','TREND_FOLLOWING',2,?,
+      'TRENDING_BULLISH','{}','1',100,98,102,?,?, 'TP',0,0,2,1,2,1,900,'{}')`);
+  for (let i = 0; i < count; i++) insert.run(`EVOLUTION-EVIDENCE-${i}`, version,
+    new Date(Date.UTC(2026, 0, 1, 0, i)).toISOString(), new Date(Date.UTC(2026, 0, 1, 0, i + 1)).toISOString());
+  return { strategy, version };
+}
+
+test("V2 model failure does not advance completed review checkpoint and immediate cycles respect retry backoff", async () => {
+  const db = store();
+  const { strategy, version } = seedActiveChampionEvidence(db, 20);
+  let calls = 0;
+  const roles = { json: async () => { calls++; return null; } } as never;
+  const config = { intervalTrades: 15, minimumSample: 20, maxParamChanges: 1, maxParamDeltaPct: 10 };
+  assert.equal(await maybeEvolveV2Strategies(process.cwd(), roles, db, config), 0);
+  const state = getEvolutionReviewState(db, "SWING_15M", v2EvolutionReviewScope(strategy, version))!;
+  assert.equal(state.last_outcome, "FAILED");
+  assert.equal(state.last_success_trade_count, 0);
+  assert.equal(Number(kvGet(db, v2EvolutionStateKey("SWING_15M", strategy, version)) ?? 0), 0);
+  assert.equal(calls, 1);
+  assert.equal(await maybeEvolveV2Strategies(process.cwd(), roles, db, config), 0);
+  assert.equal(calls, 1, "a normal global cycle must not repeat the failed role request before retry time");
+  db.close();
+});
+
+test("valid V2 no-proposal response is recorded as completed no-change and advances its evidence checkpoint", async () => {
+  const db = store();
+  const { strategy, version } = seedActiveChampionEvidence(db, 20);
+  const roles = { json: async () => ({ proposals: [], no_change_reason: "Current Champion remains supported." }) } as never;
+  const config = { intervalTrades: 15, minimumSample: 20, maxParamChanges: 1, maxParamDeltaPct: 10 };
+  assert.equal(await maybeEvolveV2Strategies(process.cwd(), roles, db, config), 0);
+  const state = getEvolutionReviewState(db, "SWING_15M", v2EvolutionReviewScope(strategy, version))!;
+  assert.equal(state.last_outcome, "NO_CHANGE");
+  assert.equal(state.last_success_trade_count, 20);
+  assert.ok(state.last_no_change_ts);
+  assert.equal(Number(kvGet(db, v2EvolutionStateKey("SWING_15M", strategy, version))), 20);
+  db.close();
+});
+
+test("V2 review upgrade honors an existing successful legacy evidence checkpoint", async () => {
+  const db = store();
+  const { strategy, version } = seedActiveChampionEvidence(db, 20);
+  kvSet(db, v2EvolutionStateKey("SWING_15M", strategy, version), "20");
+  let calls = 0;
+  const roles = { json: async () => { calls++; return null; } } as never;
+  assert.equal(await maybeEvolveV2Strategies(process.cwd(), roles, db,
+    { intervalTrades: 15, minimumSample: 20, maxParamChanges: 1, maxParamDeltaPct: 10 }), 0);
+  assert.equal(calls, 0, "a pre-migration completed checkpoint remains authoritative until new evidence accumulates");
+  db.close();
 });
 
 test("V2 candidate persistence flows into isolated net evidence, learning, and version-scoped evolution cadence", () => {

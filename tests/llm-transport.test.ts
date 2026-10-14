@@ -20,7 +20,7 @@ test("OpenAI-compatible transport retries a bounded rate limit and applies role 
   }, async (ms) => { waits.push(ms); });
 
   assert.deepEqual(result, { value: { ok: true }, status: "SUCCESS", attempts: 2,
-    latencyMs: result.latencyMs, inputTokens: 4, outputTokens: 2 });
+    latencyMs: result.latencyMs, tokenUsageComplete: false, inputTokens: 4, outputTokens: 2 });
   assert.equal(calls, 2);
   assert.deepEqual(waits, [250]);
   assert.equal(requestBody.model, "role-model");
@@ -88,6 +88,63 @@ test("transport never treats reasoning content as a final answer", async () => {
   assert.equal(result.status, "INVALID_RESPONSE");
   assert.equal(result.failureReason, "EMPTY_CONTENT");
   assert.equal(result.value, null);
+});
+
+test("format repair uses one budgeted request and preserves an explicit Gate DENY", async () => {
+  let calls = 0;
+  const requestKinds: string[] = [];
+  const result = await llmJsonDetailed({ baseUrl: "https://provider.test/v1", apiKey: "key", model: "gate",
+    retryCount: 2, preserveDecisionField: "verdict", beforeRequest: kind => { requestKinds.push(kind); return true; } },
+  "gate instructions", "candidate context", z.object({ verdict: z.enum(["ALLOW", "DENY"]), confidence: z.number(), reason: z.string() }).strict(),
+  async (_url, init) => {
+    calls++;
+    if (calls === 1) return new Response(JSON.stringify({ choices: [{ message: { content: '{"verdict":"DENY","confidence":"bad","reason":"no"}' } }] }));
+    const body = JSON.parse(String(init?.body)) as { messages: Array<{ content: string }> };
+    assert.ok(body.messages[0]?.content.includes("FORMAT REPAIR"));
+    assert.ok(body.messages[1]?.content.includes("invalid_response_untrusted"));
+    return new Response(JSON.stringify({ choices: [{ message: { content: '{"verdict":"DENY","confidence":0.9,"reason":"context mismatch"}' } }] }));
+  });
+
+  assert.equal(calls, 2);
+  assert.deepEqual(requestKinds, ["PRIMARY", "SCHEMA_REPAIR"]);
+  assert.equal(result.status, "SUCCESS");
+  assert.equal(result.value?.verdict, "DENY");
+  assert.equal(result.attempts, 2);
+  assert.equal(result.schemaRepairAttempts, 1);
+  assert.equal(result.schemaRepairSucceeded, true);
+  assert.equal(result.initialFailureReason, "SCHEMA_MISMATCH");
+});
+
+test("format repair cannot turn an explicit Gate DENY into ALLOW", async () => {
+  let calls = 0;
+  const result = await llmJsonDetailed({ baseUrl: "https://provider.test/v1", apiKey: "key", model: "gate",
+    retryCount: 0, preserveDecisionField: "verdict" }, "system", "user",
+  z.object({ verdict: z.enum(["ALLOW", "DENY"]), confidence: z.number() }).strict(), async () => {
+    calls++;
+    const content = calls === 1 ? '{"verdict":"DENY","confidence":"bad"}' : '{"verdict":"ALLOW","confidence":0.9}';
+    return new Response(JSON.stringify({ choices: [{ message: { content } }] }));
+  });
+  assert.equal(calls, 2);
+  assert.equal(result.status, "INVALID_RESPONSE");
+  assert.equal(result.value, null);
+  assert.equal(result.failureReason, "SCHEMA_MISMATCH");
+  assert.equal(result.schemaRepairSucceeded, false);
+});
+
+test("malformed JSON repair is single-shot and failed repair keeps initial failure diagnostic", async () => {
+  let calls = 0;
+  const result = await llmJsonDetailed({ baseUrl: "https://provider.test/v1", apiKey: "key", model: "reviewer", retryCount: 3 },
+    "review", "evidence", schema, async () => {
+      calls++;
+      const content = calls === 1 ? "```json {broken" : "still not json";
+      return new Response(JSON.stringify({ choices: [{ message: { content } }] }));
+    });
+  assert.equal(calls, 2);
+  assert.equal(result.status, "INVALID_RESPONSE");
+  assert.equal(result.failureReason, "INVALID_JSON");
+  assert.equal(result.initialFailureReason, "INVALID_JSON");
+  assert.equal(result.schemaRepairAttempts, 1);
+  assert.equal(result.schemaRepairSucceeded, false);
 });
 
 test("request capabilities omit only unsupported provider parameters", () => {

@@ -9,6 +9,8 @@ import { logSystemEvent } from "../memory/db.ts";
 import { BASE_STRATEGIES, loadStrategies, saveStrategy, type StrategyParams } from "../strategy/library.ts";
 import { regimeStats } from "../memory/regimes.ts";
 import type { TradingEngine } from "../memory/engines.ts";
+import { evolutionReviewDue, getEvolutionReviewState, markEvolutionReviewAttempt, markEvolutionReviewComplete,
+  markEvolutionReviewFailure } from "./evolution-review-state.ts";
 
 export const ProposalSchema = z.object({
   proposals: z.array(z.object({
@@ -52,14 +54,11 @@ export async function maybeEvolveStrategies(
   interval: number, maxParamChanges: number, minSample: number, engine: TradingEngine = "SWING_15M",
 ): Promise<number> {
   const closed = (store.db.prepare("SELECT COUNT(*) c FROM trades WHERE status='CLOSED' AND evidence_state='VALID' AND evolution_evidence_eligible=1 AND result_r_basis='NET' AND engine=? AND strategy_core_version=1").get(engine) as { c: number }).c;
-  let lastRun = 0;
-  for (const row of store.db.prepare("SELECT payload FROM system_events WHERE kind='EVOLUTION' ORDER BY id DESC LIMIT 20").all() as Array<{ payload: string }>) {
-    try {
-      const p = JSON.parse(row.payload) as { engine?: TradingEngine; tradesAtRun?: number };
-      if ((p.engine ?? "SWING_15M") === engine && typeof p.tradesAtRun === "number") { lastRun = p.tradesAtRun; break; }
-    } catch { /* ignore malformed payload */ }
-  }
-  if (closed < Math.max(minSample, interval) || closed - lastRun < interval) return 0;
+  const scope = "legacy:core1:all";
+  const state = getEvolutionReviewState(store, engine, scope);
+  const now = Date.now();
+  if (!evolutionReviewDue(state, closed, minSample, interval, now)) return 0;
+  markEvolutionReviewAttempt(store, engine, scope, closed, now);
   const prompt = readFileSync(path.join(root, "prompts/evolution.md"), "utf8");
   const strategies = loadStrategies(store);
   const input = {
@@ -69,19 +68,29 @@ export async function maybeEvolveStrategies(
     engine, closed_trades: closed,
     constraints: { max_param_changes: maxParamChanges, minimum_validation_sample: minSample },
   };
-  const out = await roles.json("evolution", prompt, JSON.stringify(input), ProposalSchema, "legacy_strategy_evolution");
-  store.db.prepare("INSERT INTO system_events(ts,kind,payload) VALUES(?,?,?)").run(
-    new Date().toISOString(), "EVOLUTION", JSON.stringify({ engine, tradesAtRun: closed, proposals: out?.proposals?.length ?? 0 }));
-  if (!out) return 0;
+  let out: Proposals | null;
+  try { out = await roles.json("evolution", prompt, JSON.stringify(input), ProposalSchema, "legacy_strategy_evolution"); }
+  catch { out = null; logSystemEvent(store, "EVOLUTION_REVIEW_FAILED", { engine, reason: "LEGACY_PROPOSAL_GENERATION_EXCEPTION" }); }
+  if (!out) {
+    markEvolutionReviewFailure(store, engine, scope, "PROPOSAL_GENERATION_UNAVAILABLE_OR_INVALID", now);
+    logSystemEvent(store, "EVOLUTION_REVIEW_RETRY_SCHEDULED", { engine, scope, outcome: "FAILED" });
+    return 0;
+  }
+  if (out.proposals.length === 0) {
+    markEvolutionReviewComplete(store, engine, scope, closed, "NO_CHANGE", now);
+    logSystemEvent(store, "EVOLUTION", { engine, tradesAtRun: closed, proposals: 0, outcome: "NO_CHANGE", reason: out.no_change_reason });
+    return 0;
+  }
   let created = 0;
+  let rejected = 0;
   for (const p of out.proposals) {
     const parent = strategies.find((s) => s.name === p.parent.name && s.version === p.parent.version)
       ?? BASE_STRATEGIES.find((s) => s.name === p.parent.name);
-    if (!parent) continue;
+    if (!parent) { rejected += 1; continue; }
     const v = validateProposal(p, parent.params, maxParamChanges);
-    if (!v.ok) { logSystemEvent(store, "EVOLUTION_REJECT", { proposal: p, reason: v.reason }); continue; }
+    if (!v.ok) { rejected += 1; logSystemEvent(store, "EVOLUTION_REJECT", { proposal: p, reason: v.reason }); continue; }
     const existingChallenger = strategies.find((s) => s.name === p.parent.name && s.status === "CHALLENGER");
-    if (existingChallenger) continue; // one active challenger per strategy (§36)
+    if (existingChallenger) { rejected += 1; continue; } // one active challenger per strategy (§36)
     const next: StrategyParams = { ...parent.params };
     for (const [k, ch] of Object.entries(p.changes)) (next as unknown as Record<string, number>)[k] = ch.new;
     saveStrategy(store, {
@@ -91,5 +100,8 @@ export async function maybeEvolveStrategies(
     logSystemEvent(store, "CHALLENGER_CREATED", { name: p.candidate.name, version: p.candidate.version, changes: p.changes, hypothesis: p.hypothesis });
     created += 1;
   }
+  const outcome = created > 0 ? "CHALLENGER_CREATED" : rejected > 0 ? "REJECTED" : "NO_CHANGE";
+  markEvolutionReviewComplete(store, engine, scope, closed, outcome, now);
+  logSystemEvent(store, "EVOLUTION", { engine, tradesAtRun: closed, proposals: out.proposals.length, created, rejected, outcome });
   return created;
 }

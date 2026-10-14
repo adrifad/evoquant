@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { randomUUID } from "node:crypto";
 import type { Store } from "../memory/db.ts";
 import { logSystemEvent } from "../memory/db.ts";
 import { llmJsonDetailed, type LlmErrorClass, type LlmTransportResult } from "./llm.ts";
@@ -123,7 +124,8 @@ export class RoleLlmService {
     this.now = options.now ?? Date.now;
     this.sleep = options.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
     options.store.db.exec(`CREATE TABLE IF NOT EXISTS llm_provider_requests (
-      id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL, role TEXT NOT NULL, retry INTEGER NOT NULL, context_ref TEXT);
+      id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL, role TEXT NOT NULL, retry INTEGER NOT NULL, context_ref TEXT,
+      correlation_id TEXT, request_kind TEXT NOT NULL DEFAULT 'PRIMARY');
       CREATE INDEX IF NOT EXISTS idx_llm_provider_requests_role_ts ON llm_provider_requests(role,ts)`);
     const columns = options.store.db.prepare("PRAGMA table_info(llm_runs)").all() as Array<{ name: string }>;
     if (!columns.some(column => column.name === "provider_requests")) {
@@ -131,8 +133,14 @@ export class RoleLlmService {
     }
     if (!columns.some(column => column.name === "http_status")) options.store.db.exec("ALTER TABLE llm_runs ADD COLUMN http_status INTEGER");
     if (!columns.some(column => column.name === "failure_reason")) options.store.db.exec("ALTER TABLE llm_runs ADD COLUMN failure_reason TEXT");
+    if (!columns.some(column => column.name === "correlation_id")) options.store.db.exec("ALTER TABLE llm_runs ADD COLUMN correlation_id TEXT");
+    if (!columns.some(column => column.name === "schema_repair_attempts")) options.store.db.exec("ALTER TABLE llm_runs ADD COLUMN schema_repair_attempts INTEGER NOT NULL DEFAULT 0");
+    if (!columns.some(column => column.name === "schema_repair_succeeded")) options.store.db.exec("ALTER TABLE llm_runs ADD COLUMN schema_repair_succeeded INTEGER NOT NULL DEFAULT 0");
+    if (!columns.some(column => column.name === "initial_failure_reason")) options.store.db.exec("ALTER TABLE llm_runs ADD COLUMN initial_failure_reason TEXT");
     const requestColumns = options.store.db.prepare("PRAGMA table_info(llm_provider_requests)").all() as Array<{ name: string }>;
     if (!requestColumns.some(column => column.name === "context_ref")) options.store.db.exec("ALTER TABLE llm_provider_requests ADD COLUMN context_ref TEXT");
+    if (!requestColumns.some(column => column.name === "correlation_id")) options.store.db.exec("ALTER TABLE llm_provider_requests ADD COLUMN correlation_id TEXT");
+    if (!requestColumns.some(column => column.name === "request_kind")) options.store.db.exec("ALTER TABLE llm_provider_requests ADD COLUMN request_kind TEXT NOT NULL DEFAULT 'PRIMARY'");
   }
 
   resolve(role: LlmRole): ResolvedRoleConfig {
@@ -166,13 +174,17 @@ export class RoleLlmService {
     return LLM_ROLES.map((role) => this.safeSettings(role));
   }
 
-  diagnostics(): Record<LlmRole, { lastHour: Record<string, number>; last24Hours: Record<string, number>; byContext: Record<string, number> }> {
+  diagnostics(): Record<LlmRole, { lastHour: Record<string, number>; last24Hours: Record<string, number>; byContext: Record<string, number>;
+    schemaRepairAttempts24h: number; schemaRepairSuccesses24h: number }> {
     const sinceHour = new Date(this.now() - 3_600_000).toISOString();
     const sinceDay = new Date(this.now() - 86_400_000).toISOString();
     return Object.fromEntries(LLM_ROLES.map(role => {
-      const grouped = (since: string, context: boolean) => this.options.store.db.prepare(`SELECT ${context ? "context_ref" : "COALESCE(failure_reason,status) key"} key, COUNT(*) count FROM llm_runs WHERE role=? AND ts>=? GROUP BY key`).all(role, since) as Array<{ key: string; count: number }>;
-      return [role, { lastHour: Object.fromEntries(grouped(sinceHour, false).map(row => [row.key, row.count])), last24Hours: Object.fromEntries(grouped(sinceDay, false).map(row => [row.key, row.count])), byContext: Object.fromEntries(grouped(sinceDay, true).map(row => [row.key, row.count])) }];
-    })) as Record<LlmRole, { lastHour: Record<string, number>; last24Hours: Record<string, number>; byContext: Record<string, number> }>;
+      const grouped = (since: string, context: boolean) => this.options.store.db.prepare(`SELECT ${context ? "context_ref" : "COALESCE(failure_reason,status)"} AS bucket_key, COUNT(*) count FROM llm_runs WHERE role=? AND ts>=? GROUP BY bucket_key`).all(role, since) as Array<{ bucket_key: string; count: number }>;
+      const repairs = this.options.store.db.prepare(`SELECT COALESCE(SUM(schema_repair_attempts),0) attempts,
+        COALESCE(SUM(schema_repair_succeeded),0) successes FROM llm_runs WHERE role=? AND ts>=?`).get(role, sinceDay) as { attempts: number; successes: number };
+      return [role, { lastHour: Object.fromEntries(grouped(sinceHour, false).map(row => [row.bucket_key, row.count])), last24Hours: Object.fromEntries(grouped(sinceDay, false).map(row => [row.bucket_key, row.count])), byContext: Object.fromEntries(grouped(sinceDay, true).map(row => [row.bucket_key, row.count])), schemaRepairAttempts24h: repairs.attempts, schemaRepairSuccesses24h: repairs.successes }];
+    })) as Record<LlmRole, { lastHour: Record<string, number>; last24Hours: Record<string, number>; byContext: Record<string, number>;
+      schemaRepairAttempts24h: number; schemaRepairSuccesses24h: number }>;
   }
 
   async json<T>(role: LlmRole, system: string, user: string, schema: z.ZodType<T>, contextRef: string): Promise<T | null> {
@@ -225,6 +237,7 @@ export class RoleLlmService {
   private async execute<T>(role: LlmRole, resolved: ResolvedRoleConfig, system: string, user: string,
     schema: z.ZodType<T>, contextRef: string): Promise<LlmTransportResult<T>> {
     const config = resolved.config;
+    const correlationId = randomUUID();
     if (resolved.status !== "AVAILABLE") {
       const status = resolved.status === "DISABLED" ? "DISABLED" : resolved.status === "ERROR" ? "INVALID_CONFIG" : "UNCONFIGURED";
       this.recordUnavailable(role, resolved, contextRef, resolved.errorClass ?? status);
@@ -233,23 +246,28 @@ export class RoleLlmService {
     const now = this.now();
     const quota = this.budgetState(role, config, now);
     if (quota.exhausted) {
-      this.recordRun(role, config, "BUDGET_EXHAUSTED", 0, null, null, null, contextRef);
+      this.recordRun(role, config, "BUDGET_EXHAUSTED", 0, null, null, null, contextRef, 0, null, null, correlationId);
       logSystemEvent(this.options.store, "LLM_BUDGET_EXHAUSTED", { role, provider: config.provider || "custom", model: config.model, contextRef: safeContextRef(contextRef) });
       return { value: null, status: "BUDGET_EXHAUSTED", attempts: 0, latencyMs: 0 };
     }
     logSystemEvent(this.options.store, "LLM_REQUEST", { role, provider: config.provider || "custom", model: config.model, contextRef: safeContextRef(contextRef) });
     let result: LlmTransportResult<T>;
     let requests = 0;
+    const preserveDecisionField = role === "gate" || role === "critic" ? "verdict" as const
+      : role === "scalp" ? (contextRef.includes("stance") ? "stance" as const : "verdict" as const)
+      : role === "evolution" ? "proposal" as const : undefined;
     try {
       result = await llmJsonDetailed({ baseUrl: config.baseUrl, apiKey: config.apiKey, model: config.model,
         temperature: config.temperature, timeoutMs: config.timeoutMs, maxOutputTokens: config.maxOutputTokens,
-        capabilities: config.capabilities, now: this.now,
-        retryCount: config.retryCount, beforeRequest: () => {
+        capabilities: config.capabilities, now: this.now, correlationId,
+        ...(preserveDecisionField ? { preserveDecisionField } : {}),
+        retryCount: config.retryCount, beforeRequest: (requestKind) => {
           // Synchronous reservation is shared by all service instances using this DB.
           return this.options.store.db.transaction(() => {
             if (this.budgetState(role, config, this.now()).exhausted) return false;
-            this.options.store.db.prepare("INSERT INTO llm_provider_requests(ts,role,retry,context_ref) VALUES(?,?,?,?)")
-              .run(new Date(this.now()).toISOString(), role, requests > 0 ? 1 : 0, safeContextRef(contextRef));
+            this.options.store.db.prepare(`INSERT INTO llm_provider_requests(ts,role,retry,context_ref,correlation_id,request_kind)
+              VALUES(?,?,?,?,?,?)`).run(new Date(this.now()).toISOString(), role, requestKind === "PRIMARY" ? 0 : 1,
+              safeContextRef(contextRef), correlationId, requestKind);
             requests++;
             return true;
           }).immediate();
@@ -258,10 +276,15 @@ export class RoleLlmService {
       result = { value: null, status: "NETWORK_ERROR", attempts: 1, latencyMs: 0 };
     }
     const errorClass = result.status === "SUCCESS" ? null : result.failureReason ?? result.status;
-    this.recordRun(role, config, result.status, result.latencyMs, requests === 1 ? result.inputTokens ?? null : null,
-      requests === 1 ? result.outputTokens ?? null : null, errorClass, contextRef, requests, result.failureReason ?? null, result.httpStatus ?? null);
+    this.recordRun(role, config, result.status, result.latencyMs, result.tokenUsageComplete ? result.inputTokens ?? null : null,
+      result.tokenUsageComplete ? result.outputTokens ?? null : null, errorClass, contextRef, requests, result.failureReason ?? null,
+      result.httpStatus ?? null, correlationId, result.schemaRepairAttempts ?? 0, result.schemaRepairSucceeded ?? false,
+      result.initialFailureReason ?? null);
     const payload = { role, provider: config.provider || "custom", model: config.model, latency_ms: result.latencyMs,
-      attempt: result.attempts, success: result.status === "SUCCESS", ...(result.inputTokens !== undefined ? { input_tokens: result.inputTokens } : {}),
+      correlation_id: correlationId, attempt: result.attempts, success: result.status === "SUCCESS",
+      schema_repair_attempts: result.schemaRepairAttempts ?? 0, schema_repair_succeeded: result.schemaRepairSucceeded ?? false,
+      ...(result.initialFailureReason ? { initial_failure_reason: result.initialFailureReason } : {}),
+      ...(result.inputTokens !== undefined ? { input_tokens: result.inputTokens } : {}),
       ...(result.outputTokens !== undefined ? { output_tokens: result.outputTokens } : {}), ...(errorClass ? { error_class: errorClass } : {}),
       ...(result.failureReason ? { failure_reason: result.failureReason } : {}), ...(result.httpStatus ? { http_status: result.httpStatus } : {}), contextRef: safeContextRef(contextRef) };
     if (result.status === "SUCCESS") logSystemEvent(this.options.store, "LLM_SUCCESS", payload);
@@ -290,11 +313,11 @@ export class RoleLlmService {
     const providerRequestsThisHour = budgetRequestsThisHour - legacyBudgetChargesThisHour;
     const providerRequestsToday = budgetRequestsToday - legacyBudgetChargesToday;
     const usage = this.options.store.db.prepare(`SELECT
-      CASE WHEN COUNT(*)=COUNT(input_tokens) THEN SUM(input_tokens) END input,
-      CASE WHEN COUNT(*)=COUNT(output_tokens) THEN SUM(output_tokens) END output,
+      CASE WHEN COUNT(*)>0 AND COUNT(*)=COUNT(input_tokens) THEN SUM(input_tokens) END input,
+      CASE WHEN COUNT(*)>0 AND COUNT(*)=COUNT(output_tokens) THEN SUM(output_tokens) END output,
       COALESCE(SUM(provider_requests),0) completed_requests
-      FROM llm_runs WHERE role=? AND ts>=? AND (provider_requests>0 OR (provider_requests IS NULL AND status IN (${COUNTED_STATUSES.map(() => "?").join(",")})))`)
-      .get(role, todayStart, ...COUNTED_STATUSES) as { input: number | null; output: number | null; completed_requests: number };
+      FROM llm_runs WHERE role=? AND ts>=? AND provider_requests>0`)
+      .get(role, todayStart) as { input: number | null; output: number | null; completed_requests: number };
     const retry = this.options.store.db.prepare("SELECT COALESCE(SUM(retry),0) count FROM llm_provider_requests WHERE role=? AND ts>=?").get(role, todayStart) as { count: number };
     const overBudget = (config.budget.maxCallsPerHour !== undefined && budgetRequestsThisHour >= config.budget.maxCallsPerHour)
       || (config.budget.maxCallsPerDay !== undefined && budgetRequestsToday >= config.budget.maxCallsPerDay);
@@ -350,10 +373,14 @@ export class RoleLlmService {
   }
 
   private recordRun(role: LlmRole, config: RoleLlmConfig, status: string, latencyMs: number, inputTokens: number | null,
-    outputTokens: number | null, errorClass: string | null, contextRef: string, requests = 0, failureReason: string | null = null, httpStatus: number | null = null): void {
-    this.options.store.db.prepare(`INSERT INTO llm_runs(ts,role,provider,model,status,latency_ms,input_tokens,output_tokens,error_class,context_ref,provider_requests,failure_reason,http_status)
-      VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(new Date(this.now()).toISOString(), role, config.provider || "custom", config.model,
-      status, Math.max(0, Math.trunc(latencyMs)), inputTokens, outputTokens, errorClass, safeContextRef(contextRef), requests, failureReason, httpStatus);
+    outputTokens: number | null, errorClass: string | null, contextRef: string, requests = 0, failureReason: string | null = null,
+    httpStatus: number | null = null, correlationId: string | null = null, repairAttempts = 0, repairSucceeded = false,
+    initialFailureReason: string | null = null): void {
+    this.options.store.db.prepare(`INSERT INTO llm_runs(ts,role,provider,model,status,latency_ms,input_tokens,output_tokens,error_class,context_ref,
+      provider_requests,failure_reason,http_status,correlation_id,schema_repair_attempts,schema_repair_succeeded,initial_failure_reason)
+      VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(new Date(this.now()).toISOString(), role, config.provider || "custom", config.model,
+      status, Math.max(0, Math.trunc(latencyMs)), inputTokens, outputTokens, errorClass, safeContextRef(contextRef), requests, failureReason,
+      httpStatus, correlationId, repairAttempts, repairSucceeded ? 1 : 0, initialFailureReason);
   }
 
   private recordUnavailable(role: LlmRole, resolved: ResolvedRoleConfig, contextRef: string, errorClass: string): void {

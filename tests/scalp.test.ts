@@ -7,10 +7,11 @@ import { evaluateSignal, stanceAllows, budgetAllows, dailyAllows, SCALP_DEFAULTS
 import type { ScalpCfg } from "../src/scalp/signals.ts";
 import type { Candle } from "../src/exchange/okx/types.ts";
 import type { FeatureSnapshot } from "../src/market/features.ts";
-import { backtestScalp } from "../src/scalp/backtest.ts";
+import { backtestScalp, calculateScalpExecutionCostR } from "../src/scalp/backtest.ts";
 import { scalpBlocker } from "../src/scalp/runner.ts";
 import { fetchStance, gateSignal, ScalpCandidateGateSchema, StanceSchema } from "../src/agents/scalp-agent.ts";
 import { latestConfirmedCandleClose } from "../src/scalp/candles.ts";
+import { calculateExecutionCostR, DEFAULT_V2_COSTS } from "../src/evaluation/backtest.ts";
 
 const cfg: ScalpCfg = { ...SCALP_DEFAULTS, watchlist: ["BTC-USDT-SWAP"] };
 
@@ -167,6 +168,15 @@ test("scalp replay reuses live signal fee guard and reports after-cost net R", (
     slPlus: { enabled: true, activationR: 1, lockInR: 0.05, minProfitBufferPct: 0.12 },
   });
   assert.equal(noFees[0]?.netR, noFees[0]?.grossR);
+});
+
+test("Scalp backtest charges per-side fees and friction once, matching Swing evaluator units", () => {
+  const scalp = calculateScalpExecutionCostR(100, 110, 10, {
+    feePctPerSide: 0.05, slippageBpsPerSide: 1.5, spreadBpsPerSide: 1.5,
+  });
+  const swing = calculateExecutionCostR(100, 110, 10, DEFAULT_V2_COSTS);
+  assert.equal(scalp, 0.0168);
+  assert.ok(Math.abs(scalp - swing) < 1e-12);
 });
 
 test("downtrend + burst fires SHORT", () => {

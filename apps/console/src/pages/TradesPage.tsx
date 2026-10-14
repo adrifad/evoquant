@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { useApi } from "../hooks/useApi";
 import { formatAmount, formatDuration, formatLeverage, formatMoney, formatNumber, formatPercent, formatPrice, formatR, formatTimestamp, toneFor } from "../lib/format";
 import { asNumber, asRow, asRows, asText, parseJson, type Row } from "../lib/types";
-import { Badge, DataState, DataTable, Evidence, Field, PageHeading, Panel, StatusBadge } from "../components/Primitives";
+import { Badge, DataState, DataTable, Evidence, Field, Metric, PageHeading, Panel, StatusBadge } from "../components/Primitives";
 import { MarketChart } from "../components/MarketChart";
 import { InstrumentChart } from "../components/InstrumentChart";
 import { X } from "lucide-react";
@@ -10,11 +10,22 @@ import { X } from "lucide-react";
 export function TradesPage() {
   const api = useApi<unknown>("/api/trades");
   const reviewsApi = useApi<unknown>("/api/reviews");
+  const [lossWindow, setLossWindow] = useState("30d");
+  const lossApi = useApi<unknown>(`/api/loss-attribution?window=${lossWindow}`);
   const [search, setSearch] = useState("");
   const [side, setSide] = useState("ALL");
   const [result, setResult] = useState("ALL");
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const trades = asRows(api.data);
+  const lossReport = asRow(lossApi.data);
+  const lossMetrics = asRow(lossReport?.overall);
+  const lossAccounting = asRow(lossReport?.accounting);
+  const lossBy = asRow(lossReport?.by);
+  const strategyLosses = asRows(lossBy?.strategy);
+  const setupLosses = asRows(lossBy?.setup);
+  const gateLosses = asRows(lossBy?.gateDecision);
+  const entryHourLosses = asRows(lossBy?.entryHourUtc);
+  const exitLosses = asRows(lossBy?.exitReason);
   const reviewedTrades = new Set(asRows(reviewsApi.data).map(review => asText(review.trade_id, "")));
   const visible = trades.filter(row => {
     const matchesText = `${asText(row.trade_id)} ${asText(row.instrument)} ${asText(row.strategy)} ${asText(row.regime)}`.toLowerCase().includes(search.toLowerCase());
@@ -27,6 +38,51 @@ export function TradesPage() {
 
   return <div className="page">
     <PageHeading title="Trades" description="Search the ledger and trace each position through decision, execution, risk, and review." detail={<Evidence sample={trades.filter(row => row.status === "CLOSED").length}/>}/>
+    <Panel title="Loss attribution" subtitle="Only complete, validated NET trade evidence is included. Cost components unavailable in the exchange ledger stay unavailable." action={<label className="filter-control"><span>Window</span><select aria-label="Loss attribution window" value={lossWindow} onChange={event => setLossWindow(event.target.value)}><option value="24h">24 hours</option><option value="7d">7 days</option><option value="30d">30 days</option><option value="all">All history</option></select></label>}>
+      <DataState loading={lossApi.loading} error={lossApi.error} empty={!lossMetrics || asNumber(lossMetrics.tradeCount) === 0} hasData={lossApi.data !== null} emptyTitle="No complete valid NET trades in this window" emptyDetail="Pending, incomplete, invalid, and corrupt accounting evidence is excluded from trusted performance statistics.">
+        {lossMetrics ? <>
+          <div className="metric-strip loss-metric-strip">
+            <Metric label="Trusted closed trades" value={formatNumber(lossMetrics.tradeCount, 0)} detail={`${formatNumber(lossAccounting?.validButCorrupt, 0)} VALID rows have incomplete metrics`}/>
+            <Metric label="Net realized PnL" value={formatMoney(lossMetrics.totalNetPnlUsdt)} tone={asNumber(lossMetrics.totalNetPnlUsdt) === null ? "neutral" : Number(lossMetrics.totalNetPnlUsdt) >= 0 ? "positive" : "negative"}/>
+            <Metric label="Gross PnL" value={formatMoney(lossMetrics.totalGrossPnlUsdt)} detail="NET + fees − signed funding"/>
+            <Metric label="Fees / funding" value={`${formatMoney(lossMetrics.totalTradingFeesUsdt)} / ${formatMoney(lossMetrics.totalFundingUsdt)}`}/>
+            <Metric label="Win rate" value={lossMetrics.winRate == null ? "Unavailable" : formatPercent(Number(lossMetrics.winRate) * 100, 1)}/>
+            <Metric label="Expectancy" value={lossMetrics.expectancyR == null ? "Unavailable" : `${formatNumber(lossMetrics.expectancyR, 3)} R / trade`}/>
+            <Metric label="Profit factor" value={lossMetrics.profitFactor == null ? "Unavailable" : formatNumber(lossMetrics.profitFactor, 2)}/>
+            <Metric label="Average win / loss" value={`${formatMoney(lossMetrics.averageWinUsdt)} / ${formatMoney(lossMetrics.averageLossUsdt)}`}/>
+          </div>
+          <div className="loss-attribution-details">
+            <div><h3 className="subsection-title">By strategy and version</h3><DataTable caption="Trusted NET results by strategy and version" rows={strategyLosses} rowKey={row => asText(row.key)} minWidth={600} columns={[
+              { key: "key", label: "Strategy", render: row => asText(row.key) },
+              { key: "count", label: "Trades", numeric: true, render: row => formatNumber(asRow(row.metrics)?.tradeCount, 0) },
+              { key: "net", label: "Net PnL", numeric: true, render: row => formatMoney(asRow(row.metrics)?.totalNetPnlUsdt) },
+              { key: "expectancy", label: "Expectancy", numeric: true, render: row => `${formatNumber(asRow(row.metrics)?.expectancyR, 3)} R` },
+            ]}/></div>
+            <div><h3 className="subsection-title">By entry setup</h3><DataTable caption="Trusted NET results grouped by strategy and recorded passing setup conditions" rows={setupLosses} rowKey={row => asText(row.key)} minWidth={600} columns={[
+              { key: "key", label: "Setup evidence", render: row => asText(row.key) },
+              { key: "count", label: "Trades", numeric: true, render: row => formatNumber(asRow(row.metrics)?.tradeCount, 0) },
+              { key: "net", label: "Net PnL", numeric: true, render: row => formatMoney(asRow(row.metrics)?.totalNetPnlUsdt) },
+            ]}/></div>
+            <div><h3 className="subsection-title">By Gate outcome</h3><DataTable caption="Trusted NET results grouped by persisted Gate outcome" rows={gateLosses} rowKey={row => asText(row.key)} minWidth={360} columns={[
+              { key: "key", label: "Gate", render: row => asText(row.key) },
+              { key: "count", label: "Trades", numeric: true, render: row => formatNumber(asRow(row.metrics)?.tradeCount, 0) },
+              { key: "net", label: "Net PnL", numeric: true, render: row => formatMoney(asRow(row.metrics)?.totalNetPnlUsdt) },
+            ]}/></div>
+            <div><h3 className="subsection-title">By entry hour (UTC)</h3><DataTable caption="Trusted NET results grouped by entry hour in UTC" rows={entryHourLosses} rowKey={row => asText(row.key)} minWidth={360} columns={[
+              { key: "key", label: "Hour", render: row => asText(row.key) },
+              { key: "count", label: "Trades", numeric: true, render: row => formatNumber(asRow(row.metrics)?.tradeCount, 0) },
+              { key: "net", label: "Net PnL", numeric: true, render: row => formatMoney(asRow(row.metrics)?.totalNetPnlUsdt) },
+            ]}/></div>
+            <div><h3 className="subsection-title">By exit reason</h3><DataTable caption="Trusted NET results by exit reason" rows={exitLosses} rowKey={row => asText(row.key)} minWidth={420} columns={[
+              { key: "key", label: "Exit", render: row => asText(row.key) },
+              { key: "count", label: "Trades", numeric: true, render: row => formatNumber(asRow(row.metrics)?.tradeCount, 0) },
+              { key: "net", label: "Net PnL", numeric: true, render: row => formatMoney(asRow(row.metrics)?.totalNetPnlUsdt) },
+            ]}/></div>
+          </div>
+          <p className="data-footnote">Excluded by evidence state: {formatNumber(lossAccounting?.excludedByState, 0)}. Gate outcome is descriptive, not proof of causality. Legacy Gate outcomes and exchange-reported spread/slippage remain unavailable unless recorded in source data.</p>
+        </> : <span/>}
+      </DataState>
+    </Panel>
     <Panel title="Trade ledger" subtitle={`${visible.length} of ${trades.length} records`} className="ledger-panel">
       <div className="ledger-filters">
         <label className="filter-control filter-search"><span>Search records</span><input value={search} onChange={event => setSearch(event.target.value)} placeholder="Trade ID, symbol, strategy, regime"/></label>

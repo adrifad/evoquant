@@ -15,6 +15,14 @@ export interface ScalpBacktestTrade {
 }
 export interface ScalpContext { regime: Regime; features: FeatureSnapshot; last5m?: { close: number } | null }
 
+/** Costs are per side and applied once to each side's notional, matching the Swing evaluator. */
+export function calculateScalpExecutionCostR(entry: number, exit: number, risk: number, costs: Pick<ScalpBacktestCosts,
+  "feePctPerSide" | "slippageBpsPerSide" | "spreadBpsPerSide">): number {
+  if (!(entry > 0 && exit > 0 && risk > 0)) return 0;
+  const costPerSide = costs.feePctPerSide / 100 + (costs.slippageBpsPerSide + costs.spreadBpsPerSide) / 10_000;
+  return (entry * costPerSide + exit * costPerSide) / risk;
+}
+
 /**
  * Deterministic scalp replay; evaluator/fee guard are the exact live evaluateSignal function.
  * Supply the 15m feature/regime snapshot that was actually available at each signal close.
@@ -75,8 +83,7 @@ export function backtestScalp(
     }
     if (!resolved) { const last = candles[Math.min(candles.length - 1, i + maxBars)]!; exit = last.c; exitTs = last.ts; }
     const grossR = ((exit - entry) * sign) / risk;
-    const costFraction = 2 * costs.feePctPerSide / 100 + 2 * (costs.slippageBpsPerSide + costs.spreadBpsPerSide) / 10_000;
-    const feesR = costFraction * (entry + exit) / risk;
+    const feesR = calculateScalpExecutionCostR(entry, exit, risk, costs);
     trades.push({ engine: "SCALP_5M", instrument: signal.instrument, strategy: "SCALP", strategyVersion: 1,
       regime: context.regime, entryTs: entryCandle.ts, exitTs, side, grossR, netR: grossR - feesR, feesR, exitReason });
     lastExitS = Math.floor(exitTs / 1000);

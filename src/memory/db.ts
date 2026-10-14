@@ -12,6 +12,7 @@ CREATE TABLE IF NOT EXISTS decisions (
   ts TEXT NOT NULL,
   instrument TEXT NOT NULL,
   decision TEXT NOT NULL,
+  gate_result TEXT CHECK(gate_result IS NULL OR gate_result IN ('ALLOW','DENY','ERROR','NOT_EVALUATED')),
   strategy TEXT,
   regime TEXT,
   raw_confidence REAL,
@@ -234,9 +235,28 @@ CREATE TABLE IF NOT EXISTS llm_runs (
   input_tokens INTEGER,
   output_tokens INTEGER,
   error_class TEXT,
-  context_ref TEXT NOT NULL
+  context_ref TEXT NOT NULL,
+  correlation_id TEXT,
+  schema_repair_attempts INTEGER NOT NULL DEFAULT 0,
+  schema_repair_succeeded INTEGER NOT NULL DEFAULT 0,
+  initial_failure_reason TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_llm_runs_role_ts ON llm_runs(role,ts DESC);
+CREATE TABLE IF NOT EXISTS evolution_review_state (
+  engine TEXT NOT NULL,
+  scope_key TEXT NOT NULL,
+  last_attempt_ts TEXT,
+  last_attempt_trade_count INTEGER,
+  last_success_ts TEXT,
+  last_success_trade_count INTEGER NOT NULL DEFAULT 0,
+  last_no_change_ts TEXT,
+  last_failure_ts TEXT,
+  last_failure_reason TEXT,
+  failure_count INTEGER NOT NULL DEFAULT 0,
+  next_retry_ts TEXT,
+  last_outcome TEXT NOT NULL DEFAULT 'NEVER_RUN',
+  PRIMARY KEY(engine,scope_key)
+);
 CREATE TABLE IF NOT EXISTS dynamic_watchlist_runs (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   snapshot_date TEXT NOT NULL,
@@ -332,6 +352,8 @@ export function openStore(root: string): Store {
   db.pragma("journal_mode = WAL");
   db.pragma("foreign_keys = ON");
   db.exec(SCHEMA);
+  const decisionCols = new Set((db.prepare("PRAGMA table_info(decisions)").all() as Array<{ name: string }>).map((c) => c.name));
+  if (!decisionCols.has("gate_result")) db.exec("ALTER TABLE decisions ADD COLUMN gate_result TEXT");
   const scanStateCols = new Set((db.prepare("PRAGMA table_info(market_scan_state)").all() as Array<{ name: string }>).map((c) => c.name));
   if (!scanStateCols.has("candle_timeframe")) db.exec("ALTER TABLE market_scan_state ADD COLUMN candle_timeframe TEXT");
   // lightweight column migration for pre-existing DBs

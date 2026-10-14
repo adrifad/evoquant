@@ -407,7 +407,7 @@ export class ScalpRunner {
       const tradeId = `SCP-${String(Date.now()).slice(-8)}`;
       const decisionId = nextDecisionId();
       recordDecision(store, { decisionId, ts: new Date().toISOString(),
-        instrument: sig.instrument, decision: side, strategy: "SCALP_V1", regime: sig.regime,
+        instrument: sig.instrument, decision: side, gateResult: "ALLOW", strategy: "SCALP_V1", regime: sig.regime,
         rawConfidence: sig.score, calibratedConfidence: sig.score,
         thesis: [sig.reason.slice(0, 280)], riskVerdict: { approved: true, reason: `scalp ${this.stance}` } });
       const entryPosition = (await getPositions(client, sig.instrument).catch(() => []))

@@ -500,7 +500,9 @@ export async function runTick(d: ExecutorDeps, ctx: TickContext, symbol: TickSym
   const decisionId = nextDecisionId();
   recordDecision(store, {
     decisionId, ts: new Date().toISOString(), instrument: instId,
-    decision: decision.decision, strategy: decision.strategy ?? undefined, regime: ctx.regime,
+    decision: decision.decision,
+    gateResult: ctx.candidate ? gateErrored || !gate ? "ERROR" : gate.verdict : "NOT_EVALUATED",
+    strategy: decision.strategy ?? undefined, regime: ctx.regime,
     rawConfidence: decision.confidence, calibratedConfidence: calConf,
     thesis: decision.thesis, riskVerdict: verdict,
   });
