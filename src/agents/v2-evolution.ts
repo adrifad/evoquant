@@ -11,6 +11,7 @@ import { summarize } from "../evaluation/performance.ts";
 import { DEFAULT_V2_PARAMS, StrategyV2ParamsSchema, type StrategyV2Id, type StrategyV2Params } from "../strategy/core-v2.ts";
 import { createV2Challenger, getV2Champions, listV2Versions, V2_STRATEGIES } from "../strategy/v2-registry.ts";
 import { familyForV2 } from "../strategy/identity.ts";
+import { eligibleLessonScope } from "../memory/lessons.ts";
 import { evolutionReviewDue, getEvolutionReviewState, markEvolutionReviewAttempt, markEvolutionReviewComplete,
   markEvolutionReviewFailure } from "./evolution-review-state.ts";
 
@@ -49,11 +50,19 @@ export function getV2EvolutionEvidence(store: Store, strategy: StrategyV2Id, ver
 
 export function getVerifiedV2Lessons(store: Store, strategy: StrategyV2Id, version: number,
   engine: TradingEngine = "SWING_15M"): Array<Record<string, unknown>> {
-  return store.db.prepare(`SELECT lesson_id,statement,scope_engine,scope_strategy,scope_strategy_version,scope_regime,
-      scope_direction,scope_regime_axes,confidence,observations,expectancy_r FROM lessons
-    WHERE status='VERIFIED' AND scope_engine=? AND (scope_strategy IS NULL OR scope_strategy=?)
-      AND (scope_strategy_version IS NULL OR scope_strategy_version=?)
-    ORDER BY confidence DESC,observations DESC LIMIT 10`)
+  return store.db.prepare(`WITH evidence AS (
+      SELECT l.lesson_id,COUNT(*) AS n,AVG(CAST(le.aligned AS REAL)) AS agree_rate,
+        AVG(CASE WHEN le.aligned=1 THEN t.result_r END) AS aligned_expectancy
+      FROM lessons l JOIN lesson_evidence le ON le.lesson_id=l.lesson_id JOIN trades t ON t.trade_id=le.trade_id
+      WHERE le.trade_id<>COALESCE(l.source_trade_id,'') AND (${eligibleLessonScope("l", "t")})
+      GROUP BY l.lesson_id
+    )
+    SELECT l.lesson_id,l.statement,l.scope_engine,l.scope_strategy,l.scope_strategy_version,l.scope_instrument,l.scope_regime,
+      l.scope_direction,l.scope_regime_axes,l.confidence,e.n AS observations,e.aligned_expectancy AS expectancy_r FROM lessons l
+    JOIN evidence e ON e.lesson_id=l.lesson_id
+    WHERE l.status='VERIFIED' AND l.scope_engine=? AND (l.scope_strategy IS NULL OR l.scope_strategy=?)
+      AND (l.scope_strategy_version IS NULL OR l.scope_strategy_version=?) AND e.n>=30 AND e.agree_rate>=0.65
+    ORDER BY l.confidence DESC,e.n DESC LIMIT 10`)
     .all(engine, familyForV2(strategy), version) as Array<Record<string, unknown>>;
 }
 
@@ -115,7 +124,11 @@ export async function maybeEvolveV2Strategies(root: string, roles: RoleLlmServic
   for (const strategy of ready) markEvolutionReviewAttempt(store, engine, v2EvolutionReviewScope(strategy, champions[strategy].version),
     evidenceByStrategy.get(strategy)?.length ?? 0, now);
 
-  logSystemEvent(store, "EVOLUTION_TRIGGERED", { engine, strategies: ready, intervalTrades: evolution.intervalTrades });
+  const lessonsByStrategy = Object.fromEntries(ready.map((strategy) => [strategy,
+    getVerifiedV2Lessons(store, strategy, champions[strategy].version, engine)]));
+  logSystemEvent(store, "EVOLUTION_TRIGGERED", { engine, strategies: ready, intervalTrades: evolution.intervalTrades,
+    lessonIdsByStrategy: Object.fromEntries(Object.entries(lessonsByStrategy).map(([strategy, lessons]) =>
+      [strategy, lessons.map((lesson) => lesson.lesson_id)])) });
   const prompt = readFileSync(path.join(root, "prompts/evolution-v2.md"), "utf8");
   const strategyEvidence = Object.fromEntries(ready.map((strategy) => {
     const champion = champions[strategy];
@@ -143,7 +156,7 @@ export async function maybeEvolveV2Strategies(root: string, roles: RoleLlmServic
         strategy: familyForV2(strategy), strategyCoreVersion: 2, strategyVersion: champion.version,
       }),
       shadow_challenger_summary: shadows,
-      machine_verified_lessons: getVerifiedV2Lessons(store, strategy, champion.version, engine),
+      machine_verified_lessons: lessonsByStrategy[strategy],
       evidence_cutoff_ts: latestEvidenceExitTs(trades),
     }];
   }));

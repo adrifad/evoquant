@@ -75,6 +75,8 @@ export interface OrderDetail {
 export interface Fill {
   instId: string;
   tradeId: string;
+  /** OKX historical-fill cursor. Absent on the recent `/trade/fills` endpoint. */
+  billId?: string;
   ordId: string;
   clOrdId?: string;
   fillPx: string;

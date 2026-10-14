@@ -12,7 +12,7 @@ import { createV2Challenger, ensureV2Registry, getV2Champions, listV2Versions, t
 import { evolutionReviewEligible, getVerifiedV2Lessons, getV2EvolutionEvidence, maybeEvolveV2Strategies,
   validateV2Proposal, v2EvolutionReviewScope, v2EvolutionStateKey } from "../src/agents/v2-evolution.ts";
 import { measureContributions } from "../src/learning/signal-weights.ts";
-import { upsertLesson } from "../src/memory/lessons.ts";
+import { addLessonEvidence, upsertLesson } from "../src/memory/lessons.ts";
 import { calculateExecutionCostR, DEFAULT_V2_COSTS } from "../src/evaluation/backtest.ts";
 import { evaluateV2Lifecycle } from "../src/evaluation/v2-promotion.ts";
 import { processShadowCycle, shadowExperimentId } from "../src/evaluation/shadow-challenger.ts";
@@ -124,8 +124,16 @@ test("V2 evolution consumes only statistically verified lessons scoped to the ac
   const relevant = make("Verified trend evidence", "SWING_15M", "TREND_FOLLOWING");
   const wrongEngine = make("Scalp evidence", "SCALP_5M", "TREND_FOLLOWING");
   const wrongFamily = make("Breakout evidence", "SWING_15M", "BREAKOUT");
-  db.db.prepare("UPDATE lessons SET status='VERIFIED',observations=30,expectancy_r=0.4 WHERE lesson_id IN (?,?,?)")
-    .run(relevant, wrongEngine, wrongFamily);
+  const insert = db.db.prepare(`INSERT INTO trades(trade_id,engine,status,evidence_state,evolution_evidence_eligible,result_r_basis,instrument,
+    timeframe,side,strategy,strategy_core_version,strategy_version,regime,contracts,result_r,exit_ts)
+    VALUES(?,'SWING_15M','CLOSED','VALID',1,'NET','BTC-USDT-SWAP','15m','LONG','TREND_FOLLOWING',2,2,'TRENDING_BULLISH','1',0.4,?)`);
+  for (let i = 0; i < 30; i++) {
+    const tradeId = `VERIFIED-LESSON-${i}`;
+    insert.run(tradeId, new Date(Date.now() + (i + 1) * 1000).toISOString());
+    addLessonEvidence(db, relevant, tradeId, true);
+  }
+  db.db.prepare("UPDATE lessons SET status='VERIFIED',observations=30,expectancy_r=0.4 WHERE lesson_id IN (?,?)")
+    .run(wrongEngine, wrongFamily);
   const rows = getVerifiedV2Lessons(db, "TREND_FOLLOWING_V2", 2, "SWING_15M");
   assert.deepEqual(rows.map(row => row.lesson_id), [relevant]);
   db.close();
@@ -173,6 +181,35 @@ test("valid V2 no-proposal response is recorded as completed no-change and advan
   assert.equal(state.last_success_trade_count, 20);
   assert.ok(state.last_no_change_ts);
   assert.equal(Number(kvGet(db, v2EvolutionStateKey("SWING_15M", strategy, version))), 20);
+  db.close();
+});
+
+test("eligible verified lesson ids reach the Evolution prompt with scope-limited evidence", async () => {
+  const db = store();
+  const { strategy, version } = seedActiveChampionEvidence(db, 20);
+  const lessonId = upsertLesson(db, { statement: "Volume-confirmed continuation holds", confidence: 0.9,
+    sourceTradeId: "LESSON-SOURCE", scope: { engine: "SWING_15M", strategy: "TREND_FOLLOWING",
+      strategyVersion: version, instrument: "BTC-USDT-SWAP" } });
+  const insert = db.db.prepare(`INSERT INTO trades(trade_id,engine,status,evidence_state,evolution_evidence_eligible,result_r_basis,instrument,
+    timeframe,side,strategy,strategy_core_version,strategy_version,regime,contracts,result_r,exit_ts,entry_features)
+    VALUES(?,'SWING_15M','CLOSED','VALID',1,'NET','BTC-USDT-SWAP','15m','LONG','TREND_FOLLOWING',2,?,
+      'TRENDING_BULLISH','1',0.4,?,'{}')`);
+  for (let i = 0; i < 30; i++) {
+    const tradeId = `LESSON-VALIDATION-${i}`;
+    insert.run(tradeId, version, new Date(Date.now() + (i + 1) * 1000).toISOString());
+    addLessonEvidence(db, lessonId, tradeId, true);
+  }
+  const inputs: string[] = [];
+  const roles = { json: async (_role: string, _system: string, user: string) => {
+    inputs.push(user);
+    return { proposals: [], no_change_reason: "Current Champion remains supported." };
+  } } as never;
+  assert.equal(await maybeEvolveV2Strategies(process.cwd(), roles, db,
+    { intervalTrades: 30, minimumSample: 30, maxParamChanges: 1, maxParamDeltaPct: 10 }), 0);
+  const input = JSON.parse(inputs[0]!) as { strategies: Record<string, { machine_verified_lessons: Array<{ lesson_id: string }> }> };
+  assert.deepEqual(input.strategies[strategy]!.machine_verified_lessons.map((lesson) => lesson.lesson_id), [lessonId]);
+  const event = db.db.prepare("SELECT payload FROM system_events WHERE kind='EVOLUTION_TRIGGERED' ORDER BY rowid DESC LIMIT 1").get() as { payload: string };
+  assert.deepEqual(JSON.parse(event.payload).lessonIdsByStrategy[strategy], [lessonId]);
   db.close();
 });
 

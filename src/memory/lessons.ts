@@ -7,6 +7,7 @@ export type LessonStatus = "PROVISIONAL" | "REINFORCED" | "VERIFIED" | "CONFLICT
 
 export interface LessonRow {
   lesson_id: string; statement: string; status: LessonStatus;
+  source_trade_id: string | null;
   scope_strategy: string | null; scope_instrument: string | null; scope_regime: string | null;
   scope_engine: TradingEngine | null; scope_strategy_version: number | null; scope_direction: string | null; scope_regime_axes: string | null;
   confidence: number | null; observations: number | null; wins: number | null;
@@ -15,9 +16,21 @@ export interface LessonRow {
 }
 
 let seq = 0;
+export function eligibleLessonScope(lesson: string, trade: string): string {
+  return `${trade}.status='CLOSED' AND ${trade}.evidence_state='VALID'
+    AND ${trade}.evolution_evidence_eligible=1 AND ${trade}.result_r_basis='NET' AND ${trade}.result_r IS NOT NULL
+    AND ${trade}.exit_ts>${lesson}.created_ts AND ${trade}.engine=${lesson}.scope_engine
+    AND (${lesson}.scope_strategy IS NULL OR ${lesson}.scope_strategy=${trade}.strategy)
+    AND (${lesson}.scope_strategy_version IS NULL OR ${lesson}.scope_strategy_version=${trade}.strategy_version)
+    AND (${lesson}.scope_instrument IS NULL OR ${lesson}.scope_instrument=${trade}.instrument)
+    AND (${lesson}.scope_regime IS NULL OR ${lesson}.scope_regime=${trade}.regime)
+    AND (${lesson}.scope_direction IS NULL OR ${lesson}.scope_direction=${trade}.side)
+    AND (${lesson}.scope_regime_axes IS NULL OR ${lesson}.scope_regime_axes=${trade}.regime_axes)`;
+}
+
 export function upsertLesson(
   store: Store,
-  l: { statement: string; scope: { engine?: TradingEngine; strategy?: string; strategyVersion?: number; instrument?: string; regime?: string; direction?: string; regimeAxes?: string }; confidence: number },
+  l: { statement: string; scope: { engine?: TradingEngine; strategy?: string; strategyVersion?: number; instrument?: string; regime?: string; direction?: string; regimeAxes?: string }; confidence: number; sourceTradeId?: string },
 ): string {
   const existing = store.db.prepare(
     `SELECT lesson_id FROM lessons WHERE statement=? AND scope_engine=?
@@ -26,17 +39,17 @@ export function upsertLesson(
   ).get(l.statement, l.scope.engine ?? "SWING_15M", l.scope.strategy ?? "", l.scope.strategyVersion ?? 0,
     l.scope.instrument ?? "", l.scope.regime ?? "", l.scope.direction ?? "", l.scope.regimeAxes ?? "") as { lesson_id: string } | undefined;
   if (existing) {
-    store.db.prepare("UPDATE lessons SET confidence=MAX(confidence,?), updated_ts=? WHERE lesson_id=?")
-      .run(l.confidence, new Date().toISOString(), existing.lesson_id);
+    store.db.prepare("UPDATE lessons SET confidence=MAX(confidence,?), source_trade_id=COALESCE(source_trade_id,?), updated_ts=? WHERE lesson_id=?")
+      .run(l.confidence, l.sourceTradeId ?? null, new Date().toISOString(), existing.lesson_id);
     return existing.lesson_id;
   }
   seq += 1;
   const id = `LESSON-${Date.now().toString(36)}${seq}`;
-  store.db.prepare(`INSERT INTO lessons(lesson_id,statement,status,scope_engine,scope_strategy,scope_strategy_version,scope_instrument,scope_regime,scope_direction,scope_regime_axes,confidence,created_ts,updated_ts)
-    VALUES(?,?,'PROVISIONAL',?,?,?,?,?,?,?,?,?,?)`).run(
+  store.db.prepare(`INSERT INTO lessons(lesson_id,statement,status,scope_engine,scope_strategy,scope_strategy_version,scope_instrument,scope_regime,scope_direction,scope_regime_axes,source_trade_id,confidence,created_ts,updated_ts)
+    VALUES(?,?,'PROVISIONAL',?,?,?,?,?,?,?,?,?,?,?)`).run(
     id, l.statement, l.scope.engine ?? "SWING_15M", l.scope.strategy ?? null, l.scope.strategyVersion ?? null,
     l.scope.instrument ?? null, l.scope.regime ?? null, l.scope.direction ?? null, l.scope.regimeAxes ?? null,
-    l.confidence, new Date().toISOString(), new Date().toISOString());
+    l.sourceTradeId ?? null, l.confidence, new Date().toISOString(), new Date().toISOString());
   return id;
 }
 
@@ -46,7 +59,8 @@ export function addLessonEvidence(
   store.db.prepare(
     `INSERT OR IGNORE INTO lesson_evidence(lesson_id,trade_id,aligned,ts)
      SELECT l.lesson_id,t.trade_id,?,? FROM lessons l JOIN trades t ON t.trade_id=?
-     WHERE l.lesson_id=? AND l.scope_engine=t.engine
+     WHERE l.lesson_id=? AND l.status NOT IN ('REJECTED','SUPERSEDED') AND l.scope_engine=t.engine
+       AND (${eligibleLessonScope("l", "t")}) AND t.trade_id<>COALESCE(l.source_trade_id,'')
        AND (l.scope_strategy IS NULL OR l.scope_strategy=t.strategy)
        AND (l.scope_strategy_version IS NULL OR l.scope_strategy_version=t.strategy_version)
        AND (l.scope_instrument IS NULL OR l.scope_instrument=t.instrument)
@@ -62,8 +76,12 @@ export function addLessonEvidence(
 // REINFORCED → (≥30 obs AND ≥20% out-of-sample agree) → VERIFIED
 // contradictions ≥40% → CONFLICTED
 export function recomputeLesson(store: Store, lessonId: string): void {
+  const current = store.db.prepare("SELECT status FROM lessons WHERE lesson_id=?").get(lessonId) as { status?: string } | undefined;
+  if (!current || current.status === "REJECTED" || current.status === "SUPERSEDED") return;
   const ev = store.db.prepare(
-    "SELECT aligned, COUNT(*) n FROM lesson_evidence WHERE lesson_id=? GROUP BY aligned",
+    `SELECT le.aligned, COUNT(*) n FROM lesson_evidence le JOIN lessons lesson ON lesson.lesson_id=le.lesson_id
+     JOIN trades t ON t.trade_id=le.trade_id WHERE le.lesson_id=? AND le.trade_id<>COALESCE(lesson.source_trade_id,'')
+       AND (${eligibleLessonScope("lesson", "t")}) GROUP BY le.aligned`,
   ).all(lessonId) as Array<{ aligned: number; n: number }>;
   const total = ev.reduce((a, b) => a + b.n, 0);
   const agree = ev.find((e) => e.aligned === 1)?.n ?? 0;
@@ -71,8 +89,9 @@ export function recomputeLesson(store: Store, lessonId: string): void {
     SELECT COALESCE(SUM(CASE WHEN l.aligned=1 THEN t.result_r ELSE 0 END),0) AS agree_r,
            COALESCE(SUM(CASE WHEN l.aligned=1 THEN 1 ELSE 0 END),0) AS agree_n,
            COUNT(*) AS n
-    FROM lesson_evidence l JOIN trades t ON t.trade_id=l.trade_id
-    WHERE l.lesson_id=? AND t.status='CLOSED' AND t.evidence_state='VALID' AND t.evolution_evidence_eligible=1 AND t.result_r_basis='NET'`).get(lessonId) as { agree_r: number; agree_n: number; n: number };
+    FROM lesson_evidence l JOIN lessons lesson ON lesson.lesson_id=l.lesson_id JOIN trades t ON t.trade_id=l.trade_id
+    WHERE l.lesson_id=? AND l.trade_id<>COALESCE(lesson.source_trade_id,'')
+      AND (${eligibleLessonScope("lesson", "t")})`).get(lessonId) as { agree_r: number; agree_n: number; n: number };
   const expectAgree = stats.agree_n ? stats.agree_r / stats.agree_n : 0;
   const agreeRate = total ? agree / total : 0;
   const conflictRate = total ? 1 - agreeRate : 0;
@@ -91,9 +110,21 @@ export function recomputeLesson(store: Store, lessonId: string): void {
 
 export function getActiveLessons(store: Store, instrument: string, engine: TradingEngine = "SWING_15M"): Array<Record<string, unknown>> {
   return store.db.prepare(
-    `SELECT lesson_id, statement, status, scope_engine, scope_strategy, scope_strategy_version, scope_regime, scope_regime_axes, scope_direction, confidence, observations, expectancy_r
-     FROM lessons WHERE status IN ('REINFORCED','VERIFIED') AND scope_engine=?
-       AND (scope_instrument IS NULL OR scope_instrument=?) ORDER BY confidence DESC LIMIT 20`,
+    `WITH evidence AS (
+       SELECT l.lesson_id,COUNT(*) AS n,AVG(CAST(le.aligned AS REAL)) AS agree_rate,
+         AVG(CASE WHEN le.aligned=1 THEN t.result_r END) AS aligned_expectancy
+       FROM lessons l JOIN lesson_evidence le ON le.lesson_id=l.lesson_id JOIN trades t ON t.trade_id=le.trade_id
+       WHERE le.trade_id<>COALESCE(l.source_trade_id,'') AND (${eligibleLessonScope("l", "t")})
+       GROUP BY l.lesson_id
+     )
+     SELECT l.lesson_id,l.statement,l.status,l.scope_engine,l.scope_strategy,l.scope_strategy_version,l.scope_regime,
+       l.scope_regime_axes,l.scope_direction,l.confidence,e.n AS observations,e.aligned_expectancy AS expectancy_r
+     FROM lessons l JOIN evidence e ON e.lesson_id=l.lesson_id
+     WHERE l.status IN ('REINFORCED','VERIFIED') AND l.scope_engine=?
+       AND (l.scope_instrument IS NULL OR l.scope_instrument=?)
+       AND ((l.status='REINFORCED' AND e.n>=10 AND e.agree_rate>=0.6)
+         OR (l.status='VERIFIED' AND e.n>=30 AND e.agree_rate>=0.65))
+     ORDER BY l.confidence DESC LIMIT 20`,
   ).all(engine, instrument) as Array<Record<string, unknown>>;
 }
 

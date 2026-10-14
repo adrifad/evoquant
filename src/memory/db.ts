@@ -77,6 +77,10 @@ CREATE TABLE IF NOT EXISTS trades (
   evidence_reason TEXT,
   evidence_attempts INTEGER NOT NULL DEFAULT 0,
   evidence_next_retry_ts TEXT,
+  accounting_reconcile_attempts INTEGER NOT NULL DEFAULT 0,
+  accounting_reconcile_last_attempt_ts TEXT,
+  accounting_reconcile_last_result TEXT,
+  accounting_reconcile_next_retry_ts TEXT,
   instrument TEXT NOT NULL,
   timeframe TEXT NOT NULL,
   side TEXT NOT NULL,              -- LONG | SHORT
@@ -116,6 +120,7 @@ CREATE TABLE IF NOT EXISTS lessons (
   status TEXT NOT NULL,            -- §29 states
   scope_strategy TEXT, scope_instrument TEXT, scope_regime TEXT,
   scope_engine TEXT, scope_strategy_version INTEGER, scope_direction TEXT, scope_regime_axes TEXT,
+  source_trade_id TEXT,
   confidence REAL,
   observations INTEGER, wins INTEGER, losses INTEGER, expectancy_r REAL,
   created_ts TEXT, updated_ts TEXT,
@@ -375,6 +380,10 @@ export function openStore(root: string): Store {
   if (!cols.has("evidence_reason")) db.exec("ALTER TABLE trades ADD COLUMN evidence_reason TEXT");
   if (!cols.has("evidence_attempts")) db.exec("ALTER TABLE trades ADD COLUMN evidence_attempts INTEGER NOT NULL DEFAULT 0");
   if (!cols.has("evidence_next_retry_ts")) db.exec("ALTER TABLE trades ADD COLUMN evidence_next_retry_ts TEXT");
+  if (!cols.has("accounting_reconcile_attempts")) db.exec("ALTER TABLE trades ADD COLUMN accounting_reconcile_attempts INTEGER NOT NULL DEFAULT 0");
+  if (!cols.has("accounting_reconcile_last_attempt_ts")) db.exec("ALTER TABLE trades ADD COLUMN accounting_reconcile_last_attempt_ts TEXT");
+  if (!cols.has("accounting_reconcile_last_result")) db.exec("ALTER TABLE trades ADD COLUMN accounting_reconcile_last_result TEXT");
+  if (!cols.has("accounting_reconcile_next_retry_ts")) db.exec("ALTER TABLE trades ADD COLUMN accounting_reconcile_next_retry_ts TEXT");
   // Historical records are Core 1 unless a future migration has explicit evidence.
   if (!cols.has("strategy_core_version")) db.exec("ALTER TABLE trades ADD COLUMN strategy_core_version INTEGER NOT NULL DEFAULT 1");
   db.exec(`UPDATE trades SET engine=CASE WHEN lower(timeframe)='scalp' THEN 'SCALP_5M' ELSE 'SWING_15M' END
@@ -398,6 +407,7 @@ export function openStore(root: string): Store {
   if (!lessonCols.has("scope_strategy_version")) db.exec("ALTER TABLE lessons ADD COLUMN scope_strategy_version INTEGER");
   if (!lessonCols.has("scope_direction")) db.exec("ALTER TABLE lessons ADD COLUMN scope_direction TEXT");
   if (!lessonCols.has("scope_regime_axes")) db.exec("ALTER TABLE lessons ADD COLUMN scope_regime_axes TEXT");
+  if (!lessonCols.has("source_trade_id")) db.exec("ALTER TABLE lessons ADD COLUMN source_trade_id TEXT");
   const instrumentCols = new Set((db.prepare("PRAGMA table_info(instruments)").all() as Array<{ name: string }>).map((c) => c.name));
   if (!instrumentCols.has("state")) db.exec("ALTER TABLE instruments ADD COLUMN state TEXT");
   if (!instrumentCols.has("settleCcy")) db.exec("ALTER TABLE instruments ADD COLUMN settleCcy TEXT");
