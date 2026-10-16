@@ -397,6 +397,11 @@ export function openStore(root: string): Store {
   if (!cols.has("exit_reconcile_attempts")) db.exec("ALTER TABLE trades ADD COLUMN exit_reconcile_attempts INTEGER NOT NULL DEFAULT 0");
   if (!cols.has("exit_reconcile_last_attempt_ts")) db.exec("ALTER TABLE trades ADD COLUMN exit_reconcile_last_attempt_ts TEXT");
   if (!cols.has("exit_reconcile_next_retry_ts")) db.exec("ALTER TABLE trades ADD COLUMN exit_reconcile_next_retry_ts TEXT");
+  if (!cols.has("exit_reconcile_state")) db.exec("ALTER TABLE trades ADD COLUMN exit_reconcile_state TEXT NOT NULL DEFAULT 'PENDING'");
+  if (!cols.has("exit_reconcile_last_failure_reason")) db.exec("ALTER TABLE trades ADD COLUMN exit_reconcile_last_failure_reason TEXT");
+  if (!cols.has("exit_reconcile_claim_until_ts")) db.exec("ALTER TABLE trades ADD COLUMN exit_reconcile_claim_until_ts TEXT");
+  if (!cols.has("sl_algo_cl_ord_id")) db.exec("ALTER TABLE trades ADD COLUMN sl_algo_cl_ord_id TEXT");
+  if (!cols.has("tp_algo_cl_ord_id")) db.exec("ALTER TABLE trades ADD COLUMN tp_algo_cl_ord_id TEXT");
   // Historical records are Core 1 unless a future migration has explicit evidence.
   if (!cols.has("strategy_core_version")) db.exec("ALTER TABLE trades ADD COLUMN strategy_core_version INTEGER NOT NULL DEFAULT 1");
   db.exec(`UPDATE trades SET engine=CASE WHEN lower(timeframe)='scalp' THEN 'SCALP_5M' ELSE 'SWING_15M' END

@@ -70,11 +70,16 @@ export function normalizePriceToTick(price: number, tickSz: string, direction: "
 
 function closeSide(posSide: PosSide): Side { return posSide === "long" ? "sell" : "buy"; }
 
+export function protectionClientIds(base: string): { stop: string; takeProfit: string } {
+  return { stop: `${base.slice(0, 30)}SL`, takeProfit: `${base.slice(0, 30)}TP` };
+}
+
 async function placeLeg(client: OkxClient, p: ConditionalProtection, kind: "SL" | "TP", price: string): Promise<AlgoResult> {
+  const clientIds = p.clAlgoId ? protectionClientIds(p.clAlgoId) : undefined;
   const common = {
     instId: p.instId, tdMode: "isolated", side: closeSide(p.posSide), posSide: p.posSide,
     ordType: "conditional", sz: p.contracts,
-    ...(p.clAlgoId ? { algoClOrdId: `${p.clAlgoId.slice(0, 30)}${kind}` } : {}),
+    ...(clientIds ? { algoClOrdId: kind === "SL" ? clientIds.stop : clientIds.takeProfit } : {}),
   };
   const body = kind === "SL"
     ? { ...common, slTriggerPx: price, slOrdPx: "-1", slTriggerPxType: "mark" }
@@ -84,7 +89,7 @@ async function placeLeg(client: OkxClient, p: ConditionalProtection, kind: "SL" 
   if (first.sCode !== "0") throw new Error(`algo ${kind} rejected: sCode=${first.sCode ?? "missing"}`);
   const algoId = first.algoId ?? "";
   if (!algoId) throw new Error(`algo ${kind} response missing algoId`);
-  return { algoId, clAlgoId: first.algoClOrdId ?? (p.clAlgoId ? `${p.clAlgoId.slice(0, 30)}${kind}` : "") };
+  return { algoId, clAlgoId: first.algoClOrdId ?? (clientIds ? (kind === "SL" ? clientIds.stop : clientIds.takeProfit) : "") };
 }
 
 function verifyLeg(detail: AlgoOrderDetail, args: { instId: string; posSide: PosSide; contracts: string; kind: "SL" | "TP"; price: string }): void {
@@ -160,6 +165,18 @@ export async function getAlgoOrder(client: OkxClient, instId: string, algoId: st
   return { algoId: first.algoId ?? algoId, state: first.state ?? "", instId: first.instId ?? "",
     tdMode: first.tdMode ?? "", side: first.side ?? "", posSide: first.posSide ?? "", ordType: first.ordType ?? "",
     sz: first.sz ?? "", slTriggerPx: first.slTriggerPx ?? "", slTriggerPxType: first.slTriggerPxType ?? "",
+    tpTriggerPx: first.tpTriggerPx ?? "", tpTriggerPxType: first.tpTriggerPxType ?? "" };
+}
+
+/** Exact lookup is used after a timed-out placement response. Empty successful
+ * result means absent; transport/API errors propagate so callers never duplicate. */
+export async function getAlgoOrderByClientId(client: OkxClient, instId: string, algoClOrdId: string): Promise<AlgoOrderDetail | null> {
+  const data = await client.get<Array<Record<string, string>>>("/api/v5/trade/order-algo", { instId, algoClOrdId }, true);
+  const first = data[0];
+  if (!first) return null;
+  return { algoId: first.algoId ?? "", state: first.state ?? "", instId: first.instId ?? "", tdMode: first.tdMode ?? "",
+    side: first.side ?? "", posSide: first.posSide ?? "", ordType: first.ordType ?? "", sz: first.sz ?? "",
+    slTriggerPx: first.slTriggerPx ?? "", slTriggerPxType: first.slTriggerPxType ?? "",
     tpTriggerPx: first.tpTriggerPx ?? "", tpTriggerPxType: first.tpTriggerPxType ?? "" };
 }
 

@@ -4,7 +4,7 @@
 import type { InstrumentInfo } from "../exchange/okx/types.ts";
 import type { OkxClient } from "../exchange/okx/client.ts";
 import { getFundingBills } from "../exchange/okx/account.ts";
-import { getFills, getFillsHistoryForOrder } from "../exchange/okx/orders.ts";
+import { getFills, getFillsHistoryForOrder, deduplicateFills } from "../exchange/okx/orders.ts";
 import { persistFills, excursionCandles } from "../execution/executor.ts";
 import { serializeTradeMutation } from "../execution/trade-mutation.ts";
 import { computeClosedMetrics, type ClosedMetrics } from "../memory/trades.ts";
@@ -49,14 +49,8 @@ function pendingReason(row: Record<string, unknown>, feeReason: string): string 
 
 interface FeeResolution { fees: number | null; entryPx: number | null; exitPx: number | null; reason: string }
 
-function distinctFills(fills: Array<Awaited<ReturnType<typeof getFills>>[number]>): typeof fills {
-  const seen = new Set<string>();
-  return fills.filter((fill) => {
-    const key = `${fill.instId}:${fill.ordId}:${fill.tradeId}:${fill.ts}`;
-    if (seen.has(key)) return false;
-    seen.add(key);
-    return true;
-  });
+function distinctFills(fills: Array<Awaited<ReturnType<typeof getFills>>[number]>) {
+  return deduplicateFills(fills);
 }
 
 function exactOrderId(d: EvidenceFinalizerDeps, t: Record<string, unknown>, kind: "OPEN" | "CLOSE"): string | null {
@@ -96,7 +90,9 @@ async function resolveLeg(d: EvidenceFinalizerDeps, args: {
   let recent: Awaited<ReturnType<typeof getFills>>;
   try { recent = await getFills(d.client, args.instrument, args.orderId); }
   catch { recent = []; }
-  recent = distinctFills(recent);
+  const recentUnique = distinctFills(recent);
+  if (recentUnique.conflicts) return { fills: [], averagePx: null, reason: "FILL_IDENTITY_CONFLICT" };
+  recent = recentUnique.fills;
   let reason = legReason(recent, args);
   if (reason === null) return { fills: recent, averagePx: weightedAveragePrice(recent), reason: null };
 
@@ -104,10 +100,12 @@ async function resolveLeg(d: EvidenceFinalizerDeps, args: {
   // history by exact order ID, page with billId, and require a complete scan.
   try {
     const history = await getFillsHistoryForOrder(d.client, args.instrument, args.orderId);
+    if (history.conflicts) return { fills: [], averagePx: null, reason: "FILL_IDENTITY_CONFLICT" };
     const merged = distinctFills([...recent, ...history.fills]);
-    reason = legReason(merged, args);
+    if (merged.conflicts) return { fills: [], averagePx: null, reason: "FILL_IDENTITY_CONFLICT" };
+    reason = legReason(merged.fills, args);
     if (!history.complete) reason = "FILL_HISTORY_INCOMPLETE";
-    if (reason === null) return { fills: merged, averagePx: weightedAveragePrice(merged), reason: null };
+    if (reason === null) return { fills: merged.fills, averagePx: weightedAveragePrice(merged.fills), reason: null };
     return { fills: [], averagePx: null, reason };
   } catch {
     return { fills: [], averagePx: null, reason: "FILL_HISTORY_LOOKUP_FAILED" };
@@ -157,7 +155,9 @@ async function resolveFees(d: EvidenceFinalizerDeps, t: Record<string, unknown>)
   ]);
   if (entry.reason) return { fees: null, entryPx: null, exitPx: null, reason: `ENTRY_${entry.reason}` };
   if (exit.reason) return { fees: null, entryPx: null, exitPx: null, reason: `EXIT_${exit.reason}` };
-  const fills = distinctFills([...entry.fills, ...exit.fills]);
+  const combined = distinctFills([...entry.fills, ...exit.fills]);
+  if (combined.conflicts) return { fees: null, entryPx: null, exitPx: null, reason: "FILL_IDENTITY_CONFLICT" };
+  const fills = combined.fills;
   if (fills.some((fill) => finite(fill.fee) === null) || entry.averagePx === null || exit.averagePx === null) {
     return { fees: null, entryPx: null, exitPx: null, reason: "FEE_VALUE_INVALID" };
   }

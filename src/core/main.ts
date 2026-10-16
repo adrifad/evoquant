@@ -13,7 +13,7 @@ import { scanInstruments, scanCoreV2, pickEntry, type ScanRow } from "../strateg
 import { attemptRankedCandidates } from "../strategy/candidate-queue.ts";
 import { type TradeCandidate, parseStrategyV2Params, type StrategyV2Id, type StrategyV2Params } from "../strategy/core-v2.ts";
 import { ensureV2Registry, getV2ChampionParams, getV2ChampionVersions, getV2Champions } from "../strategy/v2-registry.ts";
-import { startupSafetySequence, runTick, emergencyStop, getLastKillReason, resetLastKillReason, sweepUnprovenExits, persistCandles, priceTrigger } from "../execution/executor.ts";
+import { startupSafetySequence, runTick, emergencyStop, recoverProtectionHalt, inferLegacyProtectionHalt, getLastKillReason, resetLastKillReason, sweepUnprovenExits, persistCandles, priceTrigger } from "../execution/executor.ts";
 import { closeTradeOnExchange } from "../execution/executor.ts";
 import { getPositions } from "../exchange/okx/account.ts";
 import { getOpenTrades } from "../memory/trades.ts";
@@ -22,7 +22,7 @@ import { CandleCloseScheduler, msForBar } from "./scheduler.ts";
 import { ScalpRunner } from "../scalp/runner.ts";
 import type { ScalpCfg } from "../scalp/signals.ts";
 import { updateTradeStopPlus } from "../execution/position-management.ts";
-import { getBotState, setBotState } from "./state.ts";
+import { getBotState, setBotState, getRiskHaltReason, setRiskHaltReason, isEmergencyHalted } from "./state.ts";
 import { decide, gateCandidate, holdBecause, type Decision } from "../agents/decision-agent.ts";
 import { reviewTrade } from "../agents/reviewer-agent.ts";
 import { finalizePendingEvidence, reviewerEligibleTradeIds } from "../evidence/finalizer.ts";
@@ -143,8 +143,12 @@ async function main(): Promise<void> {
     persistCandles(store, sym, trading.timeframe, cs);
   }
 
+  inferLegacyProtectionHalt(store);
+  const stateBeforeStartup = getBotState(store);
+  const haltReasonBeforeStartup = getRiskHaltReason(store);
   setBotState(store, "STARTING");
   if (!(await startupSafetySequence(deps))) {
+    if (!getRiskHaltReason(store)) setRiskHaltReason(store, "STARTUP_SAFETY_FAILURE");
     setBotState(store, "RISK_HALTED");
     log.error({ event: "startup_failed", result: "trading disabled" });
     return;
@@ -156,7 +160,16 @@ async function main(): Promise<void> {
   await dynamicWatchlist.hydrateManagementMetadata(dynamicWatchlist.currentManagementUniverse());
   syncDynamicUniverse();
   loadStrategies(store);
-  setBotState(store, "RUNNING");
+  const safetyStateAfterStartup = getBotState(store);
+  if (stateBeforeStartup === "RISK_HALTED" || safetyStateAfterStartup === "RISK_HALTED") {
+    setBotState(store, "RISK_HALTED");
+    const currentHaltReason = getRiskHaltReason(store) ?? haltReasonBeforeStartup;
+    if (["LIVE_POSITION_PROTECTION_UNVERIFIED", "EXIT_PROTECTION_CLEANUP_UNVERIFIED", "EXCHANGE_STATE_UNKNOWN", "EXCHANGE_POSITION_MISMATCH", "ORPHANED_PROTECTION_ALGO"]
+      .includes(currentHaltReason ?? "")) {
+      await recoverProtectionHalt(deps);
+    }
+  } else if (isEmergencyHalted(store)) setBotState(store, "RISK_HALTED");
+  else setBotState(store, stateBeforeStartup === "PAUSED" ? "PAUSED" : "RUNNING");
   log.info({ event: "bot_started", state: getBotState(store) });
 
   let lastTick: { features: unknown; regime: string; at: string } | null = null;

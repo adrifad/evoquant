@@ -3,7 +3,7 @@ import type { InstrumentInfo, Position } from "../exchange/okx/types.ts";
 import { amendConditionalStop, getAlgoOrder, normalizePriceToTick } from "../exchange/okx/algo.ts";
 import type { Store } from "../memory/db.ts";
 import { logSystemEvent } from "../memory/db.ts";
-import { setBotState } from "../core/state.ts";
+import { setBotState, setRiskHaltReason } from "../core/state.ts";
 import { calculateSlPlusStop } from "./sl-plus.ts";
 import { serializeTradeMutation } from "./trade-mutation.ts";
 
@@ -52,6 +52,7 @@ export async function updateTradeStopPlus(
     if (!algoId || !tpAlgoId || String(position.pos) === "0" || position.instId !== String(current.instrument)
       || meta.instId !== String(current.instrument) || !Number.isFinite(Number(meta.tickSz)) || Number(meta.tickSz) <= 0) {
       store.db.prepare("UPDATE trades SET protection_state='DEGRADED' WHERE trade_id=?").run(tradeId);
+      setRiskHaltReason(store, "LIVE_POSITION_PROTECTION_UNVERIFIED");
       setBotState(store, "RISK_HALTED");
       logSystemEvent(store, "RISK_EVENT", { sl_plus_not_applied: "missing active position protection", tradeId, candidate });
       return { stopPx, updated: false };
@@ -86,6 +87,7 @@ export async function updateTradeStopPlus(
       return { stopPx: Number(expectedStop), updated: true };
     } catch (error) {
       store.db.prepare("UPDATE trades SET protection_state='DEGRADED' WHERE trade_id=?").run(tradeId);
+      setRiskHaltReason(store, "LIVE_POSITION_PROTECTION_UNVERIFIED");
       setBotState(store, "RISK_HALTED");
       logSystemEvent(store, "RISK_EVENT", {
         sl_plus_amend_failed: error instanceof Error ? error.message : String(error), tradeId, oldStop: stopPx, candidate,

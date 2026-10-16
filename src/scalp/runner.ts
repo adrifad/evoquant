@@ -12,7 +12,7 @@ import { getCandles } from "../exchange/okx/market.ts";
 import { getBalance, getPositions } from "../exchange/okx/account.ts";
 import { getServerTime } from "../exchange/okx/market.ts";
 import { waitForOrderTerminal, getFills } from "../exchange/okx/orders.ts";
-import { placeConditionalProtection, ProtectionPlacementError } from "../exchange/okx/algo.ts";
+import { placeConditionalProtection, protectionClientIds, ProtectionPlacementError } from "../exchange/okx/algo.ts";
 import { updateTradeStopPlus } from "../execution/position-management.ts";
 import type { RiskConfig, TradingConfig } from "../core/config.ts";
 import type { Store } from "../memory/db.ts";
@@ -35,7 +35,7 @@ import {
 } from "./signals.ts";
 import { sizePosition } from "../risk/position-sizing.ts";
 import type { Regime } from "../market/regime.ts";
-import { baseline, getBotState, isEmergencyHalted, setBotState } from "../core/state.ts";
+import { baseline, getBotState, isEmergencyHalted, setBotState, setRiskHaltReason } from "../core/state.ts";
 import { evaluateKillSwitch } from "../risk/limits.ts";
 import { evaluateGlobalEntryGate } from "../risk/global-entry-gate.ts";
 import type { Position } from "../exchange/okx/types.ts";
@@ -308,7 +308,7 @@ export class ScalpRunner {
         botState: getBotState(store),
         openPositions: usdt.length,
         instrument: sig.instrument,
-        protectionDegraded: Boolean(store.db.prepare(`SELECT 1 FROM trades WHERE status IN ('OPEN','RECONCILIATION_PENDING')
+        protectionDegraded: Boolean(store.db.prepare(`SELECT 1 FROM trades WHERE status='OPEN'
           AND COALESCE(protection_state,'UNVERIFIED')<>'VERIFIED' LIMIT 1`).get()),
         instrumentOccupied: usdt.some((p) => p.instId === sig.instrument) ||
           localOpen.some((t) => String(t.instrument) === sig.instrument),
@@ -379,7 +379,7 @@ export class ScalpRunner {
       const candidateRisk = candidateStopRiskPct(Number(sz.contracts) * Number(meta.ctVal) * Math.abs(sig.price - sig.stopPx), finalEquity);
       const finalGate = evaluateGlobalEntryGate({
         killSwitchActive: finalKill ?? (isEmergencyHalted(store) ? "EMERGENCY_STOP" : null), botState: getBotState(store), openPositions: finalPositions.length,
-        protectionDegraded: Boolean(store.db.prepare(`SELECT 1 FROM trades WHERE status IN ('OPEN','RECONCILIATION_PENDING')
+        protectionDegraded: Boolean(store.db.prepare(`SELECT 1 FROM trades WHERE status='OPEN'
           AND COALESCE(protection_state,'UNVERIFIED')<>'VERIFIED' LIMIT 1`).get()),
         instrument: sig.instrument, instrumentOccupied: finalPositions.some((p) => p.instId === sig.instrument) ||
           finalLocal.some((t) => String(t.instrument) === sig.instrument),
@@ -432,15 +432,21 @@ export class ScalpRunner {
         plannedRiskPct: Number(actualContracts) * Number(meta.ctVal) * Math.abs(entryPx - stopPx) / finalEquity * 100,
         leverage: confirmedFillLeverage(entryPosition ?? filled, confirmedFillLeverage(filled, leverage)), entryFeatures: features,
       });
+      const protectionBaseId = clId(side, "ALGO", sig.instrument);
+      const clientAlgoIds = protectionClientIds(protectionBaseId);
+      store.db.prepare(`UPDATE trades SET protection_state='ENTRY_FILLED_PROTECTION_PENDING',
+        sl_algo_cl_ord_id=?,tp_algo_cl_ord_id=? WHERE trade_id=?`)
+        .run(clientAlgoIds.stop, clientAlgoIds.takeProfit, tradeId);
       try {
         const algo = await placeConditionalProtection(client, {
           instId: sig.instrument, posSide: side === "LONG" ? "long" : "short",
           contracts: actualContracts, tickSz: meta.tickSz, stopPrice: stopPx, takeProfitPrice: tpPx,
-          clAlgoId: clId(side, "ALGO", sig.instrument),
+          clAlgoId: protectionBaseId,
         });
         store.db.prepare("UPDATE trades SET algo_id=?,sl_algo_id=?,tp_algo_id=?,protection_state=? WHERE trade_id=?")
           .run(algo.stop.algoId, algo.stop.algoId, algo.takeProfit.algoId, positionReadbackVerified ? "VERIFIED" : "DEGRADED", tradeId);
         if (!positionReadbackVerified) {
+          setRiskHaltReason(store, "LIVE_POSITION_PROTECTION_UNVERIFIED");
           setBotState(store, "RISK_HALTED");
           logSystemEvent(store, "RISK_EVENT", { protection_degraded: "EXCHANGE_POSITION_SIZE_UNVERIFIED", tradeId, newEntriesHalted: true });
         }
@@ -449,6 +455,7 @@ export class ScalpRunner {
           store.db.prepare("UPDATE trades SET algo_id=?,sl_algo_id=?,tp_algo_id=?,protection_state='DEGRADED' WHERE trade_id=?")
             .run(error.stop.algoId, error.stop.algoId, error.takeProfit?.algoId ?? null, tradeId);
         } else store.db.prepare("UPDATE trades SET protection_state='DEGRADED' WHERE trade_id=?").run(tradeId);
+        setRiskHaltReason(store, "LIVE_POSITION_PROTECTION_UNVERIFIED");
         setBotState(store, "RISK_HALTED");
         logSystemEvent(store, "RISK_EVENT", { protection_degraded: error instanceof Error ? error.message : "UNKNOWN", tradeId, newEntriesHalted: true });
         releaseEntry(store, clOpen);

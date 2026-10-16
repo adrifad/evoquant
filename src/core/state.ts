@@ -16,6 +16,21 @@ export function setBotState(store: Store, s: BotState): void {
   kvSet(store, "bot_state", s);
 }
 
+/** Persist the provenance of a risk halt; a null kill-switch sample is not a
+ * sufficient reason to clear a halt established by another safety subsystem. */
+export function setRiskHaltReason(store: Store, reason: string): void {
+  kvSet(store, "risk_halt_reason", reason);
+}
+
+export function getRiskHaltReason(store: Store): string | null {
+  const reason = kvGet(store, "risk_halt_reason");
+  return reason ? reason : null;
+}
+
+export function clearRiskHaltReason(store: Store): void {
+  kvSet(store, "risk_halt_reason", "");
+}
+
 export interface EquityBaseline {
   dayKey: string;        // YYYY-MM-DD UTC
   dayStartEquity: number;

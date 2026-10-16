@@ -178,29 +178,62 @@ export async function getFillsHistory(client: OkxClient, instId?: string): Promi
 export async function getFillsHistoryForInstrument(
   client: OkxClient, instId: string, maxPages = 20,
 ): Promise<CompleteFillHistory> {
-  const fills: Fill[] = [];
-  const seen = new Set<string>();
+  let fills: Fill[] = [];
+  let conflicts = 0;
   let after: string | undefined;
   for (let page = 1; page <= maxPages; page++) {
     const data = await client.get<Array<Record<string, string>>>("/api/v5/trade/fills-history",
       { instType: "SWAP", instId, limit: 100, ...(after ? { after } : {}) }, true);
     const rows = data.map(mapFill);
-    for (const fill of rows) {
-      const key = `${fill.instId}:${fill.ordId}:${fill.tradeId}:${fill.ts}`;
-      if (!seen.has(key)) { seen.add(key); fills.push(fill); }
-    }
-    if (rows.length < 100) return { fills, complete: true, pages: page };
+    const normalized = deduplicateFills([...fills, ...rows]);
+    fills = normalized.fills;
+    conflicts += normalized.conflicts;
+    if (rows.length < 100) return { fills, complete: true, pages: page, ...(conflicts ? { conflicts } : {}) };
     const next = rows.at(-1)?.billId;
-    if (!next || next === after) return { fills, complete: false, pages: page };
+    if (!next || next === after) return { fills, complete: false, pages: page, ...(conflicts ? { conflicts } : {}) };
     after = next;
   }
-  return { fills, complete: false, pages: maxPages };
+  return { fills, complete: false, pages: maxPages, ...(conflicts ? { conflicts } : {}) };
 }
 
 export interface CompleteFillHistory {
   fills: Fill[];
   complete: boolean;
   pages: number;
+  conflicts?: number;
+}
+
+/** Deduplicate overlapping OKX recent/history pages without collapsing distinct
+ * partial executions. billId is the exchange fill identifier; when it is absent,
+ * the complete execution tuple is used. Rows without enough identity are kept
+ * distinct and must still pass order/quantity reconciliation before accounting. */
+export function deduplicateFills<T extends Fill>(fills: readonly T[]): { fills: T[]; duplicateCount: number; conflicts: number } {
+  const byKey = new Map<string, T>();
+  const aliases = new Map<string, string>();
+  let duplicateCount = 0;
+  let conflicts = 0;
+  for (const fill of fills) {
+    const billKey = fill.billId ? `bill:${fill.instId}:${fill.billId}` : null;
+    const executionKey = fill.tradeId && fill.ordId && fill.ts
+      ? `exec:${fill.instId}:${fill.ordId}:${fill.tradeId}:${fill.ts}` : null;
+    const existingKey = (billKey ? aliases.get(billKey) : undefined) ?? (executionKey ? aliases.get(executionKey) : undefined);
+    if (!existingKey) {
+      const key = executionKey ?? billKey ?? `unkeyed:${byKey.size}`;
+      byKey.set(key, fill);
+      if (billKey) aliases.set(billKey, key);
+      if (executionKey) aliases.set(executionKey, key);
+      continue;
+    }
+    const previous = byKey.get(existingKey)!;
+    duplicateCount += 1;
+    if (previous.instId !== fill.instId || previous.ordId !== fill.ordId || previous.tradeId !== fill.tradeId
+      || previous.fillPx !== fill.fillPx || previous.fillSz !== fill.fillSz || previous.fee !== fill.fee
+      || previous.feeCcy !== fill.feeCcy || previous.side !== fill.side || previous.posSide !== fill.posSide
+      || previous.ts !== fill.ts) conflicts += 1;
+    if (billKey) aliases.set(billKey, existingKey);
+    if (executionKey) aliases.set(executionKey, existingKey);
+  }
+  return { fills: [...byKey.values()], duplicateCount, conflicts };
 }
 
 /**
@@ -215,8 +248,8 @@ export async function getFillsHistoryForOrder(
   maxPages = 20,
 ): Promise<CompleteFillHistory> {
   const pageSize = 100;
-  const fills: Fill[] = [];
-  const seen = new Set<string>();
+  let fills: Fill[] = [];
+  let conflicts = 0;
   let after: string | undefined;
   for (let page = 1; page <= maxPages; page++) {
     const data = await client.get<Array<Record<string, string>>>(
@@ -225,16 +258,15 @@ export async function getFillsHistoryForOrder(
       true,
     );
     const rows = data.map(mapFill);
-    for (const fill of rows) {
-      const key = `${fill.instId}:${fill.ordId}:${fill.tradeId}:${fill.ts}`;
-      if (!seen.has(key)) { seen.add(key); fills.push(fill); }
-    }
-    if (rows.length < pageSize) return { fills, complete: true, pages: page };
+    const normalized = deduplicateFills([...fills, ...rows]);
+    fills = normalized.fills;
+    conflicts += normalized.conflicts;
+    if (rows.length < pageSize) return { fills, complete: true, pages: page, ...(conflicts ? { conflicts } : {}) };
     const next = rows.at(-1)?.billId;
-    if (!next || next === after) return { fills, complete: false, pages: page };
+    if (!next || next === after) return { fills, complete: false, pages: page, ...(conflicts ? { conflicts } : {}) };
     after = next;
   }
-  return { fills, complete: false, pages: maxPages };
+  return { fills, complete: false, pages: maxPages, ...(conflicts ? { conflicts } : {}) };
 }
 
 // spec §10/§11/§13 — close a position side: opposite order side, same posSide

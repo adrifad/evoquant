@@ -13,11 +13,11 @@ import { timingSafeEqual, createHash } from "node:crypto";
 import type { Duplex } from "node:stream";
 import type { AddressInfo } from "node:net";
 import type { Store } from "../memory/db.ts";
-import { getBotState, setBotState, isEmergencyHalted, setEmergencyHalted, baseline } from "../core/state.ts";
+import { getBotState, setBotState, isEmergencyHalted, baseline, getRiskHaltReason } from "../core/state.ts";
 import { getWeights } from "../learning/signal-weights.ts";
 import { regimeStats, scopedPerformance } from "../memory/regimes.ts";
 import { kvGet, logSystemEvent } from "../memory/db.ts";
-import { emergencyStop, type ExecutorDeps } from "../execution/executor.ts";
+import { emergencyStop, clearEmergency, type ExecutorDeps } from "../execution/executor.ts";
 import { setEnvKeys, maskKey } from "./settings.ts";
 import { loadRepoEnv } from "./env.ts";
 import path from "node:path";
@@ -367,12 +367,23 @@ export function startDashboard(cfg: DashboardConfig): DashboardServer {
     }
     if (method === "POST" && p === "/api/clear-halt") { // §95: requires confirm flag
       if (url.searchParams.get("confirm") !== "yes") return send(400, { error: "confirm=yes required (§95)" });
-      setEmergencyHalted(store, false);
-      setBotState(store, "RUNNING");
-      return send(200, { ok: true, state: getBotState(store) });
+      try {
+        await clearEmergency(cfg.deps());
+        return send(200, { ok: true, state: getBotState(store) });
+      } catch (error) {
+        return send(409, { error: error instanceof Error ? error.message : "SAFE_RECOVERY_PRECONDITIONS_NOT_MET", state: getBotState(store) });
+      }
     }
     if (method === "POST" && (p === "/api/pause" || p === "/api/resume")) {
-      setBotState(store, p.endsWith("pause") ? "PAUSED" : "RUNNING");
+      if (p.endsWith("pause")) {
+        if (getBotState(store) === "RISK_HALTED") return send(409, { error: "RISK_HALT_ACTIVE", state: getBotState(store) });
+        setBotState(store, "PAUSED");
+      } else {
+        if (getBotState(store) !== "PAUSED" || isEmergencyHalted(store) || getRiskHaltReason(store)) {
+          return send(409, { error: "SAFE_RESUME_PRECONDITIONS_NOT_MET", state: getBotState(store) });
+        }
+        setBotState(store, "RUNNING");
+      }
       return send(200, { ok: true, state: getBotState(store) });
     }
     if (p === "/api/settings/llm-roles") {
