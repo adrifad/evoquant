@@ -56,6 +56,7 @@ export interface DashboardConfig {
   deps: () => ExecutorDeps;
   getLastTick: () => { features: unknown; regime: string; at: string } | null;
   getKillReason: () => string | null;
+  getExistingPositionMonitoring?: () => boolean;
   getScan: () => Array<{ instrument: string; regime: string; price: number; score: number; strategy: string | null; tradable: boolean }>;
   evolution: {
     reviewEvery: boolean; signalInterval: number; strategyInterval: number; minSample: number;
@@ -134,6 +135,9 @@ export function startDashboard(cfg: DashboardConfig): DashboardServer {
       const eq = finite(usdt?.eq);
       const base = eq !== null ? baseline(store, eq) : null;
       const open = store.db.prepare("SELECT * FROM trades WHERE status IN ('OPEN','RECONCILIATION_PENDING')").all() as Array<Record<string, unknown>>;
+      const reconciliationState = store.db.prepare(`SELECT COUNT(*) AS pending_count,
+        MAX(exit_reconcile_last_attempt_ts) AS last_attempt_at,MIN(exit_reconcile_next_retry_ts) AS next_retry_at
+        FROM trades WHERE status='RECONCILIATION_PENDING'`).get() as { pending_count: number; last_attempt_at: string | null; next_retry_at: string | null };
       const capital = accountCapital(bal, exchange.positions, open, cfg.deps().instruments, cfg.trading.leverage.default);
       const portfolio = exchange.positions && eq !== null
         ? portfolioOpenRisk({ equity: eq, positions: exchange.positions, trades: open, instruments: cfg.deps().instruments })
@@ -146,14 +150,39 @@ export function startDashboard(cfg: DashboardConfig): DashboardServer {
       const evidenceCounts = store.db.prepare("SELECT evidence_state,COUNT(*) c FROM trades WHERE status='CLOSED' GROUP BY evidence_state").all() as Array<{ evidence_state: string; c: number }>;
       const evidenceByState = Object.fromEntries(evidenceCounts.map(row => [row.evidence_state, row.c]));
       const evidencePending = Number(evidenceByState.EVIDENCE_PENDING ?? 0) + Number(evidenceByState.ACCOUNTING_INCOMPLETE ?? 0);
+      const persistedHaltReason = getRiskHaltReason(store);
+      const currentState = getBotState(store);
+      const killObservation = cfg.getKillReason();
+      const protectionVerificationStatus = exchange.positions === null ? "UNKNOWN"
+        : open.some((trade) => trade.status === "OPEN" && String(trade.protection_state ?? "UNVERIFIED") !== "VERIFIED") ? "UNVERIFIED"
+        : exchange.positions.filter((position) => Number(position.pos) !== 0).some((position) =>
+          !open.some((trade) => trade.status === "OPEN" && String(trade.instrument) === position.instId
+            && String(trade.side).toLowerCase() === position.posSide && String(trade.protection_state) === "VERIFIED")) ? "UNEXPECTED_EXPOSURE" : "VERIFIED_OR_FLAT";
+      const recoveryEvent = store.db.prepare(`SELECT ts,kind,payload FROM system_events
+        WHERE kind IN ('STATE','RISK_EVENT') AND (payload LIKE '%RISK_RECOVERY_ATTEMPT%'
+          OR payload LIKE '%RISK_RECOVERY_FAILED%' OR payload LIKE '%RISK_HALT_RECOVERED%') ORDER BY id DESC LIMIT 1`).get() as
+        { ts: string; kind: string; payload: string } | undefined;
+      const entryBlocked = currentState !== "RUNNING" || isEmergencyHalted(store) || Boolean(persistedHaltReason)
+        || killObservation !== null || exchange.balance === null || exchange.positions === null
+        || protectionVerificationStatus === "UNVERIFIED" || protectionVerificationStatus === "UNEXPECTED_EXPOSURE";
       return send(200, {
         environment: "DEMO",                       // §96 always visible
         exchange: "OKX",
         instrument: cfg.trading.instrument.id,
         timeframe: cfg.trading.timeframe,
-        botState: getBotState(store),              // §89
+        botState: currentState,                    // §89
         emergencyHalted: isEmergencyHalted(store),
         killReason: cfg.getKillReason(),
+        persistedHaltReason,
+        latestKillSwitchObservation: killObservation,
+        exchangeConnectivity: exchange.balance !== null && exchange.positions !== null ? "CONNECTED" : "UNAVAILABLE",
+        protectionVerificationStatus,
+        reconciliation: { pendingCount: reconciliationState.pending_count, lastAttemptAt: reconciliationState.last_attempt_at,
+          nextRetryAt: reconciliationState.next_retry_at },
+        lastRecoveryAttempt: recoveryEvent ? { at: recoveryEvent.ts, kind: recoveryEvent.kind,
+          payload: (() => { try { return JSON.parse(recoveryEvent.payload); } catch { return null; } })() } : null,
+        newEntriesPermitted: !entryBlocked,
+        existingPositionMonitoringOperational: cfg.getExistingPositionMonitoring?.() ?? false,
         equity: eq,
         capital, exchangeState: capital.state, updatedAt: new Date(exchange.at).toISOString(), marketUpdatedAt: cfg.getLastTick()?.at ?? null,
         watchlist: cfg.deps().watchlist,

@@ -7,7 +7,7 @@ import { buildPrehash, signPayload, buildAuthHeaders } from "../src/exchange/okx
 import { normalizeContractSize } from "../src/exchange/okx/sizing.ts";
 import { OkxClient, OkxApiError, OkxConfigError, resolveBaseUrl, DEMO_BASE_URL, buildQuery } from "../src/exchange/okx/client.ts";
 import { getCandles } from "../src/exchange/okx/market.ts";
-import { placeOrder, getOrder, closePosition, waitForOrderTerminal, OrderRejectedError, OrderTimeoutError, prepareOrderSize } from "../src/exchange/okx/orders.ts";
+import { placeOrder, getOrder, getOrderByClientId, closePosition, waitForOrderTerminal, OrderRejectedError, OrderTimeoutError, prepareOrderSize } from "../src/exchange/okx/orders.ts";
 import { createDemoExchange } from "../src/exchange/okx/index.ts";
 import { amendConditionalStop, getAlgoOrder, normalizePriceToTick, placeConditionalProtection } from "../src/exchange/okx/algo.ts";
 import { redact } from "../src/core/logger.ts";
@@ -249,6 +249,17 @@ test("getOrder maps raw detail incl. state", async () => {
   });
   const d = await getOrder(client, "BTC-USDT-SWAP", "O5");
   assert.equal(d.state, "canceled");
+});
+
+test("client order lookup treats only OKX 51603 as absent and preserves other failures", async () => {
+  const absent = new OkxClient({ environment: "demo", credentials: { apiKey: "k", secret: "s", passphrase: "p" },
+    fetchImpl: (async () => new Response(JSON.stringify({ code: "51603", msg: "Order does not exist", data: [] }), { status: 200 })) as unknown as typeof fetch });
+  assert.equal(await getOrderByClientId(absent, "BTC-USDT-SWAP", "CLIENT1"), null);
+
+  const unavailable = new OkxClient({ environment: "demo", credentials: { apiKey: "k", secret: "s", passphrase: "p" },
+    fetchImpl: (async () => new Response(JSON.stringify({ code: "50011", msg: "Rate limit", data: [] }), { status: 200 })) as unknown as typeof fetch });
+  await assert.rejects(() => getOrderByClientId(unavailable, "BTC-USDT-SWAP", "CLIENT1"),
+    (error: unknown) => error instanceof OkxApiError && error.code === "50011");
 });
 
 test("conditional SL amendment preserves safe tick rounding and confirms its live trigger", async () => {

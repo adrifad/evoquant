@@ -43,6 +43,7 @@ import { runOncePerGlobalCycle } from "./global-cycle.ts";
 import { RoleLlmService } from "./llm-role-service.ts";
 import { createLogger } from "./logger.ts";
 import { startDashboard } from "./dashboard.ts";
+import { runStartupSafetyAndStartDashboard } from "./startup-lifecycle.ts";
 import { CORE_WATCHLIST, DynamicWatchlistService } from "../market/dynamic-watchlist.ts";
 import { recordScanState, recordSwingScanResults } from "../market/scan-state.ts";
 import { recordCandidateAttempt, recordOpportunityMetric, pruneOpportunityTelemetry } from "../market/opportunity-funnel.ts";
@@ -103,8 +104,9 @@ async function main(): Promise<void> {
   if (watchlist.length === 0) throw new Error("no watchlist instruments have metadata (§43)");
   const runtimeTrading = new RuntimeTradingService({ store, trading, risk, instruments: dynamicWatchlist.currentEntryUniverse() });
   const deps = { client, trading, risk, store, instruments, watchlist };
+  let exchangeManagement: string[] = [];
   const syncDynamicUniverse = () => {
-    dynamicWatchlist.setManagementSymbols(workflowSymbols());
+    dynamicWatchlist.setManagementSymbols([...workflowSymbols(), ...exchangeManagement]);
     dynamicWatchlist.syncCatalog(instruments);
     dynamicWatchlist.applyRiskAllowlist(risk.hard_limits.allowed_symbols);
     runtimeTrading.setInstruments(dynamicWatchlist.currentEntryUniverse());
@@ -135,7 +137,9 @@ async function main(): Promise<void> {
         log.warn({ event: "historical_backfill_failed", instId: sym, error: e instanceof Error ? e.message : String(e) });
       }
     }
-    const recent = await getCandles(client, sym, trading.timeframe, 300);
+    let recent: Candle[] = [];
+    try { recent = await getCandles(client, sym, trading.timeframe, 300); }
+    catch (e) { log.warn({ event: "startup_market_data_unavailable", instId: sym, error: e instanceof Error ? e.message : String(e) }); }
     const merged = new Map<number, Candle>();
     for (const c of [...cached, ...historic, ...recent]) if (c.confirm === "1") merged.set(c.ts, c);
     const cs = [...merged.values()].sort((a, b) => a.ts - b.ts);
@@ -144,38 +148,11 @@ async function main(): Promise<void> {
   }
 
   inferLegacyProtectionHalt(store);
-  const stateBeforeStartup = getBotState(store);
-  const haltReasonBeforeStartup = getRiskHaltReason(store);
-  setBotState(store, "STARTING");
-  if (!(await startupSafetySequence(deps))) {
-    if (!getRiskHaltReason(store)) setRiskHaltReason(store, "STARTUP_SAFETY_FAILURE");
-    setBotState(store, "RISK_HALTED");
-    log.error({ event: "startup_failed", result: "trading disabled" });
-    return;
-  }
-  // An exchange position can outlive the daily entry selection. Restore exact
-  // metadata before any monitoring, reconciliation, or accounting path runs.
-  const exchangeManagement = (await getPositions(client)).filter((position) => position.pos !== "0").map((position) => position.instId);
-  dynamicWatchlist.setManagementSymbols([...workflowSymbols(), ...exchangeManagement]);
-  await dynamicWatchlist.hydrateManagementMetadata(dynamicWatchlist.currentManagementUniverse());
-  syncDynamicUniverse();
-  loadStrategies(store);
-  const safetyStateAfterStartup = getBotState(store);
-  if (stateBeforeStartup === "RISK_HALTED" || safetyStateAfterStartup === "RISK_HALTED") {
-    setBotState(store, "RISK_HALTED");
-    const currentHaltReason = getRiskHaltReason(store) ?? haltReasonBeforeStartup;
-    if (["LIVE_POSITION_PROTECTION_UNVERIFIED", "EXIT_PROTECTION_CLEANUP_UNVERIFIED", "EXCHANGE_STATE_UNKNOWN", "EXCHANGE_POSITION_MISMATCH", "ORPHANED_PROTECTION_ALGO"]
-      .includes(currentHaltReason ?? "")) {
-      await recoverProtectionHalt(deps);
-    }
-  } else if (isEmergencyHalted(store)) setBotState(store, "RISK_HALTED");
-  else setBotState(store, stateBeforeStartup === "PAUSED" ? "PAUSED" : "RUNNING");
-  log.info({ event: "bot_started", state: getBotState(store) });
-
   let lastTick: { features: unknown; regime: string; at: string } | null = null;
   let lastKill: string | null = null;
   let lastScan: ScanRow[] = [];
-  const dash = startDashboard({
+  let existingPositionMonitoringOperational = false;
+  const startup = await runStartupSafetyAndStartDashboard(store, () => startupSafetySequence(deps), () => startDashboard({
     port: Number(env.DASHBOARD_PORT ?? 8790),
     ...(env.DASHBOARD_BIND ? { bind: env.DASHBOARD_BIND } : {}),
     ...(env.DASHBOARD_USER ? { auth: { user: env.DASHBOARD_USER, password: env[["DASHBOARD","PASSWORD"].join("_")] ?? "" } } : {}),
@@ -195,11 +172,38 @@ async function main(): Promise<void> {
     getLastTick: () => lastTick,
     getKillReason: () => getLastKillReason(),
     getScan: () => lastScan,
+    getExistingPositionMonitoring: () => existingPositionMonitoringOperational,
     llmRoles,
     dynamicWatchlist: { projection: () => dynamicWatchlist.projection(), refreshManual: async () => {
       const result = await dynamicWatchlist.refreshManual(); syncDynamicUniverse(); return result;
     } },
-  });
+  }));
+  if (!startup.safetyPassed) log.error({ event: "startup_degraded", result: "dashboard and safety monitoring will remain available; new entries disabled" });
+  // An exchange position can outlive the daily entry selection. Restore exact
+  // metadata before any monitoring, reconciliation, or accounting path runs.
+  try { exchangeManagement = (await getPositions(client)).filter((position) => position.pos !== "0").map((position) => position.instId); }
+  catch (error) {
+    if (!getRiskHaltReason(store)) setRiskHaltReason(store, "EXCHANGE_STATE_UNKNOWN");
+    setBotState(store, "RISK_HALTED");
+    logSystemEvent(store, "RISK_EVENT", { event: "STARTUP_EXCHANGE_STATE_UNAVAILABLE", reason: "EXCHANGE_STATE_UNKNOWN",
+      detail: error instanceof Error ? error.message.slice(0, 160) : "UNKNOWN", newEntriesPermitted: false });
+  }
+  dynamicWatchlist.setManagementSymbols([...workflowSymbols(), ...exchangeManagement]);
+  await dynamicWatchlist.hydrateManagementMetadata(dynamicWatchlist.currentManagementUniverse());
+  syncDynamicUniverse();
+  loadStrategies(store);
+  const safetyStateAfterStartup = getBotState(store);
+  if (startup.previousState === "RISK_HALTED" || safetyStateAfterStartup === "RISK_HALTED") {
+    setBotState(store, "RISK_HALTED");
+    const currentHaltReason = getRiskHaltReason(store) ?? startup.previousHaltReason;
+    if (["LIVE_POSITION_PROTECTION_UNVERIFIED", "EXIT_PROTECTION_CLEANUP_UNVERIFIED", "EXCHANGE_STATE_UNKNOWN", "EXCHANGE_POSITION_MISMATCH", "ORPHANED_PROTECTION_ALGO", "STARTUP_SAFETY_FAILURE"]
+      .includes(currentHaltReason ?? "")) {
+      await recoverProtectionHalt(deps);
+    }
+  } else if (isEmergencyHalted(store)) setBotState(store, "RISK_HALTED");
+  else setBotState(store, startup.previousState === "PAUSED" ? "PAUSED" : startup.safetyPassed ? "RUNNING" : "RISK_HALTED");
+  log.info({ event: "bot_started", state: getBotState(store) });
+  const dash = startup.dashboard;
 
   const ctxFor = (instId2: string, features: FeatureSnapshot, regime: Regime, strategies: StrategyDef[], candidate?: TradeCandidate) => ({
     features, regime, strategies,
@@ -479,9 +483,20 @@ async function main(): Promise<void> {
     }).finally(() => { finalizerRunning = false; });
   }, 60_000);
 
+  let reconciliationRunning = false;
+  const runReconciliation = async () => {
+    if (reconciliationRunning) return;
+    reconciliationRunning = true;
+    try { await sweepUnprovenExits(deps); }
+    catch (error) { log.warn({ event: "exit_reconciliation_sweep_failed", error: error instanceof Error ? error.message.slice(0, 160) : "UNKNOWN" }); }
+    finally { reconciliationRunning = false; }
+  };
+  void runReconciliation();
+  const reconciliationTimer = setInterval(() => void runReconciliation(), 60_000);
+
   const sched = new CandleCloseScheduler(msForBar(trading.timeframe), tick);
   sched.start();
-  await tick(); // immediate first evaluation with warm-up data
+  void tick(); // immediate evaluation must not delay dashboard or protective monitors
 
   let dynamicRefreshTimer: NodeJS.Timeout | undefined;
   const scheduleDynamicRefresh = () => {
@@ -505,10 +520,21 @@ async function main(): Promise<void> {
     });
     scalpRunner.start();
   }
+  existingPositionMonitoringOperational = true;
+
+  let recoveryRunning = false;
+  const recoveryTimer = setInterval(() => {
+    if (recoveryRunning || getBotState(store) !== "RISK_HALTED" || isEmergencyHalted(store)) return;
+    const reason = getRiskHaltReason(store);
+    if (!["STARTUP_SAFETY_FAILURE", "LIVE_POSITION_PROTECTION_UNVERIFIED", "EXIT_PROTECTION_CLEANUP_UNVERIFIED",
+      "EXCHANGE_STATE_UNKNOWN", "EXCHANGE_POSITION_MISMATCH", "ORPHANED_PROTECTION_ALGO"].includes(reason ?? "")) return;
+    recoveryRunning = true;
+    void recoverProtectionHalt(deps).finally(() => { recoveryRunning = false; });
+  }, 60_000);
 
   process.on("SIGINT", () => {
     log.warn({ event: "sigint_emergency_stop" });
-    void emergencyStop(deps).finally(() => { sched.stop(); clearInterval(intrabar); clearInterval(evidenceFinalizer); if (dynamicRefreshTimer) clearTimeout(dynamicRefreshTimer); scalpRunner?.stop(); store.close(); process.exit(0); });
+    void emergencyStop(deps).finally(() => { sched.stop(); clearInterval(intrabar); clearInterval(evidenceFinalizer); clearInterval(reconciliationTimer); clearInterval(recoveryTimer); if (dynamicRefreshTimer) clearTimeout(dynamicRefreshTimer); scalpRunner?.stop(); store.close(); process.exit(0); });
   });
 }
 

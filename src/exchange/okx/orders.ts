@@ -126,6 +126,21 @@ export async function getOrder(client: OkxClient, instId: string, ordId: string)
   return mapOrderDetail(firstOf(data, "trade/order detail"), instId);
 }
 
+/** Exact lookup used before retrying an order submission with a durable client ID. */
+export async function getOrderByClientId(client: OkxClient, instId: string, clOrdId: string): Promise<OrderDetail | null> {
+  try {
+    const rows = await client.get<Array<Record<string, string>>>("/api/v5/trade/order", { instId, clOrdId }, true);
+    const exact = rows.find((row) => row.instId === instId && row.clOrdId === clOrdId);
+    return exact ? mapOrderDetail(exact, instId) : null;
+  } catch (error) {
+    // OKX returns 51603 when a clOrdId has never been accepted. Treat only
+    // that authoritative not-found response as an absent prior order; network,
+    // auth, and every other API error must still block a new submission.
+    if (error instanceof OkxApiError && error.code === "51603") return null;
+    throw error;
+  }
+}
+
 // spec §14 — pending orders (also used for startup/restart reconciliation §43/§45)
 export async function getPendingOrders(client: OkxClient, instId?: string): Promise<OrderDetail[]> {
   const data = await client.get<Array<Record<string, string>>>(

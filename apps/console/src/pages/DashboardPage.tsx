@@ -13,7 +13,7 @@ export function DashboardPage({ status }: { status: ApiState<Row> }) {
   const daily = asRow(s?.daily) ?? {};
   const totals = asRow(s?.totals) ?? {};
   const decision = asRow(s?.latestDecision);
-  const halt = Boolean(s?.emergencyHalted || s?.killReason || s?.botState === "RISK_HALTED" || s?.botState === "ERROR");
+  const halt = Boolean(s?.emergencyHalted || s?.killReason || s?.persistedHaltReason || s?.botState === "RISK_HALTED" || s?.botState === "ERROR");
   const warning = !halt && (s?.botState === "PAUSED" || s?.botState === "STOPPED");
   const open = asRows(s?.openPositions)[0] ?? {};
   const recentTrades = asRows(tradesApi.data).slice(0, 6);
@@ -22,6 +22,7 @@ export function DashboardPage({ status }: { status: ApiState<Row> }) {
   const currentPnl = pnlKnown ? openPositions.reduce((sum, position) => sum + asNumber(position.upl)!, 0) : null;
   const limits = asRow(s?.limits) ?? {};
   const execution = asRow(s?.latestExecution);
+  const reconciliation = asRow(s?.reconciliation) ?? {};
   const executionPayload = asRow(parseJson(execution?.payload, {})) ?? {};
   const executionDetail = [executionPayload.instId ?? executionPayload.instrument, executionPayload.side, executionPayload.reason, executionPayload.tradeId].filter(value => value !== null && value !== undefined && value !== "").map(String).join(" | ");
   const roles = asRows(s?.aiRoles);
@@ -38,9 +39,12 @@ export function DashboardPage({ status }: { status: ApiState<Row> }) {
     {protectionWarnings.length ? <div className="inline-warning" role="alert"><strong>Position protection needs verification</strong> {protectionWarnings.map(row => asText(row.instrument)).join(", ")}. New entries are paused while native stop and target protection is unresolved.</div> : null}
     <CapitalSummary status={s}/>
     <div className={`risk-banner ${halt ? "risk-critical" : warning ? "risk-warning" : "risk-safe"}`} role="status">
-      <div className="risk-banner-copy"><span className="risk-banner-mark"/><div><strong>{halt ? "Trading risk halt" : warning ? `Bot ${asText(s.botState).toLowerCase()}` : "Risk controls active"}</strong><span>{halt ? asText(s.killReason, s.emergencyHalted ? "Emergency stop is active." : "Trading halted by system state.") : warning ? "No new automated entries are being evaluated while the bot is paused." : "No active kill-switch condition is reported by status."}</span></div></div>
+      <div className="risk-banner-copy"><span className="risk-banner-mark"/><div><strong>{halt ? "Trading risk halt" : warning ? `Bot ${asText(s.botState).toLowerCase()}` : "Risk controls active"}</strong><span>{halt ? asText(s.persistedHaltReason, asText(s.killReason, s.emergencyHalted ? "Emergency stop is active." : "Trading halted by system state.")) : warning ? "No new automated entries are being evaluated while the bot is paused." : "No active kill-switch condition is reported by status."}</span></div></div>
       <StatusBadge value={halt ? "HALTED" : warning ? "WARNING" : "SAFE"}/>
     </div>
+    {halt || s.exchangeConnectivity !== "CONNECTED" || Number(reconciliation.pendingCount) > 0 ? <div className="inline-warning" role="status">
+      <strong>Safety diagnostics</strong> {`Persisted halt: ${asText(s.persistedHaltReason, "none")}; latest kill-switch: ${asText(s.latestKillSwitchObservation, "no active observation")}; exchange: ${asText(s.exchangeConnectivity, "unknown")}; protection: ${asText(s.protectionVerificationStatus, "unknown")}; reconciliation pending: ${asText(reconciliation.pendingCount, "unknown")}; new entries: ${s.newEntriesPermitted === true ? "permitted subject to risk gates" : "blocked"}; position monitoring: ${s.existingPositionMonitoringOperational === true ? "operational" : "not confirmed"}.`}
+    </div> : null}
 
     <section className="activity-strip" aria-label="Latest operational activity">
       <div className="activity-cell"><span className="metric-label">Strategy activity</span><div className="activity-value"><strong>{asText(decision?.strategy, "No decision recorded")}</strong>{decision ? <StatusBadge value={decision.decision}/> : null}</div><span className="activity-detail">{formatTimestamp(decision?.ts)}{decision?.instrument ? ` | ${asText(decision.instrument)}` : ""}</span></div>

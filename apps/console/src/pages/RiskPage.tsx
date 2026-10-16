@@ -17,10 +17,12 @@ export function RiskPage({ status }: { status: ApiState<Row> }) {
   const dailyLimit = asNumber(limits.max_daily_loss_pct);
   const drawdownLimit = asNumber(limits.max_drawdown_pct);
   const nearLimit = (dailyLimit !== null && dailyPct !== null && dailyLimit > 0 && dailyPct >= dailyLimit * 0.75) || (drawdownLimit !== null && drawdown !== null && drawdownLimit > 0 && drawdown >= drawdownLimit * 0.75);
-  const halted = Boolean(s.emergencyHalted || s.killReason || s.botState === "RISK_HALTED" || s.botState === "ERROR");
+  const halted = Boolean(s.emergencyHalted || s.killReason || s.persistedHaltReason || s.botState === "RISK_HALTED" || s.botState === "ERROR");
   const riskState = halted ? "HALTED" : dailyPct === null || drawdown === null ? "UNKNOWN" : nearLimit ? "WARNING" : "SAFE";
   const riskEvents = asRows(eventsApi.data).filter(event => String(event.kind).includes("RISK") || event.kind === "STATE");
   const portfolio = asRow(s.portfolioRisk) ?? {};
+  const recovery = asRow(s.lastRecoveryAttempt) ?? {};
+  const recoveryPayload = asRow(recovery.payload) ?? {};
   const portfolioRisk = asNumber(portfolio.riskPct);
   const lossToStops = asNumber(portfolio.lossToStops);
   const portfolioLimit = asNumber(limits.max_portfolio_open_risk_pct);
@@ -28,6 +30,22 @@ export function RiskPage({ status }: { status: ApiState<Row> }) {
 
   return <div className="page">
     <PageHeading title="Risk" description="Deterministic controls and risk events remain separate from AI decisions." detail={<StatusBadge value={riskState}/>}/>
+    <Panel title="Safety state" subtitle="Persistent halt state and latest exchange/risk observations are reported independently">
+      <div className="risk-limit-grid">
+        <Field label="Bot state" value={asText(s.botState, "UNKNOWN")}/>
+        <Field label="Persisted halt reason" value={asText(s.persistedHaltReason, "None")}/>
+        <Field label="Latest kill-switch observation" value={asText(s.latestKillSwitchObservation, "No active observation")}/>
+        <Field label="Emergency Stop" value={s.emergencyHalted ? "ACTIVE" : "Inactive"}/>
+        <Field label="Exchange connectivity" value={asText(s.exchangeConnectivity, "Unknown")}/>
+        <Field label="Protection verification" value={asText(s.protectionVerificationStatus, "Unknown")}/>
+        <Field label="Reconciliation pending" value={asText(asRow(s.reconciliation)?.pendingCount, "Unknown")}/>
+        <Field label="Last reconciliation attempt" value={formatTimestamp(asRow(s.reconciliation)?.lastAttemptAt)}/>
+        <Field label="Last recovery attempt" value={recovery.at ? `${formatTimestamp(recovery.at)} · ${asText(recoveryPayload.event, asText(recovery.kind, "UNKNOWN"))}` : "No recovery attempt"}/>
+        <Field label="Recovery result / reason" value={asText(recoveryPayload.reason, asText(recoveryPayload.recoveryReason, "No failure reported"))}/>
+        <Field label="New entries" value={s.newEntriesPermitted === true ? "Permitted subject to risk gates" : "Blocked"}/>
+        <Field label="Position monitoring" value={s.existingPositionMonitoringOperational === true ? "Operational" : "Not confirmed"}/>
+      </div>
+    </Panel>
     <CapitalSummary status={s}/>
     <RiskSettings equity={s.equity} positions={open} onSaved={() => status.reload(true)}/>
     <section className="metric-strip risk-metric-strip" aria-label="Current risk status">

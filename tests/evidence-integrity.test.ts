@@ -36,8 +36,10 @@ function depsFor(store: ReturnType<typeof openStore>, response: (path: string, q
   post: (path: string, body?: unknown) => unknown = () => []): ExecutorDeps {
   return {
     store,
-    client: { get: async (endpoint: string, query?: Record<string, unknown>) => endpoint === "/api/v5/trade/orders-algo-pending" ? [] : response(endpoint, query), post: async (endpoint: string, body?: unknown) => post(endpoint, body) },
-    trading: { timeframe: "15m" }, risk: {}, instruments: { [symbol]: instrument }, watchlist: [symbol],
+    client: { get: async (endpoint: string, query?: Record<string, unknown>) => endpoint === "/api/v5/trade/orders-algo-pending" ? []
+      : endpoint === "/api/v5/account/config" ? [{ posMode: "long_short_mode" }] : response(endpoint, query),
+      post: async (endpoint: string, body?: unknown) => post(endpoint, body) },
+    trading: { timeframe: "15m", account: { position_mode: "long_short_mode" } }, risk: {}, instruments: { [symbol]: instrument }, watchlist: [symbol],
   } as unknown as ExecutorDeps;
 }
 
@@ -285,6 +287,38 @@ test("protection-owned halt clears only after fresh flat account and risk verifi
   assert.equal(getRiskHaltReason(store), null);
 });
 
+test("startup safety halt recovers only after a fresh successful account-wide verification", async t => {
+  const store = withStore(t);
+  setBotState(store, "RISK_HALTED");
+  setRiskHaltReason(store, "STARTUP_SAFETY_FAILURE");
+  setEmergencyHalted(store, false);
+  const deps = depsFor(store, endpoint => {
+    if (endpoint === "/api/v5/account/balance") return [{ details: [{ ccy: "USDT", eq: "100", availEq: "100", availBal: "100" }] }];
+    if (endpoint === "/api/v5/public/time") return [{ ts: String(Date.now()) }];
+    if (endpoint === "/api/v5/account/positions") return [];
+    if (endpoint === "/api/v5/trade/orders-pending" || endpoint === "/api/v5/trade/orders-algo-pending") return [];
+    throw new Error(`unexpected endpoint ${endpoint}`);
+  });
+  (deps as unknown as { risk: Record<string, unknown> }).risk = {
+    clock_drift_max_ms: 60_000,
+    hard_limits: { max_concurrent_positions: 5, max_daily_loss_pct: 3, max_drawdown_pct: 10 },
+  };
+  assert.equal(await recoverProtectionHalt(deps), true);
+  assert.equal(getBotState(store), "RUNNING");
+  assert.equal(getRiskHaltReason(store), null);
+});
+
+test("startup safety halt remains persisted when fresh recovery verification is unavailable", async t => {
+  const store = withStore(t);
+  setBotState(store, "RISK_HALTED");
+  setRiskHaltReason(store, "STARTUP_SAFETY_FAILURE");
+  setEmergencyHalted(store, false);
+  const deps = depsFor(store, () => { throw new Error("exchange unavailable"); });
+  assert.equal(await recoverProtectionHalt(deps), false);
+  assert.equal(getBotState(store), "RISK_HALTED");
+  assert.equal(getRiskHaltReason(store), "STARTUP_SAFETY_FAILURE");
+});
+
 test("protection recovery cannot clear a daily-loss halt or an active manual kill switch", async t => {
   const store = withStore(t);
   setBotState(store, "RISK_HALTED");
@@ -362,6 +396,24 @@ test("zombie exit sweep heals RECONCILIATION_PENDING once the exchange fill is r
   const row = store.db.prepare("SELECT status,exit_px,exit_reason,exit_confirmation,ord_close_id FROM trades WHERE trade_id='SCP-ZOMBIE'").get() as Record<string, unknown>;
   assert.deepEqual(row, { status: "CLOSED", exit_px: 140, exit_reason: "EXCHANGE_CLOSE_UNCLASSIFIED",
     exit_confirmation: "EXCHANGE_FILL_CONFIRMED", ord_close_id: "CLOSE-Z" });
+});
+
+test("reconciliation sweep retries non-EXIT evidence reasons such as missing instrument metadata", async t => {
+  const store = withStore(t); zombieExit(store, "SCP-METADATA-RETRY");
+  store.db.prepare(`UPDATE trades SET evidence_reason='INSTRUMENT_METADATA_PENDING',exit_reconcile_next_retry_ts=NULL
+    WHERE trade_id='SCP-METADATA-RETRY'`).run();
+  const exitFill = [{ instId: symbol, tradeId: "FM", ordId: "CLOSE-Z", fillPx: "140", fillSz: "1", side: "sell", posSide: "long", execType: "T", ts: String(exitMs), fee: "-0.01", feeCcy: "USDT" }];
+  const healed = await sweepUnprovenExits(depsFor(store, (endpoint, query) => {
+    if (endpoint === "/api/v5/account/positions") return [];
+    if (endpoint === "/api/v5/trade/fills") return [];
+    if (endpoint === "/api/v5/trade/fills-history") return exitFill;
+    if (endpoint === "/api/v5/trade/order-algo") return [{ algoId: String(query?.algoId), state: "effective", instId: symbol, posSide: "long", sz: "1" }];
+    if (endpoint === "/api/v5/market/candles") return candleRows;
+    throw new Error(`unexpected endpoint ${endpoint}`);
+  }));
+  assert.equal(healed, 1);
+  const state = store.db.prepare("SELECT status,exit_reconcile_attempts,exit_reconcile_state FROM trades WHERE trade_id='SCP-METADATA-RETRY'").get();
+  assert.deepEqual(state, { status: "CLOSED", exit_reconcile_attempts: 1, exit_reconcile_state: "RECONCILED" });
 });
 
 test("reconciliation preserves a known strategic exit reason separately from fill confirmation", async t => {

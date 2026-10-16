@@ -161,7 +161,9 @@ export class ScalpRunner {
 
   async tick(): Promise<void> {
     if (this.ticking || this.stopped) return;
-    if (isEmergencyHalted(this.d.store)) return;
+    // Entry permission is independent from safety monitoring. Halts skip the
+    // signal/LLM path entirely, while sweep() remains active for open trades.
+    if (isEmergencyHalted(this.d.store) || getBotState(this.d.store) !== "RUNNING") return;
     this.ticking = true;
     try {
       const nowS = Math.floor(Date.now() / 1000);
@@ -489,11 +491,16 @@ export class ScalpRunner {
 
   private async sweep(): Promise<void> {
     try {
-      if (isEmergencyHalted(this.d.store)) return;
+      // Emergency Stop blocks new entries, not risk-reducing exits or position
+      // reconciliation. Native protection remains primary; Layer B is kept live.
       const scalps = (getOpenTrades(this.d.store) as Array<Record<string, unknown>>)
         .filter((t) => isTradeOwnedBy(t, "SCALP_5M"));
       if (scalps.length === 0) return;
-      for (const trade of scalps) await verifyOpenTradeProtection(this.d, String(trade.instrument));
+      for (const trade of scalps) {
+        const verified = await verifyOpenTradeProtection(this.d, String(trade.instrument));
+        if (!verified) log.warn({ event: "scalp_monitor_protection_unverified", tradeId: String(trade.trade_id),
+          instrument: String(trade.instrument), nativeProtectionPrimary: true, softwareMonitorContinuing: true });
+      }
       const poss = (await getPositions(this.d.client)).filter((p) => p.pos !== "0");
       const nowS = Math.floor(Date.now() / 1000);
       for (const t of scalps) {
