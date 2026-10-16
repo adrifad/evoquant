@@ -1,4 +1,4 @@
-import { asNumber, asText } from "./types";
+import { asNumber, asText } from "./types.ts";
 
 const numberFormat = new Intl.NumberFormat("en-US", { maximumFractionDigits: 2 });
 const preciseFormat = new Intl.NumberFormat("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 4 });
@@ -24,7 +24,14 @@ export function formatPrecise(value: unknown): string {
 export function formatMoney(value: unknown, currency = "USDT"): string {
   const number = asNumber(value);
   if (number === null) return "N/A";
-  return `${number < 0 ? "−" : number > 0 ? "+" : ""}${numberFormat.format(Math.abs(number))} ${currency}`;
+  const sign = number < 0 ? "−" : number > 0 ? "+" : "";
+  const absolute = Math.abs(number);
+  if (number !== 0 && absolute < 0.000001) return `${sign}<0.000001 ${currency}`;
+  const formatter = new Intl.NumberFormat("en-US", {
+    minimumFractionDigits: number !== 0 && absolute < 0.01 ? 6 : 2,
+    maximumFractionDigits: number !== 0 && absolute < 0.01 ? 6 : 2,
+  });
+  return `${sign}${formatter.format(absolute)} ${currency}`;
 }
 
 export function formatAmount(value: unknown, currency = "USDT"): string {
@@ -54,6 +61,7 @@ export function formatTimestamp(value: unknown): string {
   const date = new Date(isEpoch ? Number(value) : raw);
   return Number.isNaN(date.getTime()) ? raw : new Intl.DateTimeFormat("en-GB", {
     day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false,
+    timeZone: "UTC", timeZoneName: "short",
   }).format(date);
 }
 

@@ -27,6 +27,7 @@ export function DashboardPage({ status }: { status: ApiState<Row> }) {
   const roles = asRows(s?.aiRoles);
   const roleWarnings = roles.filter(role => role.status !== "AVAILABLE");
   const reconciliationWarnings = asRows(s?.reconciliationWarnings);
+  const protectionWarnings = openPositions.filter(position => asText(position.protection_state, "UNVERIFIED") !== "VERIFIED");
 
   if (!s) return <div className="page"><DataState loading={status.loading} error={status.error} empty={false}><span/></DataState></div>;
 
@@ -34,6 +35,7 @@ export function DashboardPage({ status }: { status: ApiState<Row> }) {
     <PageHeading title="Operations overview" description="Risk, exposure, account state, and the latest decision cycle." detail={<Badge tone="info">OKX DEMO WORKSTATION</Badge>}/>
     {s.exchangeState !== "CURRENT" ? <div className="inline-warning" role="status">Exchange account data unavailable. Capital and live position values cannot currently be confirmed.</div> : null}
     {reconciliationWarnings.length ? <div className="inline-warning" role="alert"><strong>Reconciliation pending</strong> {reconciliationWarnings.map(row => `${asText(row.instrument)} ${asText(row.side)} (${asText(row.trade_id)})`).join(", ")}. Exit evidence is not proven; these trades are excluded from review and evolution until recovery completes.</div> : null}
+    {protectionWarnings.length ? <div className="inline-warning" role="alert"><strong>Position protection needs verification</strong> {protectionWarnings.map(row => asText(row.instrument)).join(", ")}. New entries are paused while native stop and target protection is unresolved.</div> : null}
     <CapitalSummary status={s}/>
     <div className={`risk-banner ${halt ? "risk-critical" : warning ? "risk-warning" : "risk-safe"}`} role="status">
       <div className="risk-banner-copy"><span className="risk-banner-mark"/><div><strong>{halt ? "Trading risk halt" : warning ? `Bot ${asText(s.botState).toLowerCase()}` : "Risk controls active"}</strong><span>{halt ? asText(s.killReason, s.emergencyHalted ? "Emergency stop is active." : "Trading halted by system state.") : warning ? "No new automated entries are being evaluated while the bot is paused." : "No active kill-switch condition is reported by status."}</span></div></div>
@@ -48,12 +50,12 @@ export function DashboardPage({ status }: { status: ApiState<Row> }) {
 
     <section className="metric-strip" aria-label="Account summary">
       <Metric label="Positions" value={`${openPositions.length} / ${asText(limits.max_concurrent_positions)}`} detail="Shared swing / scalp slots"/>
-      <Metric label="Evidence pending" value={asText(s.evidencePending, "0")} tone={Number(s.evidencePending) > 0 ? "warning" : "neutral"} detail="Closed trades awaiting deterministic evidence"/>
+      <Metric label="Evidence pending / incomplete" value={asText(s.evidencePending, "0")} tone={Number(s.evidencePending) > 0 ? "warning" : "neutral"} detail="Closed trades awaiting or requiring accounting recovery"/>
       <Metric label="Daily loss" value={formatPercent(daily.lossPct)} tone={Number(daily.lossPct) > 0 ? "warning" : "neutral"} detail="Current day vs baseline"/>
       <Metric label="Drawdown" value={formatPercent(s.drawdownPct)} tone={Number(s.drawdownPct) > 0 ? "warning" : "neutral"} detail="From account peak"/>
       <Metric label="Open PnL" value={formatMoney(currentPnl)} tone={toneFor(currentPnl)} detail={`${openPositions.length} open positions${pnlKnown ? "" : " | live PnL unavailable"}`}/>
       <Metric label="Evolution" value={asRow(s.evolution)?.enabled === true ? "ACTIVE" : asRow(s.evolution)?.enabled === false ? "DISABLED" : "UNKNOWN"} detail={`${asRows(asRow(s.evolution)?.active).length} active challengers`}/>
-      <Metric label="Total realized PnL" value={formatMoney(totals.pnl)} tone={toneFor(totals.pnl)} detail="Closed trades"/>
+      <Metric label="Trusted realized NET PnL" value={formatMoney(totals.pnl)} tone={toneFor(totals.pnl)} detail={`${formatNumber(totals.trustedNetClosed, 0)} closed trades with VALID NET evidence`}/>
     </section>
 
     <div className="dashboard-primary">
@@ -99,13 +101,19 @@ export function DashboardPage({ status }: { status: ApiState<Row> }) {
           { key: "symbol", label: "Symbol", render: row => asText(row.instrument) },
           { key: "side", label: "Side", render: row => <Badge tone={String(row.side).toLowerCase()}>{asText(row.side)}</Badge> },
           { key: "strategy", label: "Strategy", render: row => `${asText(row.strategy)} V${asText(row.strategy_version)}` },
-          { key: "r", label: "R", numeric: true, render: row => <span className={toneFor(row.result_r ?? row.live_r)}>{row.status === "OPEN" ? formatR(row.live_r) : formatR(row.result_r)}</span> },
-          { key: "pnl", label: "PnL", numeric: true, render: row => <span className={toneFor(row.pnl ?? row.upl)}>{formatMoney(row.pnl ?? row.upl)}</span> },
-          { key: "result", label: "Result", render: row => <StatusBadge value={tradeOutcome(row)}/> },
+          { key: "r", label: "R", numeric: true, render: row => <span className={toneFor(row.status === "OPEN" ? row.live_r : trustedNetTrade(row) ? row.result_r : null)}>{row.status === "OPEN" ? formatR(row.live_r) : trustedNetTrade(row) ? formatR(row.result_r) : "N/A"}</span> },
+          { key: "pnl", label: "PnL", numeric: true, render: row => <span className={toneFor(row.status === "OPEN" ? row.upl : trustedNetTrade(row) ? row.pnl : null)}>{row.status === "OPEN" ? formatMoney(row.upl) : trustedNetTrade(row) ? formatMoney(row.pnl) : "N/A"}</span> },
+          { key: "result", label: "Result", render: row => <StatusBadge value={row.status === "CLOSED" && !trustedNetTrade(row) ? asText(row.evidence_state, "UNVERIFIED") : tradeOutcome(row)}/> },
         ]}/>
       </DataState>
     </Panel>
   </div>;
+}
+
+function trustedNetTrade(row: Row): boolean {
+  return row.status === "CLOSED" && row.evidence_state === "VALID" && row.evolution_evidence_eligible === 1
+    && row.result_r_basis === "NET" && row.accounting_quality === "COMPLETE"
+    && asNumber(row.pnl) !== null && asNumber(row.result_r) !== null;
 }
 
 function tradeOutcome(row: Row): string {

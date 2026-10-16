@@ -19,6 +19,7 @@ export interface TrustedTradeMetrics {
   expectancyR: number | null;
   averageMfe: number | null;
   averageMae: number | null;
+  maxTradeSequenceDrawdownUsdt: number;
   averageDurationSeconds: number | null;
 }
 
@@ -26,7 +27,7 @@ interface TrustedTrade {
   engine: string; strategy: string; strategy_core_version: number; strategy_version: number;
   setup: string; instrument: string; side: string; regime: string; gate_decision: string;
   entry_hour_utc: string; exit_hour_utc: string; exit_reason: string | null;
-  pnl: number; fees: number; funding: number; result_r: number; mfe: number; mae: number; duration_s: number;
+  pnl: number; fees: number; funding: number; result_r: number; mfe: number; mae: number; duration_s: number; exit_ts: string;
 }
 
 function finite(value: unknown): number | null {
@@ -59,6 +60,13 @@ function metrics(rows: readonly TrustedTrade[]): TrustedTradeMetrics {
   const negativePnl = losses.reduce((sum, row) => sum + Math.abs(row.pnl), 0);
   const netTotal = rows.reduce((sum, row) => sum + row.pnl, 0);
   const gross = rows.map(row => row.pnl + row.fees - row.funding);
+  const instruments = new Set(rows.map(row => row.instrument));
+  let cumulative = 0, peak = 0, maxTradeSequenceDrawdown = 0;
+  for (const row of [...rows].sort((a, b) => a.exit_ts.localeCompare(b.exit_ts))) {
+    cumulative += row.pnl;
+    peak = Math.max(peak, cumulative);
+    maxTradeSequenceDrawdown = Math.max(maxTradeSequenceDrawdown, peak - cumulative);
+  }
   const average = (values: number[]): number | null => values.length ? rounded(values.reduce((sum, value) => sum + value, 0) / values.length) : null;
   return {
     tradeCount: rows.length, wins: wins.length, losses: losses.length,
@@ -70,8 +78,12 @@ function metrics(rows: readonly TrustedTrade[]): TrustedTradeMetrics {
     averageGrossPnlUsdt: average(gross), averageWinUsdt: average(wins.map(row => row.pnl)),
     averageLossUsdt: average(losses.map(row => row.pnl)),
     profitFactor: negativePnl > 0 ? rounded(positivePnl / negativePnl) : null,
-    expectancyR: average(rows.map(row => row.result_r)), averageMfe: average(rows.map(row => row.mfe)),
-    averageMae: average(rows.map(row => row.mae)), averageDurationSeconds: average(rows.map(row => row.duration_s)),
+    expectancyR: average(rows.map(row => row.result_r)),
+    // MFE/MAE are recorded in raw price units; cross-instrument averages are not comparable.
+    averageMfe: instruments.size <= 1 ? average(rows.map(row => row.mfe)) : null,
+    averageMae: instruments.size <= 1 ? average(rows.map(row => row.mae)) : null,
+    maxTradeSequenceDrawdownUsdt: rounded(maxTradeSequenceDrawdown),
+    averageDurationSeconds: average(rows.map(row => row.duration_s)),
   };
 }
 
@@ -112,6 +124,7 @@ export function buildLossAttribution(store: Store, sinceIso: string | null = nul
       instrument: String(row.instrument ?? "UNKNOWN"), side: String(row.side ?? "UNKNOWN"), regime: String(row.regime ?? "UNKNOWN"),
       gate_decision: String(row.gate_result ?? "UNKNOWN"), entry_hour_utc: utcHour(row.entry_ts), exit_hour_utc: utcHour(row.exit_ts),
       exit_reason: row.exit_reason === null ? null : String(row.exit_reason), pnl, fees, funding, result_r: resultR, mfe, mae, duration_s: duration,
+      exit_ts: String(row.exit_ts),
     });
   }
   const dimensions: Record<LossAttributionDimension, Array<{ key: string; metrics: TrustedTradeMetrics }>> = {
@@ -129,6 +142,8 @@ export function buildLossAttribution(store: Store, sinceIso: string | null = nul
       netPnl: "exchange-confirmed trade pnl after fees and signed funding",
       grossPnl: "net pnl + fees - funding; reported only for complete valid NET evidence",
       expectancyR: "arithmetic mean of deterministic NET result_r",
+      maxTradeSequenceDrawdownUsdt: "peak-to-trough drawdown of cumulative closed-trade NET PnL from zero within the selected window; not account-equity drawdown",
+      averageMfeMae: "average raw price movement; only aggregated within a single instrument because price units differ across instruments",
       winRate: "trades with net pnl > 0 divided by complete valid NET trades",
       profitFactor: "sum of positive net pnl divided by absolute sum of negative net pnl; unavailable without losses",
     },

@@ -12,7 +12,7 @@ import { getCandles } from "../exchange/okx/market.ts";
 import { getBalance, getPositions } from "../exchange/okx/account.ts";
 import { getServerTime } from "../exchange/okx/market.ts";
 import { waitForOrderTerminal, getFills } from "../exchange/okx/orders.ts";
-import { placeConditionalProtection } from "../exchange/okx/algo.ts";
+import { placeConditionalProtection, ProtectionPlacementError } from "../exchange/okx/algo.ts";
 import { updateTradeStopPlus } from "../execution/position-management.ts";
 import type { RiskConfig, TradingConfig } from "../core/config.ts";
 import type { Store } from "../memory/db.ts";
@@ -21,7 +21,7 @@ import { openTrade, nextDecisionId, recordDecision } from "../memory/trades.ts";
 import { getOpenTrades } from "../memory/trades.ts";
 import { buildFeatures, type FeatureSnapshot } from "../market/features.ts";
 import { classifyRegime } from "../market/regime.ts";
-import { clId, closeTradeOnExchange, priceTrigger, synchronizeEntryLeverage, confirmedFillLeverage, submitReservedEntry } from "../execution/executor.ts";
+import { clId, closeTradeOnExchange, priceTrigger, synchronizeEntryLeverage, confirmedFillLeverage, submitReservedEntry, verifyOpenTradeProtection } from "../execution/executor.ts";
 import { selectedEntryLeverage, serializeRiskEntry, releaseEntry } from "../core/runtime-risk.ts";
 import { entrySettingsFingerprint } from "../core/runtime-trading.ts";
 import { persistEntryCapital } from "../core/capital.ts";
@@ -35,7 +35,7 @@ import {
 } from "./signals.ts";
 import { sizePosition } from "../risk/position-sizing.ts";
 import type { Regime } from "../market/regime.ts";
-import { baseline, getBotState, isEmergencyHalted } from "../core/state.ts";
+import { baseline, getBotState, isEmergencyHalted, setBotState } from "../core/state.ts";
 import { evaluateKillSwitch } from "../risk/limits.ts";
 import { evaluateGlobalEntryGate } from "../risk/global-entry-gate.ts";
 import type { Position } from "../exchange/okx/types.ts";
@@ -304,10 +304,12 @@ export class ScalpRunner {
         drawdownPct: base.peakEquity > 0 ? ((base.peakEquity - equity) / base.peakEquity) * 100 : 0,
       }, risk, store);
       const gate = evaluateGlobalEntryGate({
-        killSwitchActive: kill,
+        killSwitchActive: kill ?? (isEmergencyHalted(store) ? "EMERGENCY_STOP" : null),
         botState: getBotState(store),
         openPositions: usdt.length,
         instrument: sig.instrument,
+        protectionDegraded: Boolean(store.db.prepare(`SELECT 1 FROM trades WHERE status IN ('OPEN','RECONCILIATION_PENDING')
+          AND COALESCE(protection_state,'UNVERIFIED')<>'VERIFIED' LIMIT 1`).get()),
         instrumentOccupied: usdt.some((p) => p.instId === sig.instrument) ||
           localOpen.some((t) => String(t.instrument) === sig.instrument),
       }, risk);
@@ -376,7 +378,9 @@ export class ScalpRunner {
       const portfolio = portfolioOpenRisk({ equity: finalEquity, positions: finalPositions, trades: finalLocal, instruments: this.d.instruments });
       const candidateRisk = candidateStopRiskPct(Number(sz.contracts) * Number(meta.ctVal) * Math.abs(sig.price - sig.stopPx), finalEquity);
       const finalGate = evaluateGlobalEntryGate({
-        killSwitchActive: finalKill, botState: getBotState(store), openPositions: finalPositions.length,
+        killSwitchActive: finalKill ?? (isEmergencyHalted(store) ? "EMERGENCY_STOP" : null), botState: getBotState(store), openPositions: finalPositions.length,
+        protectionDegraded: Boolean(store.db.prepare(`SELECT 1 FROM trades WHERE status IN ('OPEN','RECONCILIATION_PENDING')
+          AND COALESCE(protection_state,'UNVERIFIED')<>'VERIFIED' LIMIT 1`).get()),
         instrument: sig.instrument, instrumentOccupied: finalPositions.some((p) => p.instId === sig.instrument) ||
           finalLocal.some((t) => String(t.instrument) === sig.instrument),
         portfolioOpenRiskPct: portfolio.riskPct, candidateRiskPct: candidateRisk,
@@ -401,6 +405,8 @@ export class ScalpRunner {
       this.consecutiveOrderFailures = 0;
       const filled = await waitForOrderTerminal(client, sig.instrument, placed.ordId, { timeoutMs: 20_000 });
       if (filled.state !== "filled") throw new Error(`scalp entry not filled: ${filled.state}`);
+      const filledContracts = Number(filled.accFillSz);
+      if (!Number.isFinite(filledContracts) || filledContracts <= 0) throw new Error("scalp entry fill quantity unavailable");
       const entryPx = Number(filled.avgPx) || sig.price;
       const stopPx = side === "LONG" ? entryPx - (sig.price - sig.stopPx) : entryPx + (sig.stopPx - sig.price);
       const tpPx = side === "LONG" ? entryPx + (sig.tpPx - sig.price) : entryPx - (sig.tpPx - sig.price);
@@ -410,27 +416,43 @@ export class ScalpRunner {
         instrument: sig.instrument, decision: side, gateResult: "ALLOW", strategy: "SCALP_V1", regime: sig.regime,
         rawConfidence: sig.score, calibratedConfidence: sig.score,
         thesis: [sig.reason.slice(0, 280)], riskVerdict: { approved: true, reason: `scalp ${this.stance}` } });
-      const entryPosition = (await getPositions(client, sig.instrument).catch(() => []))
-        .find((p) => p.instId === sig.instrument && p.posSide === side.toLowerCase() && Number(p.pos) !== 0);
+      const exchangePositions = await getPositions(client, sig.instrument).catch(() => null);
+      const entryPosition = exchangePositions?.find((p) => p.instId === sig.instrument && p.posSide === side.toLowerCase() && Number(p.pos) > 0);
+      const exchangeContracts = Math.abs(Number(entryPosition?.pos));
+      const actualContracts = Number.isFinite(exchangeContracts) && exchangeContracts > 0 ? String(exchangeContracts) : String(filledContracts);
+      const positionReadbackVerified = Boolean(entryPosition && Number.isFinite(exchangeContracts) && exchangeContracts > 0
+        && Math.abs(exchangeContracts - filledContracts) <= Math.max(1e-9, filledContracts * 1e-8));
       openTrade(store, {
         tradeId, engine: "SCALP_5M", instrument: sig.instrument, timeframe: TF_TAG, side,
-        strategy: "SCALP", strategyVersion: 1, regime: sig.regime, contracts: sz.contracts,
+        strategy: "SCALP", strategyVersion: 1, regime: sig.regime, contracts: actualContracts,
         entryPx, entryTs: new Date().toISOString(), stopPx, takeProfitPx: tpPx,
         clOpenId: clOpen, ordOpenId: placed.ordId,
         decisionId,
         rawConfidence: sig.score, calibratedConfidence: sig.score,
-        plannedRiskPct: Number(sz.contracts) * Number(meta.ctVal) * Math.abs(entryPx - stopPx) / finalEquity * 100,
+        plannedRiskPct: Number(actualContracts) * Number(meta.ctVal) * Math.abs(entryPx - stopPx) / finalEquity * 100,
         leverage: confirmedFillLeverage(entryPosition ?? filled, confirmedFillLeverage(filled, leverage)), entryFeatures: features,
       });
       try {
         const algo = await placeConditionalProtection(client, {
           instId: sig.instrument, posSide: side === "LONG" ? "long" : "short",
-          contracts: sz.contracts, stopPrice: stopPx, takeProfitPrice: tpPx,
+          contracts: actualContracts, tickSz: meta.tickSz, stopPrice: stopPx, takeProfitPrice: tpPx,
           clAlgoId: clId(side, "ALGO", sig.instrument),
         });
-        store.db.prepare("UPDATE trades SET algo_id=? WHERE trade_id=?").run(algo.algoId, tradeId);
+        store.db.prepare("UPDATE trades SET algo_id=?,sl_algo_id=?,tp_algo_id=?,protection_state=? WHERE trade_id=?")
+          .run(algo.stop.algoId, algo.stop.algoId, algo.takeProfit.algoId, positionReadbackVerified ? "VERIFIED" : "DEGRADED", tradeId);
+        if (!positionReadbackVerified) {
+          setBotState(store, "RISK_HALTED");
+          logSystemEvent(store, "RISK_EVENT", { protection_degraded: "EXCHANGE_POSITION_SIZE_UNVERIFIED", tradeId, newEntriesHalted: true });
+        }
       } catch (error) {
-        logSystemEvent(store, "RISK_EVENT", { protection_degraded: String(error), tradeId, fallback: "Layer B bot monitor" });
+        if (error instanceof ProtectionPlacementError && error.stop) {
+          store.db.prepare("UPDATE trades SET algo_id=?,sl_algo_id=?,tp_algo_id=?,protection_state='DEGRADED' WHERE trade_id=?")
+            .run(error.stop.algoId, error.stop.algoId, error.takeProfit?.algoId ?? null, tradeId);
+        } else store.db.prepare("UPDATE trades SET protection_state='DEGRADED' WHERE trade_id=?").run(tradeId);
+        setBotState(store, "RISK_HALTED");
+        logSystemEvent(store, "RISK_EVENT", { protection_degraded: error instanceof Error ? error.message : "UNKNOWN", tradeId, newEntriesHalted: true });
+        releaseEntry(store, clOpen);
+        throw new Error("STATE_UNCERTAIN: native position protection was not fully verified");
       }
       releaseEntry(store, clOpen);
       try { persistEntryCapital(store, tradeId, entryPosition, meta, finalEquity, leverage); }
@@ -444,6 +466,9 @@ export class ScalpRunner {
       return { kind: "OPENED", reason: "POSITION_OPENED", riskResult: "RISK_PASS" };
     } catch (e) {
       log.error({ event: "scalp_open_failed", inst: sig.instrument, error: e instanceof Error ? e.message.slice(0, 140) : String(e) });
+      if (e instanceof Error && e.message.startsWith("STATE_UNCERTAIN: native position protection")) {
+        return { kind: "GLOBAL_STOP", reason: "PROTECTION_UNVERIFIED", riskResult: "GLOBAL_STOP" };
+      }
       if (e instanceof Error && e.message === "entry leverage: instrument already occupied") {
         recordOpportunityMetric(store, "SCALP_5M", "RISK_REJECT", "SYMBOL_OCCUPIED");
         return { kind: "CANDIDATE_REJECT", reason: "SYMBOL_OCCUPIED", riskResult: "INSTRUMENT_ALREADY_OCCUPIED" };
@@ -461,6 +486,7 @@ export class ScalpRunner {
       const scalps = (getOpenTrades(this.d.store) as Array<Record<string, unknown>>)
         .filter((t) => isTradeOwnedBy(t, "SCALP_5M"));
       if (scalps.length === 0) return;
+      for (const trade of scalps) await verifyOpenTradeProtection(this.d, String(trade.instrument));
       const poss = (await getPositions(this.d.client)).filter((p) => p.pos !== "0");
       const nowS = Math.floor(Date.now() / 1000);
       for (const t of scalps) {

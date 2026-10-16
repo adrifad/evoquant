@@ -9,6 +9,7 @@ export interface GlobalEntryGateInput {
   instrumentOccupied: boolean;
   portfolioOpenRiskPct?: number | null;
   candidateRiskPct?: number | null;
+  protectionDegraded?: boolean;
 }
 
 export interface GlobalEntryGateResult {
@@ -23,6 +24,7 @@ export function evaluateGlobalEntryGate(input: GlobalEntryGateInput, risk: RiskC
     kill_switch_clear: input.killSwitchActive === null,
     bot_running: input.botState === "RUNNING",
     within_position_limit: input.openPositions < risk.hard_limits.max_concurrent_positions,
+    open_position_protection_verified: input.protectionDegraded !== true,
     instrument_unoccupied: !input.instrumentOccupied,
     instrument_allowed: risk.hard_limits.allowed_symbols.includes(input.instrument),
     portfolio_risk_known: input.portfolioOpenRiskPct === undefined
@@ -37,6 +39,7 @@ export function evaluateGlobalEntryGate(input: GlobalEntryGateInput, risk: RiskC
       ? `KILL_SWITCH_ACTIVE:${input.killSwitchActive}`
       : !checks.bot_running ? `BOT_${input.botState}`
       : !checks.within_position_limit ? "MAX_CONCURRENT_POSITIONS"
+      : !checks.open_position_protection_verified ? "OPEN_POSITION_PROTECTION_UNVERIFIED"
       : !checks.instrument_unoccupied ? "INSTRUMENT_ALREADY_OCCUPIED"
       : !checks.portfolio_risk_known ? "PORTFOLIO_OPEN_RISK_UNAVAILABLE"
       : !checks.within_portfolio_open_risk ? "PORTFOLIO_OPEN_RISK_LIMIT"

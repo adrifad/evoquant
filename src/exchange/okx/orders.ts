@@ -174,6 +174,29 @@ export async function getFillsHistory(client: OkxClient, instId?: string): Promi
   return data.map(mapFill);
 }
 
+/** Bounded, cursor-complete instrument history for exit recovery. */
+export async function getFillsHistoryForInstrument(
+  client: OkxClient, instId: string, maxPages = 20,
+): Promise<CompleteFillHistory> {
+  const fills: Fill[] = [];
+  const seen = new Set<string>();
+  let after: string | undefined;
+  for (let page = 1; page <= maxPages; page++) {
+    const data = await client.get<Array<Record<string, string>>>("/api/v5/trade/fills-history",
+      { instType: "SWAP", instId, limit: 100, ...(after ? { after } : {}) }, true);
+    const rows = data.map(mapFill);
+    for (const fill of rows) {
+      const key = `${fill.instId}:${fill.ordId}:${fill.tradeId}:${fill.ts}`;
+      if (!seen.has(key)) { seen.add(key); fills.push(fill); }
+    }
+    if (rows.length < 100) return { fills, complete: true, pages: page };
+    const next = rows.at(-1)?.billId;
+    if (!next || next === after) return { fills, complete: false, pages: page };
+    after = next;
+  }
+  return { fills, complete: false, pages: maxPages };
+}
+
 export interface CompleteFillHistory {
   fills: Fill[];
   complete: boolean;

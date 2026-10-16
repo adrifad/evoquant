@@ -105,6 +105,11 @@ CREATE TABLE IF NOT EXISTS trades (
   entry_conditions TEXT,
   decision_id TEXT REFERENCES decisions(decision_id),
   algo_id TEXT,                    -- §16 Layer A conditional order id
+  sl_algo_id TEXT,
+  tp_algo_id TEXT,
+  protection_state TEXT NOT NULL DEFAULT 'UNVERIFIED',
+  protection_checked_at TEXT,
+  exit_confirmation TEXT,
   fees_paid REAL DEFAULT 0         -- §27 accumulated fill fees
 );
 CREATE TABLE IF NOT EXISTS trade_reviews (
@@ -368,6 +373,11 @@ export function openStore(root: string): Store {
   if (!hadEngine) db.exec("ALTER TABLE trades ADD COLUMN engine TEXT NOT NULL DEFAULT 'SWING_15M'");
   if (!cols.has("result_r_basis")) db.exec("ALTER TABLE trades ADD COLUMN result_r_basis TEXT NOT NULL DEFAULT 'LEGACY_GROSS'");
   if (!cols.has("algo_id")) db.exec("ALTER TABLE trades ADD COLUMN algo_id TEXT");
+  if (!cols.has("sl_algo_id")) db.exec("ALTER TABLE trades ADD COLUMN sl_algo_id TEXT");
+  if (!cols.has("tp_algo_id")) db.exec("ALTER TABLE trades ADD COLUMN tp_algo_id TEXT");
+  if (!cols.has("protection_state")) db.exec("ALTER TABLE trades ADD COLUMN protection_state TEXT NOT NULL DEFAULT 'UNVERIFIED'");
+  if (!cols.has("protection_checked_at")) db.exec("ALTER TABLE trades ADD COLUMN protection_checked_at TEXT");
+  if (!cols.has("exit_confirmation")) db.exec("ALTER TABLE trades ADD COLUMN exit_confirmation TEXT");
   if (!cols.has("fees_paid")) db.exec("ALTER TABLE trades ADD COLUMN fees_paid REAL DEFAULT 0");
   if (!cols.has("decision_id")) db.exec("ALTER TABLE trades ADD COLUMN decision_id TEXT");
   if (!cols.has("initial_stop_px")) db.exec("ALTER TABLE trades ADD COLUMN initial_stop_px REAL");
@@ -384,6 +394,9 @@ export function openStore(root: string): Store {
   if (!cols.has("accounting_reconcile_last_attempt_ts")) db.exec("ALTER TABLE trades ADD COLUMN accounting_reconcile_last_attempt_ts TEXT");
   if (!cols.has("accounting_reconcile_last_result")) db.exec("ALTER TABLE trades ADD COLUMN accounting_reconcile_last_result TEXT");
   if (!cols.has("accounting_reconcile_next_retry_ts")) db.exec("ALTER TABLE trades ADD COLUMN accounting_reconcile_next_retry_ts TEXT");
+  if (!cols.has("exit_reconcile_attempts")) db.exec("ALTER TABLE trades ADD COLUMN exit_reconcile_attempts INTEGER NOT NULL DEFAULT 0");
+  if (!cols.has("exit_reconcile_last_attempt_ts")) db.exec("ALTER TABLE trades ADD COLUMN exit_reconcile_last_attempt_ts TEXT");
+  if (!cols.has("exit_reconcile_next_retry_ts")) db.exec("ALTER TABLE trades ADD COLUMN exit_reconcile_next_retry_ts TEXT");
   // Historical records are Core 1 unless a future migration has explicit evidence.
   if (!cols.has("strategy_core_version")) db.exec("ALTER TABLE trades ADD COLUMN strategy_core_version INTEGER NOT NULL DEFAULT 1");
   db.exec(`UPDATE trades SET engine=CASE WHEN lower(timeframe)='scalp' THEN 'SCALP_5M' ELSE 'SWING_15M' END

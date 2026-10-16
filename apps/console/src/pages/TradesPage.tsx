@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { useApi } from "../hooks/useApi";
 import { formatAmount, formatDuration, formatLeverage, formatMoney, formatNumber, formatPercent, formatPrice, formatR, formatTimestamp, toneFor } from "../lib/format";
 import { asNumber, asRow, asRows, asText, parseJson, type Row } from "../lib/types";
-import { Badge, DataState, DataTable, Evidence, Field, Metric, PageHeading, Panel, StatusBadge } from "../components/Primitives";
+import { Badge, DataState, DataTable, Field, Metric, PageHeading, Panel, StatusBadge } from "../components/Primitives";
 import { MarketChart } from "../components/MarketChart";
 import { InstrumentChart } from "../components/InstrumentChart";
 import { X } from "lucide-react";
@@ -26,18 +26,24 @@ export function TradesPage() {
   const gateLosses = asRows(lossBy?.gateDecision);
   const entryHourLosses = asRows(lossBy?.entryHourUtc);
   const exitLosses = asRows(lossBy?.exitReason);
+  const engineLosses = asRows(lossBy?.engine);
+  const symbolLosses = asRows(lossBy?.symbol);
+  const sideLosses = asRows(lossBy?.side);
+  const regimeLosses = asRows(lossBy?.regime);
+  const exitHourLosses = asRows(lossBy?.exitHourUtc);
   const reviewedTrades = new Set(asRows(reviewsApi.data).map(review => asText(review.trade_id, "")));
   const visible = trades.filter(row => {
     const matchesText = `${asText(row.trade_id)} ${asText(row.instrument)} ${asText(row.strategy)} ${asText(row.regime)}`.toLowerCase().includes(search.toLowerCase());
     const matchesSide = side === "ALL" || row.side === side;
     const isOpen = row.status === "OPEN";
     const pnl = row.pnl === null || row.pnl === undefined ? null : Number(row.pnl);
-    const outcome = isOpen ? "OPEN" : pnl === null || !Number.isFinite(pnl) ? "UNKNOWN" : pnl > 0 ? "WIN" : pnl < 0 ? "LOSS" : "FLAT";
+    const outcome = isOpen ? "OPEN" : !isTrustedNetTrade(row) ? "UNVERIFIED"
+      : pnl === null || !Number.isFinite(pnl) ? "UNKNOWN" : pnl > 0 ? "WIN" : pnl < 0 ? "LOSS" : "FLAT";
     return matchesText && matchesSide && (result === "ALL" || outcome === result);
   });
 
   return <div className="page">
-    <PageHeading title="Trades" description="Search the ledger and trace each position through decision, execution, risk, and review." detail={<Evidence sample={trades.filter(row => row.status === "CLOSED").length}/>}/>
+    <PageHeading title="Trades" description="Search the ledger and trace each position through decision, execution, risk, and review." detail={<Badge tone="info">Latest {trades.filter(row => row.status === "CLOSED").length} closed records · capped at 100</Badge>}/>
     <Panel title="Loss attribution" subtitle="Only complete, validated NET trade evidence is included. Cost components unavailable in the exchange ledger stay unavailable." action={<label className="filter-control"><span>Window</span><select aria-label="Loss attribution window" value={lossWindow} onChange={event => setLossWindow(event.target.value)}><option value="24h">24 hours</option><option value="7d">7 days</option><option value="30d">30 days</option><option value="all">All history</option></select></label>}>
       <DataState loading={lossApi.loading} error={lossApi.error} empty={!lossMetrics || asNumber(lossMetrics.tradeCount) === 0} hasData={lossApi.data !== null} emptyTitle="No complete valid NET trades in this window" emptyDetail="Pending, incomplete, invalid, and corrupt accounting evidence is excluded from trusted performance statistics.">
         {lossMetrics ? <>
@@ -50,6 +56,7 @@ export function TradesPage() {
             <Metric label="Expectancy" value={lossMetrics.expectancyR == null ? "Unavailable" : `${formatNumber(lossMetrics.expectancyR, 3)} R / trade`}/>
             <Metric label="Profit factor" value={lossMetrics.profitFactor == null ? "Unavailable" : formatNumber(lossMetrics.profitFactor, 2)}/>
             <Metric label="Average win / loss" value={`${formatMoney(lossMetrics.averageWinUsdt)} / ${formatMoney(lossMetrics.averageLossUsdt)}`}/>
+            <Metric label="Closed-trade drawdown" value={formatMoney(lossMetrics.maxTradeSequenceDrawdownUsdt)} detail="NET sequence from zero; not account-equity drawdown"/>
           </div>
           <div className="loss-attribution-details">
             <div><h3 className="subsection-title">By strategy and version</h3><DataTable caption="Trusted NET results by strategy and version" rows={strategyLosses} rowKey={row => asText(row.key)} minWidth={600} columns={[
@@ -63,6 +70,13 @@ export function TradesPage() {
               { key: "count", label: "Trades", numeric: true, render: row => formatNumber(asRow(row.metrics)?.tradeCount, 0) },
               { key: "net", label: "Net PnL", numeric: true, render: row => formatMoney(asRow(row.metrics)?.totalNetPnlUsdt) },
             ]}/></div>
+            {[["Engine", engineLosses], ["Symbol", symbolLosses], ["Direction", sideLosses], ["Regime", regimeLosses], ["Exit hour (UTC)", exitHourLosses]].map(([label, rows]) => <div key={String(label)}><h3 className="subsection-title">By {String(label).toLowerCase()}</h3><DataTable caption={`Trusted NET results by ${String(label).toLowerCase()}`} rows={rows as Row[]} rowKey={row => asText(row.key)} minWidth={360} columns={[
+              { key: "key", label: String(label), render: row => asText(row.key) },
+              { key: "count", label: "Trades", numeric: true, render: row => formatNumber(asRow(row.metrics)?.tradeCount, 0) },
+              { key: "net", label: "Net PnL", numeric: true, render: row => formatMoney(asRow(row.metrics)?.totalNetPnlUsdt) },
+              { key: "mfe", label: "Avg MFE · price units", numeric: true, render: row => formatNumber(asRow(row.metrics)?.averageMfe, 4) },
+              { key: "mae", label: "Avg MAE · price units", numeric: true, render: row => formatNumber(asRow(row.metrics)?.averageMae, 4) },
+            ]}/></div>)}
             <div><h3 className="subsection-title">By Gate outcome</h3><DataTable caption="Trusted NET results grouped by persisted Gate outcome" rows={gateLosses} rowKey={row => asText(row.key)} minWidth={360} columns={[
               { key: "key", label: "Gate", render: row => asText(row.key) },
               { key: "count", label: "Trades", numeric: true, render: row => formatNumber(asRow(row.metrics)?.tradeCount, 0) },
@@ -87,7 +101,7 @@ export function TradesPage() {
       <div className="ledger-filters">
         <label className="filter-control filter-search"><span>Search records</span><input value={search} onChange={event => setSearch(event.target.value)} placeholder="Trade ID, symbol, strategy, regime"/></label>
         <label className="filter-control"><span>Side</span><select value={side} onChange={event => setSide(event.target.value)}><option>ALL</option><option>LONG</option><option>SHORT</option></select></label>
-        <label className="filter-control"><span>Result</span><select value={result} onChange={event => setResult(event.target.value)}><option>ALL</option><option>OPEN</option><option>WIN</option><option>LOSS</option><option>FLAT</option></select></label>
+        <label className="filter-control"><span>Result</span><select value={result} onChange={event => setResult(event.target.value)}><option>ALL</option><option>OPEN</option><option>WIN</option><option>LOSS</option><option>FLAT</option><option>UNVERIFIED</option></select></label>
       </div>
       <DataState loading={api.loading} error={api.error} empty={!visible.length} hasData={api.data !== null} emptyTitle={trades.length ? "No trades match these filters" : "No trades recorded yet"} emptyDetail={trades.length ? "Change the search or result filters to see other records." : "Trades appear here after an entry is recorded."}>
         <DataTable caption="Trade ledger. Select a trade ID to open its details." rows={visible} rowKey={(row, index) => asText(row.trade_id, String(index))} onRowClick={row => setSelectedId(asText(row.trade_id, ""))} minWidth={1180} columns={[
@@ -102,10 +116,11 @@ export function TradesPage() {
           { key: "margin", label: "Margin used", numeric: true, render: row => <>{formatAmount(row.status === "OPEN" ? row.margin_used : asRow(row.entry_capital)?.margin_used)}<small className="source-note">{asText(row.status === "OPEN" ? row.margin_source : asRow(row.entry_capital)?.margin_source, "UNAVAILABLE")}</small></> },
           { key: "notional", label: "Notional", numeric: true, render: row => formatAmount(row.status === "OPEN" ? row.notional : asRow(row.entry_capital)?.notional, asText(row.status === "OPEN" ? row.notional_currency : asRow(row.entry_capital)?.notional_currency, "")) },
           { key: "exit", label: "Exit / mark", numeric: true, render: row => row.status === "OPEN" ? formatPrice(row.mark_px) : formatPrice(row.exit_px) },
-          { key: "r", label: "R", numeric: true, render: row => <span className={toneFor(row.status === "OPEN" ? row.live_r : row.result_r)}>{formatR(row.status === "OPEN" ? row.live_r : row.result_r)}</span> },
-          { key: "pnl", label: "PnL", numeric: true, render: row => <span className={toneFor(row.status === "OPEN" ? row.upl : row.pnl)}>{formatMoney(row.status === "OPEN" ? row.upl : row.pnl)}</span> },
+          { key: "r", label: "R", numeric: true, render: row => <span className={toneFor(row.status === "OPEN" ? row.live_r : isTrustedNetTrade(row) ? row.result_r : null)}>{formatR(row.status === "OPEN" ? row.live_r : isTrustedNetTrade(row) ? row.result_r : null)}</span> },
+          { key: "pnl", label: "PnL", numeric: true, render: row => <span className={toneFor(row.status === "OPEN" ? row.upl : isTrustedNetTrade(row) ? row.pnl : null)}>{formatMoney(row.status === "OPEN" ? row.upl : isTrustedNetTrade(row) ? row.pnl : null)}{row.status === "CLOSED" && !isTrustedNetTrade(row) ? <small className="source-note">NET unavailable · {asText(row.evidence_state)}</small> : null}</span> },
           { key: "duration", label: "Duration", numeric: true, render: row => formatDuration(row.status === "OPEN" ? row.live_dur_s : row.duration_s) },
-          { key: "result", label: "Result", render: row => <StatusBadge value={row.status === "OPEN" ? "OPEN" : row.pnl === null || row.pnl === undefined || !Number.isFinite(Number(row.pnl)) ? "UNKNOWN" : Number(row.pnl) > 0 ? "WIN" : Number(row.pnl) < 0 ? "LOSS" : "FLAT"}/> },
+          { key: "evidence", label: "Evidence", render: row => <StatusBadge value={row.status === "CLOSED" ? asText(row.evidence_state, "UNKNOWN") : asText(row.status)}/> },
+          { key: "result", label: "Result", render: row => <StatusBadge value={row.status === "OPEN" ? "OPEN" : !isTrustedNetTrade(row) ? "UNVERIFIED" : Number(row.pnl) > 0 ? "WIN" : Number(row.pnl) < 0 ? "LOSS" : "FLAT"}/> },
           { key: "review", label: "Review record", render: row => <StatusBadge value={reviewedTrades.has(asText(row.trade_id, "")) ? "RECENT REVIEW" : "CHECK DETAIL"}/> },
           { key: "mfe", label: "MFE / MAE (price)", render: row => `${formatPrice(row.mfe)} / ${formatPrice(row.mae)}` },
           { key: "reason", label: "Exit reason", render: row => asText(row.exit_reason) },
@@ -184,7 +199,7 @@ export function TradeDetailDialog({ tradeId, onClose }: { tradeId: string; onClo
             {fills.length ? <div className="table-scroll"><table className="compact-table"><thead><tr><th>Time</th><th>Price</th><th>Size</th><th>Fee</th></tr></thead><tbody>{fills.map((fill, index) => <tr key={`${asText(fill.tradeId)}-${index}`}><td>{formatTimestamp(fill.ts)}</td><td className="numeric mono">{formatPrice(fill.fillPx)}</td><td className="numeric mono">{asText(fill.fillSz)}</td><td className="numeric mono">{asText(fill.fee)} {asText(fill.feeCcy, "")}</td></tr>)}</tbody></table></div> : <p className="muted-small">No individual fills are linked to this trade.</p>}
           </Panel>
           <Panel title="Risk" subtitle="Position parameters captured at entry">
-            <Field label="Initial stop" value={formatPrice(trade.initial_stop_px ?? trade.stop_px)}/><Field label="Active stop" value={formatPrice(trade.stop_px)}/><Field label="Take profit" value={formatPrice(trade.take_profit_px)}/><Field label="Planned risk" value={`${formatNumber(trade.planned_risk_pct)}%`}/><Field label="Leverage" value={`${formatNumber(trade.leverage, 0)}x`}/><Field label="Contracts" value={asText(trade.contracts)}/><Field label="Exit reason" value={asText(trade.exit_reason)} mono={false}/><Field label="Duration" value={formatDuration(trade.duration_s)}/><Field label="Evidence" value={<StatusBadge value={asText(trade.evidence_state, "PENDING")}/>} detail={asText(trade.evidence_reason, "Complete deterministic evidence required")}/><Field label="Accounting" value={asText(trade.accounting_quality, "PENDING")} detail={asText(trade.result_r_basis, "Result unavailable")}/><Field label="Evolution evidence" value={<StatusBadge value={trade.evolution_evidence_eligible === 1 ? "ELIGIBLE" : "NOT ELIGIBLE"}/>}/>
+            <Field label="Initial stop" value={formatPrice(trade.initial_stop_px ?? trade.stop_px)}/><Field label="Active stop" value={formatPrice(trade.stop_px)}/><Field label="Take profit" value={formatPrice(trade.take_profit_px)}/><Field label="Planned risk" value={`${formatNumber(trade.planned_risk_pct)}%`}/><Field label="Leverage" value={`${formatNumber(trade.leverage, 0)}x`}/><Field label="Contracts" value={asText(trade.contracts)}/><Field label="Exit reason" value={asText(trade.exit_reason)} mono={false}/><Field label="Exit confirmation" value={asText(trade.exit_confirmation)} mono={false}/><Field label="Duration" value={formatDuration(trade.duration_s)}/><Field label="Evidence" value={<StatusBadge value={asText(trade.evidence_state, "PENDING")}/>} detail={asText(trade.evidence_reason, "Complete deterministic evidence required")}/><Field label="Accounting" value={asText(trade.accounting_quality, "PENDING")} detail={asText(trade.result_r_basis, "Result unavailable")}/><Field label="Evolution evidence" value={<StatusBadge value={trade.evolution_evidence_eligible === 1 ? "ELIGIBLE" : "NOT ELIGIBLE"}/>}/>
           </Panel>
           <Panel title="Market snapshot" subtitle="Entry features saved with the decision">
             {features ? <div className="snapshot-fields">{[["Price", features.price], ["EMA20", features.ema20], ["EMA50", features.ema50], ["EMA spread", features.emaSpreadPct], ["RSI14", features.rsi14], ["ADX14", features.adx14], ["ATR14", features.atr14], ["ATR %", features.atrPct], ["Volume ratio", features.volumeRatio]].map(([label, value]) => <Field key={String(label)} label={String(label)} value={formatNumber(value)} />)}</div> : <div className="empty-state"><strong>Entry feature snapshot unavailable</strong></div>}
@@ -207,4 +222,10 @@ function renderThesis(value: unknown) {
   const parsed = parseJson<unknown>(value, []);
   const points = Array.isArray(parsed) ? parsed : typeof parsed === "string" ? [parsed] : [];
   return points.map((item, index) => <p key={`${index}-${typeof item === "string" ? item : "point"}`}>{typeof item === "string" ? item : JSON.stringify(item)}</p>);
+}
+
+function isTrustedNetTrade(row: Row): boolean {
+  return row.status === "CLOSED" && row.evidence_state === "VALID" && row.evolution_evidence_eligible === 1
+    && row.result_r_basis === "NET" && row.accounting_quality === "COMPLETE"
+    && asNumber(row.pnl) !== null && asNumber(row.result_r) !== null;
 }

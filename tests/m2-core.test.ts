@@ -341,10 +341,11 @@ test("market snapshots retain the same timestamp for multiple instruments", () =
 test("lesson evidence transitions (§29/§30)", () => {
   const st = openStore(tmpRoot());
   const id = upsertLesson(st, { statement: "breakouts underperform in low volume", scope: { strategy: "BREAKOUT", instrument: "BTC-USDT-SWAP", regime: "SIDEWAYS" }, confidence: 0.4 });
-  // seed 12 closed losing trades in scope
+  // Seed independent, subsequently closed, valid NET trades in scope.
   for (let i = 0; i < 12; i++) {
-    st.db.prepare(`INSERT INTO trades(trade_id,status,evidence_state,evolution_evidence_eligible,result_r_basis,instrument,timeframe,side,strategy,strategy_version,regime,contracts,result_r,exit_ts)
-      VALUES('TRD-L' || ${i},'CLOSED','VALID',1,'NET','BTC-USDT-SWAP','15m','LONG','BREAKOUT',1,'SIDEWAYS','0.01',${i < 9 ? -0.5 : 0.5},'2026-10-15T00:00:00Z')`).run();
+    st.db.prepare(`INSERT INTO trades(trade_id,engine,status,evidence_state,evolution_evidence_eligible,result_r_basis,instrument,timeframe,side,strategy,strategy_version,regime,contracts,result_r,exit_ts)
+      VALUES('TRD-L' || ${i},'SWING_15M','CLOSED','VALID',1,'NET','BTC-USDT-SWAP','15m','LONG','BREAKOUT',1,'SIDEWAYS','0.01',${i < 9 ? -0.5 : 0.5},?)`)
+      .run(new Date(Date.now() + 1000 + i).toISOString());
   }
   for (let i = 0; i < 12; i++) addLessonEvidence(st, id, `TRD-L${i}`, i < 9);
   recomputeLesson(st, id);

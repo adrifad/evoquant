@@ -17,26 +17,35 @@ export function MarketsPage({ status }: { status: ApiState<Row> }) {
   const instrument = selected || asText(status.data?.instrument);
   const selectedRow = scanner.find(row => row.instrument === instrument);
   const wl = asRow(watchlist.data);
+  const watchlistConfig = asRow(wl?.config) ?? {};
   const dynamic = asRows(wl?.dynamic);
   const historicalDynamic = asRows(wl?.historical_dynamic);
   const stats = asRow(wl?.statistics) ?? {};
   const [refreshError, setRefreshError] = useState("");
+  const [refreshing, setRefreshing] = useState(false);
   const refreshWatchlist = async () => {
     if (!window.confirm("This normally refreshes once per day. Refresh now?")) return;
     setRefreshError("");
-    const response = await fetch("/api/watchlist", { method: "POST" });
-    if (!response.ok) {
-      const failure = asRow(await response.json().catch(() => null));
-      setRefreshError(asText(failure?.error, "DYNAMIC_WATCHLIST_REFRESH_FAILED"));
-      return;
+    setRefreshing(true);
+    try {
+      const response = await fetch("/api/watchlist", { method: "POST" });
+      if (!response.ok) {
+        const failure = asRow(await response.json().catch(() => null));
+        setRefreshError(asText(failure?.error, "DYNAMIC_WATCHLIST_REFRESH_FAILED"));
+        return;
+      }
+      watchlist.applyResponse(await response.json() as unknown);
+      window.dispatchEvent(new Event("evoquant:refresh"));
+    } catch {
+      setRefreshError("DYNAMIC_WATCHLIST_REFRESH_FAILED · network unavailable");
+    } finally {
+      setRefreshing(false);
     }
-    watchlist.applyResponse(await response.json() as unknown);
-    window.dispatchEvent(new Event("evoquant:refresh"));
   };
 
   return <div className="page">
     <PageHeading title="Markets" description="Inspect the market inputs and regime used by the current decision cycle." detail={<span className="muted-small">Updated {formatTimestamp(d?.updatedAt)}</span>}/>
-    <Panel title="Daily Dynamic Watchlist" subtitle={`Status ${asText(wl?.status, "LOADING")} · Selected ${formatNumber(stats.selected, 0)} / 8 · Analyzed ${formatNumber(stats.analyzed, 0)} · Failed analysis ${formatNumber(stats.candleRequestsFailed, 0)} · Minimum score 60 · Last updated ${formatTimestamp(wl?.generated_at)} · Next ${formatTimestamp(wl?.next_refresh)}`} action={<button className="button button-secondary" onClick={() => void refreshWatchlist()}>Refresh dynamic watchlist</button>}>
+    <Panel title="Daily Dynamic Watchlist" subtitle={`Status ${asText(wl?.status, "LOADING")} · Selected ${formatNumber(stats.selected, 0)} / ${formatNumber(watchlistConfig.dynamic_slots, 0)} · Analyzed ${formatNumber(stats.analyzed, 0)} · Failed analysis ${formatNumber(stats.candleRequestsFailed, 0)} · Minimum score ${formatNumber(watchlistConfig.min_trend_score, 0)} · Last updated ${formatTimestamp(wl?.generated_at)} · Next ${formatTimestamp(wl?.next_refresh)}`} action={<button className="button button-secondary" disabled={refreshing || watchlistConfig.enabled === false} onClick={() => void refreshWatchlist()}>{refreshing ? "Refreshing…" : "Refresh dynamic watchlist"}</button>}>
       {refreshError ? <p className="inline-warning">{refreshError}. Existing snapshot was preserved when available.</p> : null}
       {asText(wl?.status) === "DISABLED" ? <p className="muted-small">Dynamic Watchlist disabled. Core markets remain active for new entries; historical dynamic snapshots are retained for audit.</p> : null}
       <DataState loading={watchlist.loading} error={watchlist.error} empty={!dynamic.length} hasData={watchlist.data !== null} emptyTitle="No dynamic markets selected" emptyDetail="Core markets remain monitored. The next eligible daily discovery will retain only markets that pass quality filters.">

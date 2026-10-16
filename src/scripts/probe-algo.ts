@@ -23,13 +23,14 @@ console.log("position opened");
 const px = (await getTicker(client, "BTC-USDT-SWAP")).last;
 try {
   const algo = await placeConditionalProtection(client, {
-    instId: "BTC-USDT-SWAP", posSide: "long", contracts: inst.minSz,
+    instId: "BTC-USDT-SWAP", posSide: "long", contracts: inst.minSz, tickSz: inst.tickSz,
     stopPrice: Math.round(px * 0.985 * 100) / 100,
     takeProfitPrice: Math.round(px * 1.03 * 100) / 100,
     clAlgoId: "EVQALGOPROBEALGO1".slice(0, 32),
   });
-  console.log("ALGO_OK algoId=", algo.algoId);
-  await cancelAlgo(client, "BTC-USDT-SWAP", algo.algoId);
+  console.log("ALGO_OK slAlgoId=", algo.stop.algoId, "tpAlgoId=", algo.takeProfit.algoId);
+  await cancelAlgo(client, "BTC-USDT-SWAP", algo.stop.algoId);
+  await cancelAlgo(client, "BTC-USDT-SWAP", algo.takeProfit.algoId);
   console.log("ALGO_CANCELLED");
 } catch (e) {
   console.log("ALGO_FAIL:", e instanceof Error ? e.message.slice(0, 200) : e);

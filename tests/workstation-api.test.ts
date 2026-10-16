@@ -18,6 +18,7 @@ import { recordScanState } from "../src/market/scan-state.ts";
 import { recordOpportunityMetric } from "../src/market/opportunity-funnel.ts";
 
 const symbol = "BTC-USDT-SWAP";
+const watchlistConfig = { enabled: true, dynamic_slots: 8, max_total_symbols: 15, min_trend_score: 60, refresh_hour_utc: 0, refresh_minute_utc: 15 };
 const json = <T>(response: Response): Promise<T> => response.json() as Promise<T>;
 type RiskResponse = ReturnType<RuntimeRiskService["snapshot"]> & { audit: Array<{ payload: string }> };
 async function fixture(t: test.TestContext, dynamicWatchlist?: { projection(): WatchlistProjection; refreshManual(): Promise<WatchlistProjection> }) {
@@ -41,11 +42,12 @@ async function fixture(t: test.TestContext, dynamicWatchlist?: { projection(): W
 
 test("watchlist API reports a persisted projection and manual refresh remains same-origin", async t => {
   let manual = 0;
-  const projection = (): WatchlistProjection => ({ generated_at: "2026-10-10T00:15:00.000Z", stale: false, stale_age_ms: 0, next_refresh: "2026-10-11T00:15:00.000Z",
+  const projection = (): WatchlistProjection => ({ generated_at: "2026-10-10T00:15:00.000Z", stale: false, stale_age_ms: 0, next_refresh: "2026-10-11T00:15:00.000Z", config: watchlistConfig,
     status: "CURRENT", core: [{ symbol, kind: "CORE" }], dynamic: [{ rank: 1, symbol: "SUI-USDT-SWAP", score: 81.2, trend_direction: "BULLISH", metrics: { momentum1hPct: 1, momentum4hPct: 3, adx14: 30, emaSeparationPct: 1, relativeVolume: 1.2, spreadPct: 0.1, liquidityUsdt: 2_000_000 }, status: "DYNAMIC" }], active: [symbol, "SUI-USDT-SWAP"], statistics: { discovered: 9, basic: 2, analyzed: 2, qualifying: 1, selected: 1, requestCount: 4, durationMs: 10 } });
   const f = await fixture(t, { projection, refreshManual: async () => { manual++; return projection(); } });
-  const get = await json<{ dynamic: Array<{ symbol: string }> }>(await f.request("/api/watchlist"));
+  const get = await json<{ dynamic: Array<{ symbol: string }>; config: WatchlistProjection["config"] }>(await f.request("/api/watchlist"));
   assert.equal(get.dynamic[0]!.symbol, "SUI-USDT-SWAP");
+  assert.deepEqual(get.config, watchlistConfig);
   assert.equal((await f.request("/api/watchlist", { method: "POST", headers: { origin: "https://external.invalid" } })).status, 403);
   assert.equal((await f.request("/api/watchlist", { method: "POST" })).status, 200);
   assert.equal(manual, 1);
@@ -88,7 +90,7 @@ test("loss attribution API excludes incomplete accounting from trusted results",
 });
 
 test("manual watchlist failures stay non-successful and disclose preserved stale state", async t => {
-  const projection = (): WatchlistProjection => ({ generated_at: "2026-10-09T00:15:00.000Z", stale: true, stale_age_ms: 86_400_000, next_refresh: "2026-10-11T00:15:00.000Z", status: "STALE", core: [{ symbol, kind: "CORE" }], dynamic: [], active: [symbol], statistics: { discovered: 0, basic: 0, analyzed: 0, qualifying: 0, selected: 0, requestCount: 0, durationMs: 0 } });
+  const projection = (): WatchlistProjection => ({ generated_at: "2026-10-09T00:15:00.000Z", stale: true, stale_age_ms: 86_400_000, next_refresh: "2026-10-11T00:15:00.000Z", status: "STALE", config: watchlistConfig, core: [{ symbol, kind: "CORE" }], dynamic: [], active: [symbol], statistics: { discovered: 0, basic: 0, analyzed: 0, qualifying: 0, selected: 0, requestCount: 0, durationMs: 0 } });
   const f = await fixture(t, { projection, refreshManual: async () => { throw new DynamicWatchlistError("DYNAMIC_WATCHLIST_REFRESH_FAILED", 503, true); } });
   const response = await f.request("/api/watchlist", { method: "POST" });
   assert.equal(response.status, 503);
@@ -96,7 +98,7 @@ test("manual watchlist failures stay non-successful and disclose preserved stale
 });
 
 test("disabled dynamic manual refresh is rejected explicitly", async t => {
-  const projection = (): WatchlistProjection => ({ generated_at: null, stale: false, stale_age_ms: null, next_refresh: "2026-10-11T00:15:00.000Z", status: "DISABLED", core: [{ symbol, kind: "CORE" }], dynamic: [], active: [symbol], statistics: { discovered: 0, basic: 0, analyzed: 0, qualifying: 0, selected: 0, requestCount: 0, durationMs: 0 } });
+  const projection = (): WatchlistProjection => ({ generated_at: null, stale: false, stale_age_ms: null, next_refresh: "2026-10-11T00:15:00.000Z", status: "DISABLED", config: watchlistConfig, core: [{ symbol, kind: "CORE" }], dynamic: [], active: [symbol], statistics: { discovered: 0, basic: 0, analyzed: 0, qualifying: 0, selected: 0, requestCount: 0, durationMs: 0 } });
   const f = await fixture(t, { projection, refreshManual: async () => { throw new DynamicWatchlistError("DYNAMIC_WATCHLIST_DISABLED", 409, false); } });
   const response = await f.request("/api/watchlist", { method: "POST" });
   assert.equal(response.status, 409);

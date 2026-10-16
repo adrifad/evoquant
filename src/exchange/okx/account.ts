@@ -39,15 +39,49 @@ interface RawFundingBill {
  * as unknown, never as zero.
  */
 export async function getFundingBills(client: OkxClient, instId: string, begin: number, end: number, nowMs: number = Date.now()): Promise<FundingBill[]> {
-  const path = nowMs - end > 6 * 24 * 60 * 60 * 1000 ? "/api/v5/account/bills-archive" : "/api/v5/account/bills";
-  const data = await client.get<RawFundingBill[]>(path, {
-    instType: "SWAP", instId, begin: String(begin), end: String(end), limit: "100",
-  }, true);
-  return data.map((raw) => ({
+  if (!Number.isFinite(begin) || !Number.isFinite(end) || begin < 0 || end < begin) throw new Error("invalid funding interval");
+  const pageSize = 100;
+  const maxPagesPerWindow = 100;
+  const maxWindows = 100;
+  const windowMs = 6 * 24 * 60 * 60 * 1000;
+  const rawBills: RawFundingBill[] = [];
+  // OKX bill queries have a bounded time window. Chunk long position intervals,
+  // then follow billId cursors; a capped/incomplete scan must fail closed.
+  let windows = 0;
+  for (let windowBegin = begin; windowBegin <= end; windowBegin += windowMs) {
+    windows += 1;
+    if (windows > maxWindows) throw new Error("funding bill interval exceeds bounded history scan");
+    const windowEnd = Math.min(end, windowBegin + windowMs - 1);
+    const path = nowMs - windowEnd > 6 * 24 * 60 * 60 * 1000 ? "/api/v5/account/bills-archive" : "/api/v5/account/bills";
+    let after: string | undefined;
+    let completed = false;
+    for (let page = 1; page <= maxPagesPerWindow; page++) {
+      const data = await client.get<RawFundingBill[]>(path, {
+        instType: "SWAP", instId, begin: String(windowBegin), end: String(windowEnd), limit: String(pageSize),
+        ...(after ? { after } : {}),
+      }, true);
+      rawBills.push(...data);
+      if (data.length < pageSize) { completed = true; break; }
+      const cursor = String(data.at(-1)?.billId ?? "");
+      if (!cursor || cursor === after) throw new Error("funding bill pagination cursor unavailable");
+      after = cursor;
+    }
+    if (!completed) throw new Error("funding bill pagination limit reached");
+  }
+  const relevant = rawBills.map((raw) => ({
     billId: String(raw.billId ?? ""), instId: String(raw.instId ?? ""), ts: String(raw.ts ?? ""),
     pnl: String(raw.pnl ?? ""), balChg: String(raw.balChg ?? ""), ccy: String(raw.ccy ?? ""), type: String(raw.type ?? ""), subType: String(raw.subType ?? ""),
-  })).filter((bill) => bill.instId === instId && Number.isFinite(Number(bill.ts)) && Number(bill.ts) >= begin && Number(bill.ts) <= end
-    && (bill.subType === "173" || bill.subType === "174"));
+  })).filter((bill) => bill.instId === instId && Number.isFinite(Number(bill.ts))
+    && Number(bill.ts) >= begin && Number(bill.ts) <= end && (bill.subType === "173" || bill.subType === "174"));
+  // A synthetic tuple can collapse two legitimate identical funding entries.
+  // Without OKX's stable billId, completeness and de-duplication are not provable.
+  if (relevant.some((bill) => !bill.billId)) throw new Error("funding bill stable identifier unavailable");
+  const seen = new Set<string>();
+  return relevant.filter((bill) => {
+    if (seen.has(bill.billId)) return false;
+    seen.add(bill.billId);
+    return true;
+  });
 }
 
 // Spec §7.7 — balance detail for one currency (all strings from OKX).

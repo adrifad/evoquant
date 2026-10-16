@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { evaluateGlobalEntryGate } from "../src/risk/global-entry-gate.ts";
+import { isGlobalStopReason } from "../src/execution/executor.ts";
 import { isTradeOwnedBy, tradeEngine } from "../src/memory/engines.ts";
 import type { RiskConfig } from "../src/core/config.ts";
 import { mkdtempSync } from "node:fs";
@@ -20,6 +21,9 @@ test("shared global entry gate blocks PAUSED, kill switch, occupied symbols, and
   assert.equal(evaluateGlobalEntryGate({ ...input, botState: "PAUSED" }, risk).reason, "BOT_PAUSED");
   assert.equal(evaluateGlobalEntryGate({ ...input, killSwitchActive: "MAX_DAILY_LOSS_REACHED" }, risk).allowed, false);
   assert.equal(evaluateGlobalEntryGate({ ...input, instrumentOccupied: true }, risk).reason, "INSTRUMENT_ALREADY_OCCUPIED");
+  const protectionFailure = evaluateGlobalEntryGate({ ...input, protectionDegraded: true }, risk);
+  assert.equal(protectionFailure.reason, "OPEN_POSITION_PROTECTION_UNVERIFIED");
+  assert.equal(isGlobalStopReason(protectionFailure.reason), true);
   assert.equal(evaluateGlobalEntryGate({ ...input, openPositions: 3 }, risk).reason, "MAX_CONCURRENT_POSITIONS");
 });
 

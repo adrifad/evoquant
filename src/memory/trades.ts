@@ -145,8 +145,8 @@ export function getOpenTrades(store: Store): Array<Record<string, unknown>> {
 /** Missing exchange exit proof leaves the trade unresolved and ineligible for all learning. */
 export function markReconciliationPending(store: Store, tradeId: string, reason: string): void {
   store.db.prepare(`UPDATE trades SET status='RECONCILIATION_PENDING', evidence_state='RECONCILIATION_PENDING',
-    evolution_evidence_eligible=0, accounting_quality='PENDING', evidence_reason=?, exit_reason=?
-    WHERE trade_id=? AND status IN ('OPEN','RECONCILIATION_PENDING')`).run(reason, reason, tradeId);
+    evolution_evidence_eligible=0, accounting_quality='PENDING', evidence_reason=?
+    WHERE trade_id=? AND status IN ('OPEN','RECONCILIATION_PENDING')`).run(reason, tradeId);
 }
 
 export function getClosedTrades(store: Store, limit = 500): Array<Record<string, unknown>> {

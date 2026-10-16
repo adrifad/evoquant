@@ -14,7 +14,7 @@ import type { InstrumentInfo, Position, OrderRequest } from "../exchange/okx/typ
 import { getCandles, getTicker, latestClosedCandle } from "../exchange/okx/market.ts";
 import { getBalance, getPositions, setLeverage } from "../exchange/okx/account.ts";
 import { closePosition, getOrder, getFills, getPendingOrders, placeOrder, OrderRejectedError, prepareOrderSize, requireFilledOrder, waitForOrderTerminal } from "../exchange/okx/orders.ts";
-import { placeConditionalProtection, cancelAlgo } from "../exchange/okx/algo.ts";
+import { placeConditionalProtection, cancelAlgo, getAlgoOrder, normalizePriceToTick, ProtectionPlacementError } from "../exchange/okx/algo.ts";
 import { getServerTime } from "../exchange/okx/market.ts";
 import type { RiskConfig, TradingConfig } from "../core/config.ts";
 import { createLogger } from "../core/logger.ts";
@@ -25,7 +25,7 @@ import { evaluateEntry } from "../risk/engine.ts";
 import { evaluateKillSwitch } from "../risk/limits.ts";
 import { evaluateGlobalEntryGate } from "../risk/global-entry-gate.ts";
 import { sizePosition, stopPriceFor, takeProfitPriceFor } from "../risk/position-sizing.ts";
-import { baseline, getBotState, setBotState, setEmergencyHalted } from "../core/state.ts";
+import { baseline, getBotState, setBotState, setEmergencyHalted, isEmergencyHalted } from "../core/state.ts";
 import type { FeatureSnapshot } from "../market/features.ts";
 import type { Regime } from "../market/regime.ts";
 import { buildFeatures } from "../market/features.ts";
@@ -48,6 +48,77 @@ import { candidateStopRiskPct, portfolioOpenRisk } from "../risk/portfolio-open-
 import { recordOpportunityMetric } from "../market/opportunity-funnel.ts";
 
 const log = createLogger("executor");
+
+function protectionDegraded(store: Store): boolean {
+  return Boolean(store.db.prepare(`SELECT 1 FROM trades WHERE status IN ('OPEN','RECONCILIATION_PENDING')
+    AND COALESCE(protection_state,'UNVERIFIED')<>'VERIFIED' LIMIT 1`).get());
+}
+
+async function cancelAndVerifyProtection(client: OkxClient, instId: string, ids: Array<string | null | undefined>): Promise<void> {
+  const uniqueIds = [...new Set(ids.filter((id): id is string => Boolean(id)))];
+  if (uniqueIds.length === 0) throw new Error("PROTECTION_IDS_UNAVAILABLE");
+  for (const id of uniqueIds) {
+    let algo = await getAlgoOrder(client, instId, id);
+    if (algo.state === "live") {
+      await cancelAlgo(client, instId, id);
+      algo = await getAlgoOrder(client, instId, id);
+    }
+    if (!["canceled", "effective", "order_failed"].includes(algo.state)) {
+      throw new Error(`PROTECTION_TERMINAL_STATE_UNCONFIRMED:${algo.state || "unknown"}`);
+    }
+  }
+}
+
+/** Re-read both exact native protection legs. Failure is observable and blocks all new entries. */
+export async function verifyOpenTradeProtection(d: Pick<ExecutorDeps, "client" | "store" | "instruments">, instId?: string): Promise<boolean> {
+  const now = new Date().toISOString();
+  const rows = d.store.db.prepare(`SELECT * FROM trades WHERE status IN ('OPEN','RECONCILIATION_PENDING')
+    AND (? IS NULL OR instrument=?)`).all(instId ?? null, instId ?? null) as Array<Record<string, unknown>>;
+  let allVerified = true;
+  for (const trade of rows) {
+    const checkedAt = Date.parse(String(trade.protection_checked_at ?? ""));
+    if (Number.isFinite(checkedAt) && Date.now() - checkedAt < 60_000) {
+      if (trade.protection_state !== "VERIFIED") allVerified = false;
+      continue;
+    }
+    const instrument = String(trade.instrument);
+    const metadata = d.instruments[instrument];
+    const slId = String(trade.sl_algo_id ?? trade.algo_id ?? "");
+    const tpId = String(trade.tp_algo_id ?? "");
+    try {
+      if (!metadata || metadata.instId !== instrument || !slId || !tpId) throw new Error("PROTECTION_METADATA_OR_ID_MISSING");
+      const side = String(trade.side) === "LONG" ? "long" : "short";
+      const positions = await getPositions(d.client, instrument);
+      const position = positions.find((p) => p.instId === instrument && p.posSide === side && Number(p.pos) > 0);
+      const positionSize = Math.abs(Number(position?.pos));
+      const tradeSize = Number(trade.contracts);
+      if (!position || !Number.isFinite(positionSize) || positionSize <= 0
+        || !Number.isFinite(tradeSize) || Math.abs(positionSize - tradeSize) > Math.max(1e-9, tradeSize * 1e-8)) {
+        throw new Error("EXCHANGE_POSITION_SIZE_UNVERIFIED");
+      }
+      const sl = await getAlgoOrder(d.client, instrument, slId);
+      const tp = await getAlgoOrder(d.client, instrument, tpId);
+      const contracts = Number(trade.contracts);
+      const stop = Number(normalizePriceToTick(Number(trade.stop_px), metadata.tickSz, side === "long" ? "up" : "down"));
+      const takeProfit = Number(normalizePriceToTick(Number(trade.take_profit_px), metadata.tickSz, side === "long" ? "down" : "up"));
+      const exitSide = side === "long" ? "sell" : "buy";
+      const stopOk = sl.state === "live" && sl.instId === instrument && sl.tdMode === "isolated" && sl.side === exitSide
+        && sl.posSide === side && sl.ordType === "conditional" && sl.slTriggerPxType === "mark" && Number(sl.sz) === contracts
+        && Number.isFinite(Number(sl.slTriggerPx)) && Math.abs(Number(sl.slTriggerPx) - stop) <= Math.max(Number(metadata.tickSz) * 1e-9, 1e-12);
+      const takeProfitOk = tp.state === "live" && tp.instId === instrument && tp.tdMode === "isolated" && tp.side === exitSide
+        && tp.posSide === side && tp.ordType === "conditional" && tp.tpTriggerPxType === "mark" && Number(tp.sz) === contracts
+        && Number.isFinite(Number(tp.tpTriggerPx)) && Math.abs(Number(tp.tpTriggerPx) - takeProfit) <= Math.max(Number(metadata.tickSz) * 1e-9, 1e-12);
+      if (!stopOk || !takeProfitOk) throw new Error(`PROTECTION_STATE_MISMATCH:${stopOk ? "TP" : "SL"}`);
+      d.store.db.prepare("UPDATE trades SET protection_state='VERIFIED',protection_checked_at=? WHERE trade_id=?").run(now, String(trade.trade_id));
+    } catch (error) {
+      allVerified = false;
+      d.store.db.prepare("UPDATE trades SET protection_state='DEGRADED',protection_checked_at=? WHERE trade_id=?").run(now, String(trade.trade_id));
+      setBotState(d.store, "RISK_HALTED");
+      logSystemEvent(d.store, "RISK_EVENT", { tradeId: trade.trade_id, protection_verification_failed: error instanceof Error ? error.message : "UNKNOWN", newEntriesHalted: true });
+    }
+  }
+  return allVerified;
+}
 
 export function getLastKillReason(): string | null {
   return lastKillReason;
@@ -96,6 +167,7 @@ export async function startupSafetySequence(d: ExecutorDeps): Promise<boolean> {
       const open = poss.filter((p) => p.pos !== "0");
       if (await reconcileOpen(d, open)) throw new Error("STATE_UNCERTAIN: unexpected exchange position");
     }],
+    ["open-position-protection", async () => { await verifyOpenTradeProtection(d); }],
     ["pending-orders", async () => {
       const pending = await getPendingOrders(client);
       if (pending.length > 0) {
@@ -221,14 +293,15 @@ async function finalizeFromExchange(d: ExecutorDeps, t: Record<string, unknown>,
  * per-symbol monitor never revisits it — while its RECONCILIATION_PENDING status
  * keeps blocking every entry gate. Re-finalize such rows once per global cycle
  * until the exchange fill is proven or the retry cap defers them for good. */
-const EXIT_SWEEP_MAX_ATTEMPTS = 12;
-const exitSweepAttempts = new Map<string, number>();
+const EXIT_RECONCILE_BASE_MS = 60_000;
+const EXIT_RECONCILE_MAX_MS = 6 * 60 * 60_000;
 export async function sweepUnprovenExits(d: ExecutorDeps): Promise<number> {
   const stale = d.store.db.prepare(
     `SELECT trade_id,instrument,side FROM trades WHERE status='RECONCILIATION_PENDING'
-     AND evidence_reason IN ('EXIT_FILL_NOT_PROVEN','EXIT_FILL_LOOKUP_UNAVAILABLE')`).all() as
+     AND evidence_reason LIKE 'EXIT_%'
+     AND (exit_reconcile_next_retry_ts IS NULL OR exit_reconcile_next_retry_ts<=?)`).all(new Date().toISOString()) as
     Array<{ trade_id: string; instrument: string; side: string }>;
-  if (stale.length === 0) { exitSweepAttempts.clear(); return 0; }
+  if (stale.length === 0) return 0;
   const liveKeys = new Set((await getPositions(d.client)).filter((p) => p.pos !== "0")
     .map((p) => `${p.instId}:${p.posSide}`));
   let healed = 0;
@@ -236,9 +309,13 @@ export async function sweepUnprovenExits(d: ExecutorDeps): Promise<number> {
     const tradeId = row.trade_id;
     // While the exchange still holds this side, the monitor path owns the trade.
     if (liveKeys.has(`${row.instrument}:${String(row.side).toLowerCase()}`)) continue;
-    const attempts = (exitSweepAttempts.get(tradeId) ?? 0) + 1;
-    if (attempts > EXIT_SWEEP_MAX_ATTEMPTS) continue;
-    exitSweepAttempts.set(tradeId, attempts);
+    const before = d.store.db.prepare("SELECT exit_reconcile_attempts FROM trades WHERE trade_id=?").get(tradeId) as { exit_reconcile_attempts: number };
+    const attempts = Number(before.exit_reconcile_attempts ?? 0) + 1;
+    const delay = Math.min(EXIT_RECONCILE_MAX_MS, EXIT_RECONCILE_BASE_MS * 2 ** Math.min(attempts - 1, 8));
+    const attemptedAt = Date.now();
+    d.store.db.prepare(`UPDATE trades SET exit_reconcile_attempts=?,exit_reconcile_last_attempt_ts=?,exit_reconcile_next_retry_ts=?
+      WHERE trade_id=? AND status='RECONCILIATION_PENDING'`).run(attempts, new Date(attemptedAt).toISOString(),
+      new Date(attemptedAt + delay).toISOString(), tradeId);
     await serializeTradeMutation(tradeId, async () => {
       const current = d.store.db.prepare("SELECT * FROM trades WHERE trade_id=? AND status='RECONCILIATION_PENDING'").get(tradeId) as Record<string, unknown> | undefined;
       if (!current) return;
@@ -247,7 +324,7 @@ export async function sweepUnprovenExits(d: ExecutorDeps): Promise<number> {
     const after = d.store.db.prepare("SELECT status FROM trades WHERE trade_id=?").get(tradeId) as { status: string } | undefined;
     if (after && after.status !== "RECONCILIATION_PENDING") {
       healed++;
-      exitSweepAttempts.delete(tradeId);
+      d.store.db.prepare("UPDATE trades SET exit_reconcile_next_retry_ts=NULL WHERE trade_id=?").run(tradeId);
       log.info({ event: "reconcile:sweep_healed", tradeId, status: after.status, attempts });
     } else {
       log.warn({ event: "reconcile:sweep_deferred", tradeId, attempts });
@@ -265,31 +342,56 @@ export async function finalizeOpenTradeFromExchange(d: ExecutorDeps, t: Record<s
   const entryMs = Date.parse(String(t.entry_ts));
   const sideL = String(t.side) === "LONG";
   const exitSide = sideL ? "sell" : "buy";
-  let exitFill: Awaited<ReturnType<typeof getFills>>[number] | undefined;
-  let fills: Awaited<ReturnType<typeof getFills>> = [];
+  let exitOrderFills: Awaited<ReturnType<typeof getFills>> = [];
+  let exitOrderId = closeId;
   let fillLookupFailed = false;
+  let historyComplete = true;
   if (closeId) {
-    try { fills = await getFills(d.client, String(t.instrument), closeId); }
+    try { exitOrderFills = await getFills(d.client, String(t.instrument), closeId); }
     catch { fillLookupFailed = true; }
-  }
-  if (fills.length === 0) {
-    const { getFillsHistory } = await import("../exchange/okx/orders.ts");
-    let sym: Awaited<ReturnType<typeof getFillsHistory>> = [];
-    try { sym = await getFillsHistory(d.client, String(t.instrument)); }
-    catch { fillLookupFailed = true; }
-    fills = sym.filter((f) => Number(f.ts) >= entryMs);
-    exitFill = fills.filter((f) => f.side === exitSide).sort((a, b) => Number(b.ts) - Number(a.ts))[0];
+    const { getFillsHistoryForOrder } = await import("../exchange/okx/orders.ts");
+    try {
+      const history = await getFillsHistoryForOrder(d.client, String(t.instrument), closeId);
+      historyComplete = history.complete;
+      exitOrderFills = [...exitOrderFills, ...history.fills];
+    } catch { fillLookupFailed = true; }
   } else {
-    exitFill = fills.find((fill) => fill.side === exitSide);
+    const { getFillsHistoryForInstrument } = await import("../exchange/okx/orders.ts");
+    try {
+      const history = await getFillsHistoryForInstrument(d.client, String(t.instrument));
+      historyComplete = history.complete;
+      exitOrderFills = history.fills;
+    } catch { fillLookupFailed = true; }
   }
-  const exitPx = Number(exitFill?.fillPx);
-  if (!exitFill || !Number.isFinite(exitPx) || exitPx <= 0) {
-    const reason = fillLookupFailed ? "EXIT_FILL_LOOKUP_UNAVAILABLE" : "EXIT_FILL_NOT_PROVEN";
+  const expectedContracts = Number(t.contracts);
+  const posSide = sideL ? "long" : "short";
+  const candidates = exitOrderFills.filter((fill) => fill.instId === String(t.instrument) && fill.side === exitSide
+    && fill.posSide === posSide && (!closeId || fill.ordId === closeId) && Boolean(fill.ordId) && Boolean(fill.tradeId)
+    && Number(fill.ts) >= entryMs && Number(fill.ts) <= Date.now()
+    && Number.isFinite(Number(fill.fillPx)) && Number(fill.fillPx) > 0
+    && Number.isFinite(Number(fill.fillSz)) && Number(fill.fillSz) > 0);
+  const byOrder = new Map<string, typeof candidates>();
+  for (const fill of candidates) byOrder.set(fill.ordId, [...(byOrder.get(fill.ordId) ?? []), fill]);
+  const completeOrders = [...byOrder.entries()].filter(([, orderFills]) => {
+    const quantity = orderFills.reduce((sum, fill) => sum + Number(fill.fillSz), 0);
+    return Math.abs(quantity - expectedContracts) <= Math.max(1e-9, expectedContracts * 1e-8);
+  });
+  const matchedOrder = historyComplete && byOrder.size === 1 && completeOrders.length === 1 ? completeOrders[0] : undefined;
+  if (!matchedOrder) {
+    const reason = fillLookupFailed ? "EXIT_FILL_LOOKUP_UNAVAILABLE"
+      : !historyComplete ? "EXIT_FILL_HISTORY_INCOMPLETE"
+      : completeOrders.length > 1 || byOrder.size > 1 ? "EXIT_FILL_ORDER_AMBIGUOUS"
+      : candidates.length ? "EXIT_FILL_QUANTITY_INCOMPLETE" : "EXIT_FILL_NOT_PROVEN";
     markReconciliationPending(d.store, tradeId, reason);
     logSystemEvent(d.store, "STATE", { tradeId, reconciliation: "RECONCILIATION_PENDING", reason });
     log.warn({ event: "reconcile:pending", tradeId, reason });
     return;
   }
+  exitOrderId = matchedOrder[0];
+  exitOrderFills = matchedOrder[1];
+  const exitQuantity = exitOrderFills.reduce((sum, fill) => sum + Number(fill.fillSz), 0);
+  const exitPx = exitOrderFills.reduce((sum, fill) => sum + Number(fill.fillPx) * Number(fill.fillSz), 0) / exitQuantity;
+  const exitFill = exitOrderFills.reduce((latest, fill) => Number(fill.ts) > Number(latest.ts) ? fill : latest);
   const contracts = Number(t.contracts);
   const meta = d.instruments[String(t.instrument)];
   if (!meta || meta.instId !== String(t.instrument) || !Number.isFinite(Number(meta.ctVal)) || Number(meta.ctVal) <= 0) {
@@ -299,17 +401,36 @@ export async function finalizeOpenTradeFromExchange(d: ExecutorDeps, t: Record<s
   }
   const ctVal = Number(meta?.ctVal ?? 0);
   const side = t.side === "LONG" ? "LONG" : "SHORT";
+  persistOrder(d.store, { ordId: exitOrderId, instId: String(t.instrument), side: exitSide, posSide,
+    ordType: "market", sz: String(contracts), state: "filled", avgPx: String(exitPx), uTime: exitFill.ts,
+    tradeId, kind: "CLOSE" });
+  persistFills(d.store, exitOrderFills.map((fill) => ({ tradeId: fill.tradeId, ordId: fill.ordId, clOrdId: fill.clOrdId,
+    instId: fill.instId, fillPx: fill.fillPx, fillSz: fill.fillSz, fee: fill.fee, feeCcy: fill.feeCcy,
+    side: fill.side, posSide: fill.posSide, ts: fill.ts })));
   const m = computeClosedMetrics({
     side, entryPx: Number(t.entry_px), stopPx: Number(t.stop_px),
     initialStopPx: Number(t.initial_stop_px ?? t.stop_px), exitPx,
-    contracts, ctVal, exitReason: fills.length ? "FILL_CONFIRM" : "RECONCILE",
+    contracts, ctVal, exitReason: String(t.exit_reason ?? "EXCHANGE_CLOSE_UNCLASSIFIED"),
     entryTs: String(t.entry_ts), exitTs: new Date(Number(exitFill.ts)).toISOString(),
     candlesWhileOpen: await excursionCandles(d, t, Date.parse(String(t.entry_ts)), Number(exitFill.ts)),
     // Reconciliation history proves the exit, but it may omit entry fills.
     // Let the evidence finalizer resolve the complete fee ledger.
     fees: null, funding: null,
   });
+  const protection = d.store.db.prepare("SELECT sl_algo_id,tp_algo_id,algo_id FROM trades WHERE trade_id=?")
+    .get(tradeId) as { sl_algo_id?: string | null; tp_algo_id?: string | null; algo_id?: string | null } | undefined;
+  try {
+    await cancelAndVerifyProtection(d.client, String(t.instrument), [protection?.sl_algo_id, protection?.tp_algo_id, protection?.algo_id]);
+  } catch (error) {
+    markReconciliationPending(d.store, tradeId, "EXIT_PROTECTION_CLEANUP_PENDING");
+    d.store.db.prepare("UPDATE trades SET protection_state='DEGRADED' WHERE trade_id=?").run(tradeId);
+    setBotState(d.store, "RISK_HALTED");
+    logSystemEvent(d.store, "RISK_EVENT", { tradeId, reason: "EXIT_PROTECTION_CLEANUP_PENDING",
+      detail: error instanceof Error ? error.message : "UNKNOWN", newEntriesHalted: true });
+    return;
+  }
   closeTrade(d.store, String(t.trade_id), m);
+  d.store.db.prepare("UPDATE trades SET ord_close_id=?,exit_confirmation='EXCHANGE_FILL_CONFIRMED' WHERE trade_id=?").run(exitOrderId, tradeId);
   log.info({ event: "trade:finalized_reconcile", tradeId: String(t.trade_id), resultR: m.resultR });
 }
 
@@ -391,6 +512,7 @@ export async function runTick(d: ExecutorDeps, ctx: TickContext, symbol: TickSym
   const possAll = (await getPositions(client)).filter((p) => p.pos !== "0");
   const possSym = possAll.filter((p) => p.instId === instId);
   const localOpenSym = (getOpenTrades(store) as Array<Record<string, unknown>>).filter((t) => String(t.instrument) === instId);
+  if (localOpenSym.length) await verifyOpenTradeProtection(d, instId);
   const swingOpenSym = localOpenSym.filter((t) => isTradeOwnedBy(t, "SWING_15M"));
   const kill = evaluateKillSwitch(
     {
@@ -404,7 +526,9 @@ export async function runTick(d: ExecutorDeps, ctx: TickContext, symbol: TickSym
     risk, store,
   );
   if (kill) { setBotState(store, "RISK_HALTED"); log.warn({ event: "kill_switch", reason: kill }); }
-  else if (getBotState(store) === "RISK_HALTED") { setBotState(store, "RUNNING"); log.info({ event: "kill_switch_cleared" }); }
+  else if (getBotState(store) === "RISK_HALTED" && !isEmergencyHalted(store) && !protectionDegraded(store)) {
+    setBotState(store, "RUNNING"); log.info({ event: "kill_switch_cleared" });
+  }
   lastKillReason = kill;
 
   // orphan heal: local OPEN but exchange has no position (algo SL/TP closed it,
@@ -440,7 +564,8 @@ export async function runTick(d: ExecutorDeps, ctx: TickContext, symbol: TickSym
   // §23 NO NEW ENTRIES when: kill active, global cap reached (max_concurrent),
   // or THIS symbol already holds a position (one position per symbol — V1 rule).
   const globalGate = evaluateGlobalEntryGate({
-    killSwitchActive: kill, botState: getBotState(store), openPositions: possAll.length,
+    killSwitchActive: kill ?? (isEmergencyHalted(store) ? "EMERGENCY_STOP" : null), botState: getBotState(store), openPositions: possAll.length,
+    protectionDegraded: protectionDegraded(store),
     instrument: instId, instrumentOccupied: localOpenSym.length > 0 || possSym.length > 0,
   }, risk);
   if (!globalGate.allowed) {
@@ -602,7 +727,8 @@ export async function runTick(d: ExecutorDeps, ctx: TickContext, symbol: TickSym
     const portfolio = portfolioOpenRisk({ equity: freshEq, positions: freshPoss, trades: freshLocal, instruments: d.instruments });
     const candidateRisk = candidateStopRiskPct(Number(sz.contracts) * Number(meta.ctVal) * Math.abs(f.price - stopPx), freshEq);
     const freshGate = evaluateGlobalEntryGate({
-      killSwitchActive: freshKill, botState: getBotState(store), openPositions: freshPoss.length,
+      killSwitchActive: freshKill ?? (isEmergencyHalted(store) ? "EMERGENCY_STOP" : null), botState: getBotState(store), openPositions: freshPoss.length,
+      protectionDegraded: protectionDegraded(store),
       instrument: instId, instrumentOccupied: freshPoss.some((p) => p.instId === instId) || [...localKeys].some((k) => k.startsWith(`${instId}:`)),
       portfolioOpenRiskPct: portfolio.riskPct, candidateRiskPct: candidateRisk,
     }, risk);
@@ -631,12 +757,18 @@ export async function runTick(d: ExecutorDeps, ctx: TickContext, symbol: TickSym
         posSide: side.toLowerCase(), ordType: "market", sz: sz.contracts, state: filled.state,
         avgPx: filled.avgPx, cTime: filled.cTime, uTime: filled.uTime, tradeId: "", kind: "OPEN" });
         const entryPx = Number(filled.avgPx) || f.price;
+        const filledContracts = Number(filled.accFillSz);
+        if (!Number.isFinite(filledContracts) || filledContracts <= 0) throw new Error("entry fill quantity unavailable");
         const executedStopPx = ctx.candidate
           ? entryPx + (side === "LONG" ? -1 : 1) * Math.abs(ctx.candidate.entryPrice - ctx.candidate.stopPrice)
           : stopPriceFor(entryPx, f.atr14, decision.suggested_stop_atr, side);
       const tradeId = nextTradeId();
-      const entryPosition = (await getPositions(client, instId).catch(() => []))
-        .find((p) => p.instId === instId && p.posSide === side.toLowerCase() && Number(p.pos) !== 0);
+      const exchangePositions = await getPositions(client, instId).catch(() => null);
+      const entryPosition = exchangePositions?.find((p) => p.instId === instId && p.posSide === side.toLowerCase() && Number(p.pos) > 0);
+      const exchangeContracts = Math.abs(Number(entryPosition?.pos));
+      const actualContracts = Number.isFinite(exchangeContracts) && exchangeContracts > 0 ? String(exchangeContracts) : String(filledContracts);
+      const positionReadbackVerified = Boolean(entryPosition && Number.isFinite(exchangeContracts) && exchangeContracts > 0
+        && Math.abs(exchangeContracts - filledContracts) <= Math.max(1e-9, filledContracts * 1e-8));
       openTrade(store, {
         tradeId, engine: "SWING_15M", instrument: instId, timeframe: trading.timeframe, side,
         strategy: candidateIdentity ? candidateIdentity.family : strat.name,
@@ -645,7 +777,7 @@ export async function runTick(d: ExecutorDeps, ctx: TickContext, symbol: TickSym
         regime: ctx.regime,
         ...(ctx.candidate ? { regimeAxes: ctx.candidate.regime } : {}),
         ...(ctx.candidate ? { entryConditions: ctx.candidate.conditions } : {}),
-        contracts: sz.contracts, entryPx, entryTs: new Date().toISOString(),
+        contracts: actualContracts, entryPx, entryTs: new Date().toISOString(),
           stopPx: executedStopPx,
         takeProfitPx: ctx.candidate
           ? entryPx + (side === "LONG" ? 1 : -1) * Math.abs(ctx.candidate.entryPrice - ctx.candidate.stopPrice) * ctx.candidate.targetR
@@ -653,29 +785,45 @@ export async function runTick(d: ExecutorDeps, ctx: TickContext, symbol: TickSym
         clOpenId: clOpen, ordOpenId: placed.ordId,
         decisionId,
         rawConfidence: decision.confidence, calibratedConfidence: calConf,
-          plannedRiskPct: Number(sz.contracts) * Number(meta.ctVal) * Math.abs(entryPx - executedStopPx) / freshEq * 100,
+          plannedRiskPct: Number(actualContracts) * Number(meta.ctVal) * Math.abs(entryPx - executedStopPx) / freshEq * 100,
         leverage: confirmedFillLeverage(entryPosition ?? filled, confirmedFillLeverage(filled, leverage)),
         ...(ctx.candidate ? { maxHoldBars: ctx.candidate.maxHoldBars } : {}),
         entryFeatures: f,
       });
-      // §16 Layer A — exchange-native conditional (SL+TP) algo orders.
-      // Best-effort: on failure Layer B (monitor) still holds; flag it.
+      // Establish and verify both independent native protection legs. A failure
+      // leaves the already-open trade under Layer B monitoring, but halts new
+      // entries until the operator resolves protection state.
       try {
         const algo = await placeConditionalProtection(client, {
           instId,
           posSide: side === "LONG" ? "long" : "short",
-          contracts: sz.contracts,
+          contracts: actualContracts,
+          tickSz: meta.tickSz,
             stopPrice: executedStopPx,
           takeProfitPrice: ctx.candidate
             ? entryPx + (side === "LONG" ? 1 : -1) * Math.abs(ctx.candidate.entryPrice - ctx.candidate.stopPrice) * ctx.candidate.targetR
             : takeProfitPriceFor(entryPx, f.atr14, decision.suggested_take_profit_atr, side),
           clAlgoId: clId(side, "ALGO", instId),
         });
-        store.db.prepare("UPDATE trades SET algo_id=? WHERE trade_id=?").run(algo.algoId, tradeId);
-        log.info({ event: "protection:algo_placed", tradeId, algoId: algo.algoId });
-        } catch (algoErr) {
-        logSystemEvent(store, "RISK_EVENT", { protection_degraded: algoErr instanceof Error ? algoErr.message : String(algoErr) });
-          log.warn({ event: "protection:algo_failed", fallback: "Layer B bot monitor" });
+        store.db.prepare("UPDATE trades SET algo_id=?,sl_algo_id=?,tp_algo_id=?,protection_state=? WHERE trade_id=?")
+          .run(algo.stop.algoId, algo.stop.algoId, algo.takeProfit.algoId, positionReadbackVerified ? "VERIFIED" : "DEGRADED", tradeId);
+        if (!positionReadbackVerified) {
+          setBotState(store, "RISK_HALTED");
+          logSystemEvent(store, "RISK_EVENT", { protection_degraded: "EXCHANGE_POSITION_SIZE_UNVERIFIED", tradeId, newEntriesHalted: true });
+        }
+        log.info({ event: "protection:algos_verified", tradeId, slAlgoId: algo.stop.algoId, tpAlgoId: algo.takeProfit.algoId });
+      } catch (algoErr) {
+        if (algoErr instanceof ProtectionPlacementError && algoErr.stop) {
+          store.db.prepare("UPDATE trades SET algo_id=?,sl_algo_id=?,tp_algo_id=?,protection_state='DEGRADED' WHERE trade_id=?")
+            .run(algoErr.stop.algoId, algoErr.stop.algoId, algoErr.takeProfit?.algoId ?? null, tradeId);
+        } else {
+          store.db.prepare("UPDATE trades SET protection_state='DEGRADED' WHERE trade_id=?").run(tradeId);
+        }
+        setBotState(store, "RISK_HALTED");
+        logSystemEvent(store, "RISK_EVENT", { protection_degraded: algoErr instanceof Error ? algoErr.message : "UNKNOWN", tradeId, newEntriesHalted: true });
+        log.error({ event: "protection:algo_failed", tradeId, newEntriesHalted: true });
+        releaseEntry(store, clOpen);
+        throw new Error("STATE_UNCERTAIN: native position protection was not fully verified");
         }
         releaseEntry(store, clOpen);
         try { persistEntryCapital(store, tradeId, entryPosition, meta, freshEq, leverage); }
@@ -700,7 +848,7 @@ export async function runTick(d: ExecutorDeps, ctx: TickContext, symbol: TickSym
 }
 
 export function isGlobalStopReason(reason: string): boolean {
-  return /^(KILL_SWITCH|BOT_|MAX_CONCURRENT|MAX_DAILY_LOSS|.*DRAWDOWN|PORTFOLIO_OPEN_RISK|RECONCILIATION_PENDING|STATE_UNCERTAIN|LLM_BUDGET_EXHAUSTED|EXCHANGE_)/.test(reason);
+  return /^(KILL_SWITCH|BOT_|MAX_CONCURRENT|MAX_DAILY_LOSS|.*DRAWDOWN|PORTFOLIO_OPEN_RISK|OPEN_POSITION_PROTECTION|RECONCILIATION_PENDING|STATE_UNCERTAIN|LLM_BUDGET_EXHAUSTED|EXCHANGE_)/.test(reason);
 }
 
 // Deterministic SL/TP price trigger (§25 Layer B core) — pure fn shared by
@@ -761,8 +909,9 @@ async function closeOpenTradeOnExchange(d: ExecutorDeps, t: Record<string, unkno
     logSystemEvent(d.store, "RISK_EVENT", { close_order_not_filled: filled.state, tradeId: String(t.trade_id), ordId: placed.ordId });
     throw error; // keep the trade OPEN and its exchange-side protection intact
   }
-  // §27 fees: sum |fee| across this trade's fills (entry + close orders)
-  let feesPaid: number | null = 0;
+  // Fee completeness/signs are finalized from both exact fill legs later.
+  // Never publish a partial close-time total as complete accounting.
+  let feesPaid: number | null = null;
   for (const id of [String(t.ord_open_id ?? ""), placed.ordId]) {
     if (!id) { feesPaid = null; continue; }
     let fs: Awaited<ReturnType<typeof getFills>>;
@@ -772,9 +921,6 @@ async function closeOpenTradeOnExchange(d: ExecutorDeps, t: Record<string, unkno
     persistFills(d.store, fs.map((fx) => ({ tradeId: fx.tradeId, ordId: fx.ordId, clOrdId: fx.clOrdId,
       instId: fx.instId, fillPx: fx.fillPx, fillSz: fx.fillSz, fee: fx.fee, feeCcy: fx.feeCcy,
       side: fx.side, posSide: fx.posSide, ts: fx.ts })));
-    if (feesPaid !== null) {
-      for (const fx of fs) feesPaid += Math.abs(Number(fx.fee) || 0);
-    }
   }
   const exitFill = [...(await getFills(d.client, String(t.instrument), placed.ordId).catch(() => []))]
     .find((fill) => fill.side === (side === "LONG" ? "sell" : "buy"));
@@ -795,14 +941,25 @@ async function closeOpenTradeOnExchange(d: ExecutorDeps, t: Record<string, unkno
     candlesWhileOpen: await excursionCandles(d, t, Date.parse(String(t.entry_ts)), Number(exitFill.ts)),
     fees: feesPaid, funding: null,
   });
+  const protectionIds = d.store.db.prepare("SELECT sl_algo_id,tp_algo_id,algo_id FROM trades WHERE trade_id=?")
+    .get(String(t.trade_id)) as { sl_algo_id?: string | null; tp_algo_id?: string | null; algo_id?: string | null } | undefined;
+  try {
+    await cancelAndVerifyProtection(d.client, String(t.instrument), [protectionIds?.sl_algo_id, protectionIds?.tp_algo_id, protectionIds?.algo_id]);
+  } catch (error) {
+    // Persist the already-known strategy exit reason before deferring closure.
+    // The reconciliation worker can later confirm the fill without erasing why
+    // this close was initiated.
+    d.store.db.prepare("UPDATE trades SET cl_close_id=?,ord_close_id=?,exit_reason=? WHERE trade_id=?")
+      .run(clClose, placed.ordId, reason, String(t.trade_id));
+    markReconciliationPending(d.store, String(t.trade_id), "EXIT_PROTECTION_CLEANUP_PENDING");
+    d.store.db.prepare("UPDATE trades SET protection_state='DEGRADED' WHERE trade_id=?").run(String(t.trade_id));
+    setBotState(d.store, "RISK_HALTED");
+    logSystemEvent(d.store, "RISK_EVENT", { tradeId: String(t.trade_id), reason: "EXIT_PROTECTION_CLEANUP_PENDING",
+      detail: error instanceof Error ? error.message : "UNKNOWN", newEntriesHalted: true });
+    return;
+  }
   closeTrade(d.store, String(t.trade_id), { ...m });
   d.store.db.prepare("UPDATE trades SET cl_close_id=?, ord_close_id=? WHERE trade_id=?").run(clClose, placed.ordId, String(t.trade_id));
-  // §16 — remove stale protective algo once we closed by other means
-  const algoRow = d.store.db.prepare("SELECT algo_id FROM trades WHERE trade_id=?").get(String(t.trade_id)) as { algo_id?: string | null } | undefined;
-  if (algoRow?.algo_id) {
-    await cancelAlgo(d.client, String(t.instrument), algoRow.algo_id).catch((err) =>
-      log.warn({ event: "algo_cancel_failed", error: err instanceof Error ? err.message : String(err) }));
-  }
   log.info({ event: "trade:closed", tradeId: String(t.trade_id), reason, resultR: m.resultR });
   logSystemEvent(d.store, "TRADE_CLOSED", { tradeId: String(t.trade_id), instId: String(t.instrument), reason, resultR: m.resultR });
 }

@@ -167,6 +167,8 @@ function executionFixture(t: { after(fn: () => void): void }, onLeverage?: () =>
   trading.sizing = { mode: "percent_of_equity", position_pct: 20 };
   const positions: Array<Record<string, string>> = [];
   const writes: Array<{ url: string; body: Record<string, string> }> = [];
+  const algos = new Map<string, Record<string, string>>();
+  let algoSequence = 0;
   const behavior = { entryFailure: null as "post" | "wait" | "wait-reject" | "reject" | "envelope-reject" | "duplicate" | "malformed" | null,
     resolution: null as Record<string, string> | null, reservationQueries: 0 };
   const client = {
@@ -181,6 +183,10 @@ function executionFixture(t: { after(fn: () => void): void }, onLeverage?: () =>
         if (behavior.entryFailure === "wait") throw new Error("order status request timed out");
         if (behavior.entryFailure === "wait-reject") throw new OrderRejectedError("51000", "status query rejected", true);
         return [{ ordId: "O1", instId: meta.instId, state: "filled", avgPx: "100", lever: "3", accFillSz: "200", sz: "200" }];
+      }
+      if (url.endsWith("/order-algo")) {
+        const algoId = query?.algoId ?? "";
+        return algoId && algos.has(algoId) ? [structuredClone(algos.get(algoId)!)] : [];
       }
       throw new Error(`unexpected fake GET ${url}`);
     },
@@ -199,7 +205,13 @@ function executionFixture(t: { after(fn: () => void): void }, onLeverage?: () =>
         positions.push({ instId: body.instId!, posSide: body.posSide!, pos: body.sz!, avgPx: "100", markPx: "100", lever: "4", margin: "5", mgnMode: "isolated" });
         return [{ ordId: "O1", sCode: "0" }];
       }
-      if (url.endsWith("/order-algo")) return [{ algoId: "A1", sCode: "0" }];
+      if (url.endsWith("/order-algo")) {
+        const algoId = `A${++algoSequence}`;
+        algos.set(algoId, { algoId, instId: body.instId!, tdMode: body.tdMode!, side: body.side!, ordType: body.ordType!,
+          posSide: body.posSide!, sz: body.sz!, state: "live", slTriggerPx: body.slTriggerPx ?? "",
+          slTriggerPxType: body.slTriggerPxType ?? "", tpTriggerPx: body.tpTriggerPx ?? "", tpTriggerPxType: body.tpTriggerPxType ?? "" });
+        return [{ algoId, algoClOrdId: body.algoClOrdId!, sCode: "0" }];
+      }
       throw new Error(`unexpected fake POST ${url}`);
     },
   } as unknown as OkxClient;
@@ -281,7 +293,7 @@ for (const engine of ["openScalp", "openSwing"] as const) {
       f.behavior.entryFailure = null;
       await f[engine]();
       assert.equal(f.writes.filter((w) => w.url.endsWith("/order")).length, 2);
-      assert.equal(f.writes.filter((w) => w.url.endsWith("/order-algo")).length, 1);
+      assert.equal(f.writes.filter((w) => w.url.endsWith("/order-algo")).length, 2);
       assert.equal((f.store.db.prepare("SELECT COUNT(*) n FROM trades WHERE status='OPEN'").get() as { n: number }).n, 1);
     });
   }
@@ -318,9 +330,12 @@ for (const engine of ["openScalp", "openSwing"] as const) {
     prepareCapitalStore(f.store);
     f.store.db.exec("CREATE TRIGGER fail_capital BEFORE INSERT ON entry_capital BEGIN SELECT RAISE(ABORT, 'snapshot unavailable'); END;");
     await f[engine]();
-    assert.equal(f.writes.filter((w) => w.url.endsWith("/order-algo")).length, 1);
-    const trade = f.store.db.prepare("SELECT algo_id FROM trades WHERE status='OPEN'").get() as { algo_id: string };
+    assert.equal(f.writes.filter((w) => w.url.endsWith("/order-algo")).length, 2);
+    const trade = f.store.db.prepare("SELECT algo_id,sl_algo_id,tp_algo_id,protection_state FROM trades WHERE status='OPEN'").get() as { algo_id: string; sl_algo_id: string; tp_algo_id: string; protection_state: string };
     assert.equal(trade.algo_id, "A1");
+    assert.equal(trade.sl_algo_id, "A1");
+    assert.equal(trade.tp_algo_id, "A2");
+    assert.equal(trade.protection_state, "VERIFIED");
     assert.equal(unresolvedEntry(f.store), null);
     assert.equal((f.store.db.prepare("SELECT COUNT(*) n FROM entry_capital").get() as { n: number }).n, 0);
   });

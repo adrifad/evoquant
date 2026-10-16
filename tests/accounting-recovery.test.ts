@@ -5,6 +5,7 @@ import path from "node:path";
 import test from "node:test";
 import { finalizePendingEvidence, type EvidenceFinalizerDeps } from "../src/evidence/finalizer.ts";
 import { getFillsHistoryForOrder } from "../src/exchange/okx/orders.ts";
+import { getFundingBills } from "../src/exchange/okx/account.ts";
 import { openStore } from "../src/memory/db.ts";
 
 const instId = "BTC-USDT-SWAP";
@@ -194,6 +195,36 @@ test("historical fill pagination uses billId and reports a bounded incomplete sc
 
   const incomplete = await getFillsHistoryForOrder({ get: async () => page.map(({ billId: _billId, ...row }) => row) } as never, instId, "O", 2);
   assert.equal(incomplete.complete, false, "full page without a stable billId cursor cannot prove coverage");
+});
+
+test("funding bills follow billId pagination and retain authoritative signed pnl", async () => {
+  const page = Array.from({ length: 100 }, (_, i) => ({ billId: `B${String(i).padStart(3, "0")}`, instId,
+    ts: String(start + i), pnl: i === 99 ? "-0.50" : "0", balChg: i === 99 ? "-0.47" : "0",
+    ccy: "USDT", type: "2", subType: "173" }));
+  const requests: Array<Record<string, unknown>> = [];
+  const bills = await getFundingBills({ get: async (_endpoint: string, query: Record<string, unknown>) => {
+    requests.push(query);
+    return query.after ? [{ billId: "B100", instId, ts: String(start + 100), pnl: "0.25", balChg: "0.21", ccy: "USDT", type: "2", subType: "174" }] : page;
+  } } as never, instId, start, finish, finish + 5 * 60_000);
+  assert.equal(requests.length, 2);
+  assert.equal(requests[1]?.after, "B099");
+  assert.equal(bills.length, 101);
+  assert.equal(bills[99]?.pnl, "-0.50");
+  assert.equal(bills[99]?.balChg, "-0.47");
+  assert.equal(bills[100]?.pnl, "0.25");
+  assert.equal(bills[100]?.balChg, "0.21");
+});
+
+test("funding pagination without a stable cursor fails closed instead of proving zero", async () => {
+  const fullPage = Array.from({ length: 100 }, (_, i) => ({ instId, ts: String(start + i), pnl: "0", ccy: "USDT", subType: "173" }));
+  await assert.rejects(() => getFundingBills({ get: async () => fullPage } as never, instId, start, finish, finish + 5 * 60_000),
+    /pagination cursor unavailable/);
+});
+
+test("a relevant funding bill without a stable ID remains untrusted instead of synthetic-deduplicating", async () => {
+  const bill = { instId, ts: String(start + 1), pnl: "-0.5", balChg: "-0.47", ccy: "USDT", type: "2", subType: "173" };
+  await assert.rejects(() => getFundingBills({ get: async () => [bill] } as never, instId, start, finish, finish + 5 * 60_000),
+    /stable identifier unavailable/);
 });
 
 test("an incomplete history page cannot qualify fees even when it contains some fill records", async (t) => {

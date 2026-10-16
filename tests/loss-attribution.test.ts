@@ -56,6 +56,7 @@ test("loss attribution uses only complete valid NET evidence and states its acco
     assert.equal(report.overall.averageMfe, 2);
     assert.equal(report.overall.averageMae, 1.5);
     assert.equal(report.overall.averageDurationSeconds, 900);
+    assert.equal(report.overall.maxTradeSequenceDrawdownUsdt, 4);
     assert.equal(report.by.side.find(item => item.key === "SHORT")?.metrics.tradeCount, 1);
     assert.equal(report.by.exitReason.find(item => item.key === "SL")?.metrics.tradeCount, 1);
     assert.equal(report.by.gateDecision.find(item => item.key === "UNKNOWN")?.metrics.tradeCount, 2,
@@ -86,5 +87,17 @@ test("loss attribution leaves profit factor unavailable when no complete losing 
   try {
     f.row("ONLY-WIN", 2, 1, 0, 0.2, 3, 1, 30);
     assert.equal(buildLossAttribution(f.store).overall.profitFactor, null);
+  } finally { f.close(); }
+});
+
+test("cross-instrument raw MFE/MAE averages are unavailable while per-symbol values remain comparable", () => {
+  const f = fixture();
+  try {
+    f.row("BTC-TRADE", 2, 0, 0, 0.2, 10, 4, 30);
+    f.row("ETH-TRADE", 3, 0, 0, 0.3, 2, 1, 30, { instrument: "ETH-USDT-SWAP" });
+    const report = buildLossAttribution(f.store);
+    assert.equal(report.overall.averageMfe, null);
+    assert.equal(report.by.symbol.find(item => item.key === "BTC-USDT-SWAP")?.metrics.averageMfe, 10);
+    assert.equal(report.formulas.maxTradeSequenceDrawdownUsdt.includes("not account-equity drawdown"), true);
   } finally { f.close(); }
 });

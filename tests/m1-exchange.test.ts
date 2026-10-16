@@ -9,7 +9,7 @@ import { OkxClient, OkxApiError, OkxConfigError, resolveBaseUrl, DEMO_BASE_URL, 
 import { getCandles } from "../src/exchange/okx/market.ts";
 import { placeOrder, getOrder, closePosition, waitForOrderTerminal, OrderRejectedError, OrderTimeoutError, prepareOrderSize } from "../src/exchange/okx/orders.ts";
 import { createDemoExchange } from "../src/exchange/okx/index.ts";
-import { amendConditionalStop, getAlgoOrder } from "../src/exchange/okx/algo.ts";
+import { amendConditionalStop, getAlgoOrder, normalizePriceToTick, placeConditionalProtection } from "../src/exchange/okx/algo.ts";
 import { redact } from "../src/core/logger.ts";
 import { assertDemo, loadRiskConfig, loadTradingConfig, ABSOLUTE_MAX } from "../src/core/config.ts";
 
@@ -251,7 +251,7 @@ test("getOrder maps raw detail incl. state", async () => {
   assert.equal(d.state, "canceled");
 });
 
-test("conditional SL amendment preserves the algo and confirms its live trigger", async () => {
+test("conditional SL amendment preserves safe tick rounding and confirms its live trigger", async () => {
   const requests: Array<{ url: string; init: RequestInit | undefined }> = [];
   const client = new OkxClient({
     environment: "demo",
@@ -261,11 +261,11 @@ test("conditional SL amendment preserves the algo and confirms its live trigger"
       requests.push({ url, init });
       const body = url.includes("amend-algos")
         ? { code: "0", msg: "", data: [{ sCode: "0", algoId: "A1" }] }
-        : { code: "0", msg: "", data: [{ algoId: "A1", state: "live", slTriggerPx: "100.2" }] };
+        : { code: "0", msg: "", data: [{ algoId: "A1", state: "live", instId: "BTC-USDT-SWAP", posSide: "long", sz: "1", slTriggerPx: "100.2" }] };
       return new Response(JSON.stringify(body), { status: 200 });
     }) as unknown as typeof fetch,
   });
-  await amendConditionalStop(client, { instId: "BTC-USDT-SWAP", algoId: "A1", stopPrice: 100.2 });
+  await amendConditionalStop(client, { instId: "BTC-USDT-SWAP", algoId: "A1", stopPrice: 100.2, tickSz: "0.1", posSide: "long" });
   const amended = JSON.parse(String(requests[0]!.init?.body)) as Record<string, unknown>;
   assert.equal(amended.algoId, "A1");
   assert.equal(amended.newSlTriggerPx, "100.2");
@@ -275,6 +275,83 @@ test("conditional SL amendment preserves the algo and confirms its live trigger"
   const confirmed = await getAlgoOrder(client, "BTC-USDT-SWAP", "A1");
   assert.equal(confirmed.state, "live");
   assert.equal(confirmed.slTriggerPx, "100.2");
+});
+
+test("tick normalization supports small and varied OKX ticks with risk-safe direction", () => {
+  assert.equal(normalizePriceToTick(0.001234, "0.0001", "up"), "0.0013");
+  assert.equal(normalizePriceToTick(1.23456, "0.001", "up"), "1.235");
+  assert.equal(normalizePriceToTick(12.3456, "0.01", "down"), "12.34");
+  assert.equal(normalizePriceToTick(12.3456, "0.1", "up"), "12.4");
+  assert.equal(normalizePriceToTick(100, "0.1", "down"), "100");
+  assert.throws(() => normalizePriceToTick(0, "0.01", "up"), /invalid protection price/);
+  assert.throws(() => normalizePriceToTick(1, "0", "up"), /invalid instrument tick/);
+});
+
+test("native protection uses two verified conditional legs with exact tick and algo client fields", async () => {
+  const requests: Array<{ url: string; init: RequestInit | undefined }> = [];
+  const details = new Map<string, Record<string, string>>();
+  let sequence = 0;
+  const client = new OkxClient({ environment: "demo", credentials: { apiKey: "k", secret: "s", passphrase: "p" },
+    fetchImpl: (async (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
+      const url = String(input); requests.push({ url, init });
+      if (url.includes("order-algo") && (!init?.method || init.method === "GET")) {
+        const algoId = new URL(url).searchParams.get("algoId") ?? "";
+        return new Response(JSON.stringify({ code: "0", msg: "", data: [details.get(algoId)] }), { status: 200 });
+      }
+      const body = JSON.parse(String(init?.body)) as Record<string, string>;
+      const algoId = `A${++sequence}`;
+      details.set(algoId, { algoId, instId: body.instId ?? "", tdMode: body.tdMode ?? "", side: body.side ?? "",
+        ordType: body.ordType ?? "", posSide: body.posSide ?? "", sz: body.sz ?? "", state: "live",
+        slTriggerPx: body.slTriggerPx ?? "", slTriggerPxType: body.slTriggerPxType ?? "",
+        tpTriggerPx: body.tpTriggerPx ?? "", tpTriggerPxType: body.tpTriggerPxType ?? "" });
+      return new Response(JSON.stringify({ code: "0", msg: "", data: [{ sCode: "0", algoId, algoClOrdId: body.algoClOrdId }] }), { status: 200 });
+    }) as unknown as typeof fetch });
+  const protection = await placeConditionalProtection(client, { instId: "SUI-USDT-SWAP", posSide: "long", contracts: "3", tickSz: "0.0001",
+    stopPrice: 1.23456, takeProfitPrice: 1.45678, clAlgoId: "EVQ-ALGO-TEST" });
+  assert.deepEqual([protection.stop.algoId, protection.takeProfit.algoId], ["A1", "A2"]);
+  const bodies = requests.filter(request => request.url.endsWith("/order-algo") && request.init?.method === "POST")
+    .map(request => JSON.parse(String(request.init?.body)) as Record<string, unknown>);
+  assert.equal(bodies.length, 2);
+  assert.equal(bodies[0]?.slTriggerPx, "1.2346");
+  assert.equal(bodies[1]?.tpTriggerPx, "1.4567");
+  assert.equal(bodies[0]?.side, "sell");
+  assert.equal(bodies[0]?.posSide, "long");
+  assert.equal(bodies[0]?.algoClOrdId, "EVQ-ALGO-TESTSL");
+  assert.equal("clOrdId" in (bodies[0] ?? {}), false);
+  assert.equal("tpTriggerPx" in (bodies[0] ?? {}), false);
+  assert.equal(bodies[1]?.tpTriggerPx, "1.4567");
+  assert.equal("slTriggerPx" in (bodies[1] ?? {}), false);
+  assert.ok(requests.filter(request => request.url.includes("order-algo") && request.init?.method !== "POST").length === 2,
+    "both exchange algo IDs were read back and verified");
+});
+
+test("native short protection uses buy close side and symmetric tick-safe trigger prices", async () => {
+  const requests: Array<{ url: string; init: RequestInit | undefined }> = [];
+  const details = new Map<string, Record<string, string>>();
+  let sequence = 0;
+  const client = new OkxClient({ environment: "demo", credentials: { apiKey: "k", secret: "s", passphrase: "p" },
+    fetchImpl: (async (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
+      const url = String(input); requests.push({ url, init });
+      if (url.includes("order-algo") && (!init?.method || init.method === "GET")) {
+        const id = new URL(url).searchParams.get("algoId") ?? "";
+        return new Response(JSON.stringify({ code: "0", data: [details.get(id)] }), { status: 200 });
+      }
+      const body = JSON.parse(String(init?.body)) as Record<string, string>;
+      const algoId = `S${++sequence}`;
+      details.set(algoId, { algoId, instId: body.instId ?? "", tdMode: body.tdMode ?? "", side: body.side ?? "",
+        ordType: body.ordType ?? "", posSide: body.posSide ?? "", sz: body.sz ?? "", state: "live",
+        slTriggerPx: body.slTriggerPx ?? "", slTriggerPxType: body.slTriggerPxType ?? "",
+        tpTriggerPx: body.tpTriggerPx ?? "", tpTriggerPxType: body.tpTriggerPxType ?? "" });
+      return new Response(JSON.stringify({ code: "0", data: [{ sCode: "0", algoId }] }), { status: 200 });
+    }) as unknown as typeof fetch });
+  await placeConditionalProtection(client, { instId: "SUI-USDT-SWAP", posSide: "short", contracts: "2", tickSz: "0.001",
+    stopPrice: 1.2341, takeProfitPrice: 1.1009 });
+  const bodies = requests.filter(r => r.init?.method === "POST").map(r => JSON.parse(String(r.init?.body)) as Record<string, unknown>);
+  assert.equal(bodies[0]?.side, "buy");
+  assert.equal(bodies[0]?.posSide, "short");
+  assert.equal(bodies[0]?.slTriggerPx, "1.234");
+  assert.equal(bodies[1]?.side, "buy");
+  assert.equal(bodies[1]?.tpTriggerPx, "1.101");
 });
 
 // ---------- logger redaction (spec §51) ----------

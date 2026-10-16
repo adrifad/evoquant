@@ -139,8 +139,13 @@ export function startDashboard(cfg: DashboardConfig): DashboardServer {
         ? portfolioOpenRisk({ equity: eq, positions: exchange.positions, trades: open, instruments: cfg.deps().instruments })
         : { known: false, lossToStops: null, riskPct: null, unavailable: [] };
       const projected = open.map(t => projectTrade(t, exchange.positions, eq));
-      const closed = store.db.prepare("SELECT COUNT(*) c, COALESCE(SUM(pnl),0) p, COALESCE(AVG(result_r),0) e FROM trades WHERE status='CLOSED'").get() as { c: number; p: number; e: number };
-      const evidencePending = store.db.prepare("SELECT COUNT(*) c FROM trades WHERE status='CLOSED' AND evidence_state='EVIDENCE_PENDING'").get() as { c: number };
+      const closed = store.db.prepare("SELECT COUNT(*) c, SUM(pnl) p FROM trades WHERE status='CLOSED'").get() as { c: number; p: number | null };
+      const trustedClosed = store.db.prepare(`SELECT COUNT(*) c, SUM(pnl) p, AVG(result_r) e FROM trades WHERE status='CLOSED'
+        AND evidence_state='VALID' AND evolution_evidence_eligible=1 AND result_r_basis='NET' AND accounting_quality='COMPLETE'
+        AND pnl IS NOT NULL AND fees IS NOT NULL AND funding IS NOT NULL AND result_r IS NOT NULL`).get() as { c: number; p: number | null; e: number | null };
+      const evidenceCounts = store.db.prepare("SELECT evidence_state,COUNT(*) c FROM trades WHERE status='CLOSED' GROUP BY evidence_state").all() as Array<{ evidence_state: string; c: number }>;
+      const evidenceByState = Object.fromEntries(evidenceCounts.map(row => [row.evidence_state, row.c]));
+      const evidencePending = Number(evidenceByState.EVIDENCE_PENDING ?? 0) + Number(evidenceByState.ACCOUNTING_INCOMPLETE ?? 0);
       return send(200, {
         environment: "DEMO",                       // §96 always visible
         exchange: "OKX",
@@ -155,7 +160,8 @@ export function startDashboard(cfg: DashboardConfig): DashboardServer {
         daily: { dayStart: base?.dayStartEquity ?? null, pnl: base && eq !== null ? eq - base.dayStartEquity : null,
           lossPct: base && eq !== null && base.dayStartEquity > 0 ? Math.max(0, (base.dayStartEquity - eq) / base.dayStartEquity * 100) : null },
         drawdownPct: base && eq !== null && base.peakEquity > 0 ? Math.max(0, (base.peakEquity - eq) / base.peakEquity * 100) : null,
-        totals: { closed: closed.c, pnl: closed.p, expectancyR: closed.e }, evidencePending: evidencePending.c,
+        totals: { closed: closed.c, pnl: trustedClosed.p, expectancyR: trustedClosed.e,
+          trustedNetClosed: trustedClosed.c, allClosedPnl: closed.p, accountingByEvidenceState: evidenceByState }, evidencePending,
         openPositions: projected, openPosition: projected[0] ?? null,
         criticalEvents: store.db.prepare("SELECT ts,kind,payload FROM system_events WHERE kind IN ('ERROR','RISK_EVENT','LLM_TIMEOUT','LLM_AUTH_FAILURE','STATE') ORDER BY id DESC LIMIT 4").all(),
         reconciliationWarnings: store.db.prepare("SELECT trade_id,instrument,side,entry_ts,exit_reason FROM trades WHERE status='RECONCILIATION_PENDING' ORDER BY entry_ts DESC").all(),
@@ -663,7 +669,7 @@ nav{display:flex;gap:4px;margin-left:auto}nav button.on{border-color:var(--blue)
 </main>
 <script>
 const $=s=>document.getElementById(s);const esc=s=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
-const money=v=>v==null?'—':(v<0?'-':'')+Math.abs(Number(v)).toFixed(2);
+const money=v=>v==null?'—':Number(v)===0?'0.00':(v<0?'-':'')+(Math.abs(Number(v))<0.000001?'<0.000001':Math.abs(Number(v)).toFixed(2));
 const cls=v=>v>0?'pos':v<0?'neg':'dim';
 let tab='overview';
 document.querySelectorAll('nav button').forEach(b=>b.onclick=()=>{document.querySelectorAll('nav button').forEach(x=>x.classList.remove('on'));b.classList.add('on');tab=b.dataset.tab;['overview','trades','memory','strategies','settings','events'].forEach(t=>$('tab-'+t).hidden=t!==tab);refresh();});
@@ -721,7 +727,7 @@ async function refresh(){
    ['Unrealized PnL',money(uplTot)+(s.openPositions?.length?' ('+s.openPositions.length+')':''),uplTot>0?'pos':uplTot<0?'neg':''],
    ['Daily Loss',s.daily.lossPct.toFixed(2)+'%',s.daily.lossPct>2?'neg':''],
    ['Drawdown',s.drawdownPct.toFixed(2)+'%',s.drawdownPct>7?'neg':''],
-   ['Expectancy / Trades',(s.totals.expectancyR||0).toFixed(2)+'R / '+s.totals.closed,s.totals.expectancyR>0?'pos':'neg'],
+   ['Trusted NET expectancy / trades',s.totals.expectancyR==null?'—':Number(s.totals.expectancyR).toFixed(2)+'R / '+(s.totals.trustedNetClosed??0),s.totals.expectancyR>0?'pos':s.totals.expectancyR<0?'neg':''],
    ['Risk State',kill?'HALTED: '+esc(kill):'SAFE',kill?'neg':'pos'],
   ].map(k=>'<div class="card"><h2>'+k[0]+'</h2><div class="num '+k[2]+'">'+k[1]+'</div></div>').join('');
   const d=s.latestDecision;
