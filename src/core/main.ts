@@ -13,14 +13,14 @@ import { scanInstruments, scanCoreV2, pickEntry, type ScanRow } from "../strateg
 import { attemptRankedCandidates } from "../strategy/candidate-queue.ts";
 import { type TradeCandidate, parseStrategyV2Params, type StrategyV2Id, type StrategyV2Params } from "../strategy/core-v2.ts";
 import { ensureV2Registry, getV2ChampionParams, getV2ChampionVersions, getV2Champions } from "../strategy/v2-registry.ts";
-import { startupSafetySequence, runTick, emergencyStop, recoverProtectionHalt, inferLegacyProtectionHalt, getLastKillReason, resetLastKillReason, sweepUnprovenExits, persistCandles, priceTrigger } from "../execution/executor.ts";
+import { startupSafetySequence, runTick, emergencyStop, recoverProtectionHalt, inferLegacyProtectionHalt, getLastKillReason, resetLastKillReason, sweepUnprovenExits, persistCandles, priceTrigger, finalizeOpenTradeFromExchange } from "../execution/executor.ts";
 import { closeTradeOnExchange } from "../execution/executor.ts";
 import { getPositions } from "../exchange/okx/account.ts";
 import { getOpenTrades } from "../memory/trades.ts";
 import { isTradeOwnedBy } from "../memory/engines.ts";
 import { CandleCloseScheduler, msForBar } from "./scheduler.ts";
 import { ScalpRunner } from "../scalp/runner.ts";
-import type { ScalpCfg } from "../scalp/signals.ts";
+import { SCALP_DEFAULTS, type ScalpCfg } from "../scalp/signals.ts";
 import { updateTradeStopPlus } from "../execution/position-management.ts";
 import { getBotState, setBotState, getRiskHaltReason, setRiskHaltReason, isEmergencyHalted } from "./state.ts";
 import { decide, gateCandidate, holdBecause, type Decision } from "../agents/decision-agent.ts";
@@ -39,6 +39,7 @@ import { parseEvolutionConfig } from "./evolution-config.ts";
 import { resolveRuntimePolicy } from "./runtime-policy.ts";
 import { RuntimeRiskService } from "./runtime-risk.ts";
 import { RuntimeTradingService } from "./runtime-trading.ts";
+import { PositionMonitorHealthTracker } from "./monitor-health.ts";
 import { runOncePerGlobalCycle } from "./global-cycle.ts";
 import { RoleLlmService } from "./llm-role-service.ts";
 import { createLogger } from "./logger.ts";
@@ -151,7 +152,7 @@ async function main(): Promise<void> {
   let lastTick: { features: unknown; regime: string; at: string } | null = null;
   let lastKill: string | null = null;
   let lastScan: ScanRow[] = [];
-  let existingPositionMonitoringOperational = false;
+  const monitorHealth = new PositionMonitorHealthTracker();
   const startup = await runStartupSafetyAndStartDashboard(store, () => startupSafetySequence(deps), () => startDashboard({
     port: Number(env.DASHBOARD_PORT ?? 8790),
     ...(env.DASHBOARD_BIND ? { bind: env.DASHBOARD_BIND } : {}),
@@ -172,7 +173,13 @@ async function main(): Promise<void> {
     getLastTick: () => lastTick,
     getKillReason: () => getLastKillReason(),
     getScan: () => lastScan,
-    getExistingPositionMonitoring: () => existingPositionMonitoringOperational,
+    getPositionMonitoringHealth: () => {
+      const managed = getOpenTrades(store) as Array<Record<string, unknown>>;
+      return monitorHealth.snapshot({
+        SWING_15M: managed.some((trade) => isTradeOwnedBy(trade, "SWING_15M")),
+        SCALP_5M: managed.some((trade) => isTradeOwnedBy(trade, "SCALP_5M")),
+      });
+    },
     llmRoles,
     dynamicWatchlist: { projection: () => dynamicWatchlist.projection(), refreshManual: async () => {
       const result = await dynamicWatchlist.refreshManual(); syncDynamicUniverse(); return result;
@@ -448,31 +455,50 @@ async function main(): Promise<void> {
 
   // §99 intrabar protection sweep — deterministic ticker check every 60s
   // (exchange-native algo = Layer A is primary; this is a fast Layer B).
-  const intrabar = setInterval(async () => {
-    try {
+  const sweepSwingPositions = () => {
+    void monitorHealth.execute("SWING_15M", async (partialFailure) => {
       const poss = (await getPositions(deps.client)).filter((p) => p.pos !== "0");
       const local = (getOpenTrades(store) as Array<Record<string, unknown>>)
         .filter((t) => isTradeOwnedBy(t, "SWING_15M"));
-      if (poss.length === 0 || local.length === 0) return;
+      if (local.length === 0) return;
       for (const pos of poss) {
-        const t = local.find((x) => String(x.instrument) === pos.instId && String(x.side).toLowerCase() === pos.posSide);
-        if (!t) continue;
-        const meta = instruments[pos.instId];
-        if (!meta) continue;
-        const slPlus = await updateTradeStopPlus(client, store, t, pos, meta, trading.position_management.sl_plus);
-        const freshTrade = store.db.prepare("SELECT * FROM trades WHERE trade_id=? AND status='OPEN'").get(String(t.trade_id)) as Record<string, unknown> | undefined;
-        if (!freshTrade) continue;
-        const activeTrade = { ...freshTrade, stop_px: slPlus.stopPx };
-        const trig = priceTrigger(activeTrade, Number(pos.markPx));
-        if (trig) {
-          log.warn({ event: "intrabar_trigger", tradeId: String(t.trade_id), instId: pos.instId, reason: trig });
-          await closeTradeOnExchange(deps, activeTrade, pos, trig);
+        try {
+          const t = local.find((x) => String(x.instrument) === pos.instId && String(x.side).toLowerCase() === pos.posSide);
+          if (!t) { partialFailure(`exchange position lacks local SWING trade: ${pos.instId}`); continue; }
+          const meta = instruments[pos.instId];
+          if (!meta) { partialFailure(`instrument metadata unavailable: ${pos.instId}`); continue; }
+          const slPlus = await updateTradeStopPlus(client, store, t, pos, meta, trading.position_management.sl_plus);
+          const freshTrade = store.db.prepare("SELECT * FROM trades WHERE trade_id=? AND status='OPEN'").get(String(t.trade_id)) as Record<string, unknown> | undefined;
+          if (!freshTrade) continue;
+          const activeTrade = { ...freshTrade, stop_px: slPlus.stopPx };
+          const trig = priceTrigger(activeTrade, Number(pos.markPx));
+          if (trig) {
+            log.warn({ event: "intrabar_trigger", tradeId: String(t.trade_id), instId: pos.instId, reason: trig });
+            await closeTradeOnExchange(deps, activeTrade, pos, trig);
+          }
+        } catch (error) {
+          partialFailure(error);
+          log.warn({ event: "intrabar_position_monitor_error", instrument: pos.instId,
+            error: error instanceof Error ? error.message.slice(0, 160) : "UNKNOWN" });
         }
       }
-    } catch (e) {
-      log.warn({ event: "intrabar_error", error: e instanceof Error ? e.message : String(e) });
-    }
-  }, 60_000);
+      for (const trade of local) {
+        if (poss.some((position) => position.instId === String(trade.instrument)
+          && position.posSide === String(trade.side).toLowerCase())) continue;
+        try {
+          await finalizeOpenTradeFromExchange(deps, trade);
+          const current = store.db.prepare("SELECT status FROM trades WHERE trade_id=?").get(String(trade.trade_id)) as { status?: string } | undefined;
+          if (current?.status === "RECONCILIATION_PENDING") partialFailure("exchange-flat position awaits exit accounting evidence");
+        } catch (error) {
+          partialFailure(error);
+          log.warn({ event: "swing_external_close_reconciliation_error", tradeId: String(trade.trade_id),
+            error: error instanceof Error ? error.message.slice(0, 160) : "UNKNOWN" });
+        }
+      }
+    }).then((succeeded) => { if (!succeeded) log.warn({ event: "intrabar_monitor_sweep_failed" }); });
+  };
+  const intrabar = setInterval(sweepSwingPositions, 60_000);
+  sweepSwingPositions();
 
   let finalizerRunning = false;
   const evidenceFinalizer = setInterval(() => {
@@ -510,17 +536,20 @@ async function main(): Promise<void> {
   // 5m hybrid scalp engine (user mode choice 2026-10-05): deterministic signals
   // on 1m closes, LLM supervisor (stance) + LLM gate (per-setup veto), fail-closed.
   let scalpRunner: ScalpRunner | undefined;
-  if (runtimePolicy.scalpEnabled && trading.scalp?.enabled) {
-    const sc = trading.scalp;
-    const scalpCfg: ScalpCfg = { ...sc, watchlist };
+  const scalpPositionExists = (getOpenTrades(store) as Array<Record<string, unknown>>)
+    .some((trade) => isTradeOwnedBy(trade, "SCALP_5M"));
+  if (trading.scalp || scalpPositionExists) {
+    const sc = trading.scalp ?? SCALP_DEFAULTS;
+    const scalpCfg: ScalpCfg = { ...SCALP_DEFAULTS, ...sc, watchlist };
     scalpRunner = new ScalpRunner({
       client, trading, risk, store, instruments, cfg: scalpCfg,
+      entryEnabled: runtimePolicy.scalpEnabled && trading.scalp?.enabled === true,
+      monitorHealth,
       llm: llmRoles,
       entryUniverse: () => dynamicWatchlist.currentEntryUniverse(),
     });
     scalpRunner.start();
   }
-  existingPositionMonitoringOperational = true;
 
   let recoveryRunning = false;
   const recoveryTimer = setInterval(() => {
@@ -534,7 +563,7 @@ async function main(): Promise<void> {
 
   process.on("SIGINT", () => {
     log.warn({ event: "sigint_emergency_stop" });
-    void emergencyStop(deps).finally(() => { sched.stop(); clearInterval(intrabar); clearInterval(evidenceFinalizer); clearInterval(reconciliationTimer); clearInterval(recoveryTimer); if (dynamicRefreshTimer) clearTimeout(dynamicRefreshTimer); scalpRunner?.stop(); store.close(); process.exit(0); });
+    void emergencyStop(deps).finally(() => { sched.stop(); clearInterval(intrabar); clearInterval(evidenceFinalizer); clearInterval(reconciliationTimer); clearInterval(recoveryTimer); if (dynamicRefreshTimer) clearTimeout(dynamicRefreshTimer); scalpRunner?.stop(); monitorHealth.setEnabled("SWING_15M", false); monitorHealth.setEnabled("SCALP_5M", false); store.close(); process.exit(0); });
   });
 }
 

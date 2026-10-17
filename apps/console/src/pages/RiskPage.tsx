@@ -23,6 +23,15 @@ export function RiskPage({ status }: { status: ApiState<Row> }) {
   const portfolio = asRow(s.portfolioRisk) ?? {};
   const recovery = asRow(s.lastRecoveryAttempt) ?? {};
   const recoveryPayload = asRow(recovery.payload) ?? {};
+  const monitoring = asRow(s.positionMonitoring) ?? {};
+  const monitorDetail = (["SWING_15M", "SCALP_5M"] as const).map(engine => {
+    const health = asRow(monitoring[engine]);
+    if (!health) return `${engine}: unknown`;
+    const status = asText(health.health, "UNKNOWN");
+    return `${engine}: ${status}${health.required === true ? ` · success ${formatTimestamp(health.lastSuccessfulSweepAt)}` : " · not required"}`;
+  }).join(" | ");
+  const readiness = asRow(s.entryReadiness) ?? {};
+  const readinessBlockers = asRows(readiness.blockers).map(blocker => asText(blocker.code)).filter(Boolean);
   const portfolioRisk = asNumber(portfolio.riskPct);
   const lossToStops = asNumber(portfolio.lossToStops);
   const portfolioLimit = asNumber(limits.max_portfolio_open_risk_pct);
@@ -42,8 +51,8 @@ export function RiskPage({ status }: { status: ApiState<Row> }) {
         <Field label="Last reconciliation attempt" value={formatTimestamp(asRow(s.reconciliation)?.lastAttemptAt)}/>
         <Field label="Last recovery attempt" value={recovery.at ? `${formatTimestamp(recovery.at)} · ${asText(recoveryPayload.event, asText(recovery.kind, "UNKNOWN"))}` : "No recovery attempt"}/>
         <Field label="Recovery result / reason" value={asText(recoveryPayload.reason, asText(recoveryPayload.recoveryReason, "No failure reported"))}/>
-        <Field label="New entries" value={s.newEntriesPermitted === true ? "Permitted subject to risk gates" : "Blocked"}/>
-        <Field label="Position monitoring" value={s.existingPositionMonitoringOperational === true ? "Operational" : "Not confirmed"}/>
+        <Field label="New entries" value={s.newEntriesPermitted === true ? "Preliminary ready · final checks still apply" : `Blocked${readinessBlockers.length ? ` · ${readinessBlockers.join(", ")}` : ""}`}/>
+        <Field label="Position monitoring" value={`${s.existingPositionMonitoringOperational === true ? "Healthy" : "Not fully healthy"} · ${monitorDetail}`}/>
       </div>
     </Panel>
     <CapitalSummary status={s}/>

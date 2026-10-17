@@ -2,6 +2,7 @@
 import { z } from "zod";
 import { ABSOLUTE_MAX, type RiskConfig, type TradingConfig } from "./config.ts";
 import { kvGet, kvSet, type Store } from "../memory/db.ts";
+import { recordSafetyStateChange } from "./state.ts";
 
 export const RUNTIME_RISK_KEY = "runtime_risk_v1";
 export const ENTRY_RESERVATION_KEY = "unresolved_entry_v1";
@@ -121,6 +122,7 @@ export class RuntimeRiskService {
       if (!changed.length) return { revision: this.revision, limits: old };
       const next = { revision: this.revision + 1, limits: request.limits };
       kvSet(this.store, RUNTIME_RISK_KEY, JSON.stringify(next));
+      recordSafetyStateChange(this.store);
       const timestamp = new Date().toISOString();
       const insert = this.store.db.prepare("INSERT INTO system_events(ts,kind,payload) VALUES(?,?,?)");
       for (const field of changed) insert.run(timestamp, "RISK_LIMIT_CHANGED", JSON.stringify({

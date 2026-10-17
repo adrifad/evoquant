@@ -21,7 +21,7 @@ import { openTrade, nextDecisionId, recordDecision } from "../memory/trades.ts";
 import { getOpenTrades } from "../memory/trades.ts";
 import { buildFeatures, type FeatureSnapshot } from "../market/features.ts";
 import { classifyRegime } from "../market/regime.ts";
-import { clId, closeTradeOnExchange, priceTrigger, synchronizeEntryLeverage, confirmedFillLeverage, submitReservedEntry, verifyOpenTradeProtection } from "../execution/executor.ts";
+import { clId, closeTradeOnExchange, finalizeOpenTradeFromExchange, priceTrigger, synchronizeEntryLeverage, confirmedFillLeverage, submitReservedEntry, verifyOpenTradeProtection } from "../execution/executor.ts";
 import { selectedEntryLeverage, serializeRiskEntry, releaseEntry } from "../core/runtime-risk.ts";
 import { entrySettingsFingerprint } from "../core/runtime-trading.ts";
 import { persistEntryCapital } from "../core/capital.ts";
@@ -46,6 +46,7 @@ import { recordCandidateAttempt, recordOpportunityMetric } from "../market/oppor
 import { scanSymbolsIsolated } from "../market/isolated-scan.ts";
 import { runScalpCandidateQueue, type ScalpEntryOutcome } from "./candidate-queue.ts";
 import { latestConfirmedCandleClose } from "./candles.ts";
+import { runMonitorItemsIsolated, type PositionMonitorHealthTracker } from "../core/monitor-health.ts";
 
 const log = createLogger("scalp");
 const TF_TAG = "scalp";
@@ -58,6 +59,9 @@ export interface ScalpDeps {
   instruments: Record<string, InstrumentInfo>;
   llm: RoleLlmService;
   cfg: ScalpCfg;
+  /** Entry authorization is independent of the existing-position monitor. */
+  entryEnabled?: boolean;
+  monitorHealth?: PositionMonitorHealthTracker;
   entryUniverse?: () => readonly string[];
 }
 
@@ -73,6 +77,7 @@ export class ScalpRunner {
   private inFlight = new Set<string>();
   private lastExit: Record<string, number> = {};
   private ticking = false;
+  private sweeping = false;
   private stopped = false;
   private consecutiveOrderFailures = 0;
 
@@ -83,9 +88,11 @@ export class ScalpRunner {
   }
 
   start(): void {
-    this.sched.start();
+    if (this.d.entryEnabled !== false) this.sched.start();
     this.monitor = setInterval(() => void this.sweep(), 15_000);
-    log.info({ event: "scalp_started", tf: this.d.cfg.signal_tf, gate: this.d.cfg.llm_gate,
+    void this.sweep();
+    log.info({ event: "scalp_started", entryEnabled: this.d.entryEnabled !== false, monitorEnabled: true,
+      tf: this.d.cfg.signal_tf, gate: this.d.cfg.llm_gate,
       stance_refresh_s: this.d.cfg.stance_refresh_s, max_daily: this.d.cfg.max_daily_trades });
   }
 
@@ -160,7 +167,7 @@ export class ScalpRunner {
   // ---------- main 5m tick ----------
 
   async tick(): Promise<void> {
-    if (this.ticking || this.stopped) return;
+    if (this.ticking || this.stopped || this.d.entryEnabled === false) return;
     // Entry permission is independent from safety monitoring. Halts skip the
     // signal/LLM path entirely, while sweep() remains active for open trades.
     if (isEmergencyHalted(this.d.store) || getBotState(this.d.store) !== "RUNNING") return;
@@ -490,43 +497,63 @@ export class ScalpRunner {
   // ---------- 15s sweep: SL/TP confirm + time-stop ----------
 
   private async sweep(): Promise<void> {
-    try {
+    if (this.sweeping || this.stopped) return;
+    this.sweeping = true;
+    const work = async (partialFailure: (error: unknown) => void): Promise<void> => {
       // Emergency Stop blocks new entries, not risk-reducing exits or position
       // reconciliation. Native protection remains primary; Layer B is kept live.
       const scalps = (getOpenTrades(this.d.store) as Array<Record<string, unknown>>)
         .filter((t) => isTradeOwnedBy(t, "SCALP_5M"));
       if (scalps.length === 0) return;
-      for (const trade of scalps) {
-        const verified = await verifyOpenTradeProtection(this.d, String(trade.instrument));
-        if (!verified) log.warn({ event: "scalp_monitor_protection_unverified", tradeId: String(trade.trade_id),
-          instrument: String(trade.instrument), nativeProtectionPrimary: true, softwareMonitorContinuing: true });
-      }
       const poss = (await getPositions(this.d.client)).filter((p) => p.pos !== "0");
       const nowS = Math.floor(Date.now() / 1000);
-      for (const t of scalps) {
+      await runMonitorItemsIsolated(scalps, async (t) => {
+        const verified = await verifyOpenTradeProtection(this.d, String(t.instrument));
+        if (!verified) log.warn({ event: "scalp_monitor_protection_unverified", tradeId: String(t.trade_id),
+          instrument: String(t.instrument), nativeProtectionPrimary: true, softwareMonitorContinuing: true });
         const pos = poss.find((p) => p.instId === String(t.instrument) && p.posSide === String(t.side).toLowerCase());
-        if (!pos) continue;
+        if (!pos) {
+          if (t.status === "OPEN") {
+            await finalizeOpenTradeFromExchange(this.depsFor(), t);
+            const current = this.d.store.db.prepare("SELECT status FROM trades WHERE trade_id=?").get(String(t.trade_id)) as { status?: string } | undefined;
+            if (current?.status === "RECONCILIATION_PENDING") partialFailure("exchange-flat Scalp position awaits exit accounting evidence");
+            log.info({ event: "scalp_external_close_reconciliation_started", tradeId: String(t.trade_id), instrument: String(t.instrument) });
+          }
+          return;
+        }
         const meta = this.d.instruments[String(t.instrument)];
-        if (!meta) continue;
+        if (!meta) {
+          log.warn({ event: "scalp_monitor_metadata_unavailable", tradeId: String(t.trade_id), instrument: String(t.instrument) });
+          return;
+        }
         const slPlus = await updateTradeStopPlus(this.d.client, this.d.store, t, pos, meta, this.d.trading.position_management.sl_plus);
         const freshTrade = this.d.store.db.prepare("SELECT * FROM trades WHERE trade_id=? AND status='OPEN'").get(String(t.trade_id)) as Record<string, unknown> | undefined;
-        if (!freshTrade) continue;
+        if (!freshTrade) return;
         const activeTrade = { ...freshTrade, stop_px: slPlus.stopPx };
         let reason: "SL" | "TP" | "TIME_STOP" | null = priceTrigger(activeTrade, Number(pos.markPx));
-        if (!reason && (pos as Position)) {
+        if (!reason) {
           const ageS = nowS - Math.floor(Date.parse(String(t.entry_ts)) / 1000);
           if (ageS > this.d.cfg.max_hold_s) reason = "TIME_STOP";
         }
         if (reason) {
           this.lastExit[String(t.instrument)] = nowS;
           log.warn({ event: "scalp_exit", tradeId: String(t.trade_id), inst: String(t.instrument), reason });
-          await closeTradeOnExchange(this.depsFor(), t as never, pos as Position, reason)
-            .catch((e) => log.warn({ event: "scalp_close_fail", err: e instanceof Error ? e.message.slice(0, 120) : "" }));
+          await closeTradeOnExchange(this.depsFor(), t as never, pos as Position, reason);
         }
-      }
+      }, (trade, error) => {
+          partialFailure(error);
+          log.warn({ event: "scalp_position_monitor_error", tradeId: String(trade.trade_id), instrument: String(trade.instrument),
+            error: error instanceof Error ? error.message.slice(0, 120) : "UNKNOWN" });
+        });
+    };
+    try {
+      if (this.d.monitorHealth) {
+        const succeeded = await this.d.monitorHealth.execute("SCALP_5M", work);
+        if (!succeeded) log.warn({ event: "scalp_monitor_sweep_failed", reason: "monitor_health_recorded_failure" });
+      } else await work(() => undefined);
     } catch (e) {
       log.warn({ event: "scalp_sweep_error", error: e instanceof Error ? e.message.slice(0, 100) : "" });
-    }
+    } finally { this.sweeping = false; }
   }
 
   // small helper so sweep can call executor with the same deps shape

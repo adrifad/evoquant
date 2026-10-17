@@ -12,6 +12,7 @@ import { startDashboard } from "../src/core/dashboard.ts";
 import type { AddressInfo } from "node:net";
 import { SCALP_DEFAULTS } from "../src/scalp/signals.ts";
 import { loadRiskConfig, loadTradingConfig } from "../src/core/config.ts";
+import { PositionMonitorHealthTracker } from "../src/core/monitor-health.ts";
 
 const instrument = "BTC-USDT-SWAP";
 const meta = { instId: instrument, tickSz: "0.1", lotSz: "1", minSz: "1", ctVal: "1", ctValCcy: "USDT" };
@@ -129,6 +130,56 @@ test("Scalp Layer B monitors without opening when there are no live Scalp positi
   assert.equal(requests, 0);
 });
 
+test("disabled Scalp entry engine does not call stance or candidate LLM and leaves monitor callable", async (t) => {
+  const store = storeFor(t);
+  setBotState(store, "RUNNING");
+  setEmergencyHalted(store, false);
+  let marketRequests = 0;
+  let llmCalls = 0;
+  const trading = loadTradingConfig();
+  const deps = { client: { get: async () => { marketRequests++; return []; }, post: async () => { throw new Error("entry order forbidden"); } },
+    store, trading, risk: loadRiskConfig(), instruments: {}, cfg: { ...SCALP_DEFAULTS, watchlist: [] },
+    entryEnabled: false, llm: { json: async () => { llmCalls++; throw new Error("disabled Scalp must not call LLM"); } } } as unknown as ScalpDeps;
+  const runner = new ScalpRunner(deps);
+  await runner.tick();
+  await (runner as unknown as { sweep(): Promise<void> }).sweep();
+  assert.equal(llmCalls, 0);
+  assert.equal(marketRequests, 0);
+});
+
+test("dashboard entry readiness reports unresolved reconciliation as a blocker", async (t) => {
+  const store = storeFor(t);
+  setBotState(store, "RUNNING");
+  setEmergencyHalted(store, false);
+  const now = new Date().toISOString();
+  store.db.prepare(`INSERT INTO trades(trade_id,engine,status,evidence_state,instrument,timeframe,side,strategy,strategy_version,regime,contracts,entry_px,entry_ts)
+    VALUES('TRD-READINESS','SWING_15M','RECONCILIATION_PENDING','RECONCILIATION_PENDING',?,'15m','LONG','TREND_FOLLOWING',1,'SIDEWAYS','1',100,?)`)
+    .run(instrument, now);
+  const trading = loadTradingConfig();
+  const risk = loadRiskConfig();
+  const monitorHealth = new PositionMonitorHealthTracker();
+  const deps = { store, trading, risk, instruments: {}, watchlist: [], client: { get: async (endpoint: string) => {
+    if (endpoint === "/api/v5/account/balance") return [{ details: [{ ccy: "USDT", eq: "100", availEq: "100" }] }];
+    if (endpoint === "/api/v5/account/positions") return [];
+    throw new Error(`unexpected exchange read ${endpoint}`);
+  } } } as never;
+  const server = startDashboard({ port: 0, trading, risk, deps: () => deps, getLastTick: () => null, getKillReason: () => null,
+    getScan: () => [], getPositionMonitoringHealth: () => monitorHealth.snapshot({ SWING_15M: true, SCALP_5M: false }),
+    evolution: { reviewEvery: false, signalInterval: 10, strategyInterval: 10, minSample: 10, maxWeightChangePct: 1, maxParamChanges: 1 } });
+  t.after(() => server.close());
+  let address = server.address();
+  for (let i = 0; !address && i < 20; i++) { await new Promise(resolve => setTimeout(resolve, 5)); address = server.address(); }
+  assert.ok(address);
+  const status = await fetch(`http://127.0.0.1:${address.port}/api/status`).then(response => response.json()) as Record<string, unknown>;
+  assert.equal(status.newEntriesPermitted, false);
+  const blockers = (status.entryReadiness as { blockers: Array<{ code: string }> }).blockers.map(blocker => blocker.code);
+  assert.ok(blockers.includes("RECONCILIATION_PENDING"));
+  const monitoring = status.positionMonitoring as Record<string, { health: string; required: boolean }>;
+  assert.equal(monitoring.SWING_15M?.health, "UNKNOWN");
+  assert.equal(monitoring.SWING_15M?.required, true);
+  assert.equal(status.existingPositionMonitoringOperational, false, "initialized timers alone are not proof of healthy sweeps");
+});
+
 test("close retry reuses its persisted client order ID and resolves an accepted timed-out close", async (t) => {
   const store = storeFor(t);
   store.db.prepare(`INSERT INTO trades(trade_id,engine,status,instrument,timeframe,side,strategy,strategy_version,regime,contracts,
@@ -139,8 +190,12 @@ test("close retry reuses its persisted client order ID and resolves an accepted 
   let firstStatusRequest = true;
   let acceptedClientId = "";
   const livePosition = { instId: instrument, posSide: "long", pos: "1", avgPx: "100", markPx: "90", lever: "2", mgnMode: "isolated" };
-  const closeFill = { instId: instrument, tradeId: "F-CLOSE", ordId: "CLOSE-ACCEPTED", fillPx: "90", fillSz: "1",
-    side: "sell", posSide: "long", execType: "T", ts: String(Date.now()), fee: "-0.01", feeCcy: "USDT" };
+  const closeFills = [
+    { instId: instrument, tradeId: "F-CLOSE-1", billId: "B-CLOSE-1", ordId: "CLOSE-ACCEPTED", fillPx: "90", fillSz: "0.4",
+      side: "sell", posSide: "long", execType: "T", ts: String(Date.now() - 1_000), fee: "-0.004", feeCcy: "USDT" },
+    { instId: instrument, tradeId: "F-CLOSE-2", billId: "B-CLOSE-2", ordId: "CLOSE-ACCEPTED", fillPx: "100", fillSz: "0.6",
+      side: "sell", posSide: "long", execType: "T", ts: String(Date.now() - 999), fee: "-0.006", feeCcy: "USDT" },
+  ];
   const client = {
     get: async (endpoint: string, query?: Record<string, string>) => {
       if (endpoint === "/api/v5/account/positions") return [livePosition];
@@ -153,11 +208,11 @@ test("close retry reuses its persisted client order ID and resolves an accepted 
         return [{ ordId: "CLOSE-ACCEPTED", clOrdId: acceptedClientId, instId: instrument, state: "filled", avgPx: "90",
           accFillSz: "1", sz: "1", side: "sell", posSide: "long", tdMode: "isolated", ordType: "market" }];
       }
-      if (endpoint === "/api/v5/trade/fills") return query?.ordId === "CLOSE-ACCEPTED" ? [closeFill] : [];
+      if (endpoint === "/api/v5/trade/fills") return query?.ordId === "CLOSE-ACCEPTED" ? closeFills : [];
       if (endpoint === "/api/v5/trade/orders-algo-pending") return [];
       if (endpoint === "/api/v5/trade/order-algo") return [{ algoId: String(query?.algoId), state: "canceled", instId: instrument,
         tdMode: "isolated", side: "sell", posSide: "long", ordType: "conditional", sz: "1" }];
-      if (endpoint === "/api/v5/trade/fills-history") return [closeFill];
+      if (endpoint === "/api/v5/trade/fills-history") return closeFills;
       if (endpoint === "/api/v5/market/candles") return [];
       throw new Error(`unexpected mock GET ${endpoint}`);
     },
@@ -175,7 +230,9 @@ test("close retry reuses its persisted client order ID and resolves an accepted 
   assert.ok(closeIdAfterTimeout);
   await closeTradeOnExchange(deps, store.db.prepare("SELECT * FROM trades WHERE trade_id='SCP-CLOSE-UNKNOWN'").get() as Record<string, unknown>, position, "SL");
   assert.equal(submissions, 1, "unknown accepted close must be queried by the same client ID, never blindly resubmitted");
-  assert.equal((store.db.prepare("SELECT status,ord_close_id FROM trades WHERE trade_id='SCP-CLOSE-UNKNOWN'").get() as Record<string, unknown>).status, "CLOSED");
+  const closed = store.db.prepare("SELECT status,ord_close_id,exit_px FROM trades WHERE trade_id='SCP-CLOSE-UNKNOWN'").get() as Record<string, unknown>;
+  assert.equal(closed.status, "CLOSED");
+  assert.equal(closed.exit_px, 96, "closed trade uses quantity-weighted price across both unique partial fills");
 });
 
 test("terminal canceled close remains an open managed position and does not resubmit or spam events", async (t) => {

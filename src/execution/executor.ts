@@ -25,7 +25,7 @@ import { evaluateEntry } from "../risk/engine.ts";
 import { evaluateKillSwitch } from "../risk/limits.ts";
 import { evaluateGlobalEntryGate } from "../risk/global-entry-gate.ts";
 import { sizePosition, stopPriceFor, takeProfitPriceFor } from "../risk/position-sizing.ts";
-import { baseline, getBotState, setBotState, setEmergencyHalted, isEmergencyHalted, setRiskHaltReason, getRiskHaltReason, clearRiskHaltReason } from "../core/state.ts";
+import { baseline, commitVerifiedProtectionRecovery, getBotState, getSafetyStateRevision, getDesiredOperationalState, setBotState, setEmergencyHalted, isEmergencyHalted, setRiskHaltReason, getRiskHaltReason } from "../core/state.ts";
 import type { FeatureSnapshot } from "../market/features.ts";
 import type { Regime } from "../market/regime.ts";
 import { buildFeatures } from "../market/features.ts";
@@ -312,6 +312,7 @@ export async function startupSafetySequence(d: ExecutorDeps): Promise<boolean> {
  * reconciliation proves exchange connectivity, positions, orders and algos. */
 export async function recoverProtectionHalt(d: ExecutorDeps, operatorConfirmed = false): Promise<boolean> {
   const haltReason = getRiskHaltReason(d.store);
+  const recoveryRevision = getSafetyStateRevision(d.store);
   const recoverableReason = ["LIVE_POSITION_PROTECTION_UNVERIFIED", "EXIT_PROTECTION_CLEANUP_UNVERIFIED",
     "EXCHANGE_STATE_UNKNOWN", "EXCHANGE_POSITION_MISMATCH", "ORPHANED_PROTECTION_ALGO", "STARTUP_SAFETY_FAILURE"].includes(haltReason ?? "")
     || (operatorConfirmed && (haltReason === "MANUAL_EMERGENCY_STOP"
@@ -354,10 +355,10 @@ export async function recoverProtectionHalt(d: ExecutorDeps, operatorConfirmed =
       drawdownPct: base.peakEquity > 0 ? ((base.peakEquity - eq) / base.peakEquity) * 100 : 0,
     }, d.risk, d.store);
     if (kill) return recoveryFailure(`KILL_SWITCH:${kill}`);
-    clearRiskHaltReason(d.store);
-    setBotState(d.store, "RUNNING");
+    const committed = commitVerifiedProtectionRecovery(d.store, { revision: recoveryRevision, haltReason: haltReason ?? "" });
+    if (!committed.committed) return recoveryFailure(committed.reason);
     logSystemEvent(d.store, "STATE", { event: "RISK_HALT_RECOVERED", recoveryReason: "PROTECTION_STATE_VERIFIED",
-      livePositionDetected: livePositions.length > 0 });
+      livePositionDetected: livePositions.length > 0, resultingState: getDesiredOperationalState(d.store) ?? committed.state });
     return true;
   } catch (error) {
     logSystemEvent(d.store, "RISK_EVENT", { event: "RISK_RECOVERY_FAILED", haltReason, newEntriesPermitted: false,
@@ -590,7 +591,7 @@ export async function finalizeOpenTradeFromExchange(d: ExecutorDeps, t: Record<s
   });
 }
 
-async function finalizeOpenTradeFromExchangeLocked(d: ExecutorDeps, t: Record<string, unknown>, ex?: Position): Promise<void> {
+async function finalizeOpenTradeFromExchangeLocked(d: ExecutorDeps, t: Record<string, unknown>, ex?: Position, protectionAlreadyVerified = false): Promise<void> {
   const tradeId = String(t.trade_id ?? "");
   if (!tradeId) return;
   // Exit print resolution (algo/external closes have NO local close order id):
@@ -693,17 +694,21 @@ async function finalizeOpenTradeFromExchangeLocked(d: ExecutorDeps, t: Record<st
   });
   const protection = d.store.db.prepare("SELECT sl_algo_id,tp_algo_id,algo_id FROM trades WHERE trade_id=?")
     .get(tradeId) as { sl_algo_id?: string | null; tp_algo_id?: string | null; algo_id?: string | null } | undefined;
-  try {
-    await cancelAndVerifyProtection(d.client, String(t.instrument), [protection?.sl_algo_id, protection?.tp_algo_id, protection?.algo_id]);
-  } catch (error) {
-    markReconciliationPending(d.store, tradeId, "EXIT_PROTECTION_CLEANUP_PENDING");
-    d.store.db.prepare("UPDATE trades SET protection_state='DEGRADED' WHERE trade_id=?").run(tradeId);
-    setRiskHaltReason(d.store, "EXIT_PROTECTION_CLEANUP_UNVERIFIED");
-    setBotState(d.store, "RISK_HALTED");
-    logSystemEvent(d.store, "RISK_EVENT", { tradeId, reason: "EXIT_PROTECTION_CLEANUP_PENDING",
-      detail: error instanceof Error ? error.message : "UNKNOWN", newEntriesHalted: true });
-    return;
+  if (!protectionAlreadyVerified) {
+    try {
+      await cancelAndVerifyProtection(d.client, String(t.instrument), [protection?.sl_algo_id, protection?.tp_algo_id, protection?.algo_id]);
+    } catch (error) {
+      markReconciliationPending(d.store, tradeId, "EXIT_PROTECTION_CLEANUP_PENDING");
+      d.store.db.prepare("UPDATE trades SET protection_state='DEGRADED' WHERE trade_id=?").run(tradeId);
+      setRiskHaltReason(d.store, "EXIT_PROTECTION_CLEANUP_UNVERIFIED");
+      setBotState(d.store, "RISK_HALTED");
+      logSystemEvent(d.store, "RISK_EVENT", { tradeId, reason: "EXIT_PROTECTION_CLEANUP_PENDING",
+        detail: error instanceof Error ? error.message : "UNKNOWN", newEntriesHalted: true });
+      return;
+    }
   }
+  d.store.db.prepare("UPDATE trades SET protection_state='EXITED_VERIFIED',protection_checked_at=? WHERE trade_id=?")
+    .run(new Date().toISOString(), tradeId);
   closeTrade(d.store, String(t.trade_id), m);
   d.store.db.prepare(`UPDATE trades SET ord_close_id=?,exit_confirmation='EXCHANGE_FILL_CONFIRMED',exit_reconcile_state='RECONCILED',
     exit_reconcile_next_retry_ts=NULL,exit_reconcile_claim_until_ts=NULL,exit_reconcile_last_failure_reason=NULL WHERE trade_id=?`).run(exitOrderId, tradeId);
@@ -1252,38 +1257,6 @@ async function closeOpenTradeOnExchange(d: ExecutorDeps, t: Record<string, unkno
     logSystemEvent(d.store, "RISK_EVENT", { close_order_not_filled: filled.state, tradeId: String(t.trade_id), ordId: placed.ordId });
     throw error; // keep the trade OPEN and its exchange-side protection intact
   }
-  // Fee completeness/signs are finalized from both exact fill legs later.
-  // Never publish a partial close-time total as complete accounting.
-  let feesPaid: number | null = null;
-  for (const id of [String(t.ord_open_id ?? ""), placed.ordId]) {
-    if (!id) { feesPaid = null; continue; }
-    let fs: Awaited<ReturnType<typeof getFills>>;
-    try { fs = await getFills(d.client, String(t.instrument), id); }
-    catch { feesPaid = null; continue; }
-    if (fs.length === 0) { feesPaid = null; continue; }
-    persistFills(d.store, fs.map((fx) => ({ tradeId: fx.tradeId, ordId: fx.ordId, clOrdId: fx.clOrdId,
-      instId: fx.instId, fillPx: fx.fillPx, fillSz: fx.fillSz, fee: fx.fee, feeCcy: fx.feeCcy,
-      side: fx.side, posSide: fx.posSide, ts: fx.ts })));
-  }
-  const exitFill = [...(await getFills(d.client, String(t.instrument), placed.ordId).catch(() => []))]
-    .find((fill) => fill.side === (side === "LONG" ? "sell" : "buy"));
-  const exitPx = Number(exitFill?.fillPx);
-  if (!exitFill || !Number.isFinite(exitPx) || exitPx <= 0) {
-    d.store.db.prepare("UPDATE trades SET cl_close_id=?, ord_close_id=? WHERE trade_id=?").run(clClose, placed.ordId, String(t.trade_id));
-    markReconciliationPending(d.store, String(t.trade_id), "EXIT_FILL_NOT_PROVEN");
-    logSystemEvent(d.store, "STATE", { tradeId: String(t.trade_id), reconciliation: "RECONCILIATION_PENDING", reason: "EXIT_FILL_NOT_PROVEN" });
-    return;
-  }
-  const contracts = Number(t.contracts);
-  const ctVal = Number(meta.ctVal);
-  const m = computeClosedMetrics({
-    side, entryPx: Number(t.entry_px), stopPx: Number(t.stop_px),
-    initialStopPx: Number(t.initial_stop_px ?? t.stop_px), exitPx,
-    contracts, ctVal, exitReason: reason,
-    entryTs: String(t.entry_ts), exitTs: new Date(Number(exitFill.ts)).toISOString(),
-    candlesWhileOpen: await excursionCandles(d, t, Date.parse(String(t.entry_ts)), Number(exitFill.ts)),
-    fees: feesPaid, funding: null,
-  });
   const protectionIds = d.store.db.prepare("SELECT sl_algo_id,tp_algo_id,algo_id FROM trades WHERE trade_id=?")
     .get(String(t.trade_id)) as { sl_algo_id?: string | null; tp_algo_id?: string | null; algo_id?: string | null } | undefined;
   try {
@@ -1302,10 +1275,13 @@ async function closeOpenTradeOnExchange(d: ExecutorDeps, t: Record<string, unkno
       detail: error instanceof Error ? error.message : "UNKNOWN", newEntriesHalted: true });
     return;
   }
-  closeTrade(d.store, String(t.trade_id), { ...m });
-  d.store.db.prepare("UPDATE trades SET cl_close_id=?, ord_close_id=? WHERE trade_id=?").run(clClose, placed.ordId, String(t.trade_id));
-  log.info({ event: "trade:closed", tradeId: String(t.trade_id), reason, resultR: m.resultR });
-  logSystemEvent(d.store, "TRADE_CLOSED", { tradeId: String(t.trade_id), instId: String(t.instrument), reason, resultR: m.resultR });
+  d.store.db.prepare(`UPDATE trades SET cl_close_id=?,ord_close_id=?,exit_reason=?,protection_state='EXITED_PENDING_ACCOUNTING',
+    protection_checked_at=? WHERE trade_id=? AND status='OPEN'`).run(clClose, placed.ordId, reason, new Date().toISOString(), tradeId);
+  const current = d.store.db.prepare("SELECT * FROM trades WHERE trade_id=? AND status='OPEN'").get(tradeId) as Record<string, unknown> | undefined;
+  if (!current) return;
+  // Share the exact order-scoped, deduplicated fill aggregation and VWAP path
+  // with later reconciliation. The close is never finalized from the first fill.
+  await finalizeOpenTradeFromExchangeLocked(d, current, undefined, true);
 }
 
 function markCloseOrderUnresolved(d: ExecutorDeps, tradeId: string, reason: string, orderId: string): void {

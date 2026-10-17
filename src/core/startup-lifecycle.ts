@@ -1,6 +1,6 @@
 import type { Store } from "../memory/db.ts";
 import { logSystemEvent } from "../memory/db.ts";
-import { getBotState, getRiskHaltReason, isEmergencyHalted, setBotState, setRiskHaltReason } from "./state.ts";
+import { ensureDesiredOperationalState, getBotState, getRiskHaltReason, isEmergencyHalted, setBotState, setRiskHaltReason } from "./state.ts";
 
 export interface DashboardHandle {
   close(): void;
@@ -19,6 +19,7 @@ export async function runStartupSafetyAndStartDashboard<T extends DashboardHandl
 ): Promise<{ safetyPassed: boolean; previousState: ReturnType<typeof getBotState>; previousHaltReason: string | null; dashboard: T }> {
   const previousState = getBotState(store);
   const previousHaltReason = getRiskHaltReason(store);
+  ensureDesiredOperationalState(store, previousState);
   if (previousState !== "RISK_HALTED" && previousState !== "PAUSED") setBotState(store, "STARTING");
   let safetyPassed = false;
   try { safetyPassed = await safetyCheck(); }

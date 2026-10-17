@@ -8,9 +8,10 @@ import { excursionCandles, finalizeOpenTradeFromExchange, sweepUnprovenExits, ve
 import { deduplicateFills } from "../src/exchange/okx/orders.ts";
 import { openStore } from "../src/memory/db.ts";
 import { closeTrade, computeClosedMetrics } from "../src/memory/trades.ts";
-import { getBotState, setBotState, getRiskHaltReason, setRiskHaltReason, setEmergencyHalted } from "../src/core/state.ts";
+import { getBotState, setBotState, getRiskHaltReason, setRiskHaltReason, setEmergencyHalted, setDesiredOperationalState } from "../src/core/state.ts";
 import { evaluateGlobalEntryGate } from "../src/risk/global-entry-gate.ts";
 import { portfolioOpenRisk } from "../src/risk/portfolio-open-risk.ts";
+import { runStartupSafetyAndStartDashboard } from "../src/core/startup-lifecycle.ts";
 
 const symbol = "BTC-USDT-SWAP";
 const instrument = { instId: symbol, tickSz: "0.01", lotSz: "1", minSz: "1", ctVal: "1", ctValCcy: "USDT" };
@@ -270,6 +271,7 @@ test("protection-owned halt clears only after fresh flat account and risk verifi
   setBotState(store, "RISK_HALTED");
   setRiskHaltReason(store, "LIVE_POSITION_PROTECTION_UNVERIFIED");
   setEmergencyHalted(store, false);
+  setDesiredOperationalState(store, "RUNNING");
   const now = Date.now();
   const deps = depsFor(store, endpoint => {
     if (endpoint === "/api/v5/account/balance") return [{ details: [{ ccy: "USDT", eq: "100", availEq: "100", availBal: "100" }] }];
@@ -292,6 +294,7 @@ test("startup safety halt recovers only after a fresh successful account-wide ve
   setBotState(store, "RISK_HALTED");
   setRiskHaltReason(store, "STARTUP_SAFETY_FAILURE");
   setEmergencyHalted(store, false);
+  setDesiredOperationalState(store, "RUNNING");
   const deps = depsFor(store, endpoint => {
     if (endpoint === "/api/v5/account/balance") return [{ details: [{ ccy: "USDT", eq: "100", availEq: "100", availBal: "100" }] }];
     if (endpoint === "/api/v5/public/time") return [{ ts: String(Date.now()) }];
@@ -317,6 +320,156 @@ test("startup safety halt remains persisted when fresh recovery verification is 
   assert.equal(await recoverProtectionHalt(deps), false);
   assert.equal(getBotState(store), "RISK_HALTED");
   assert.equal(getRiskHaltReason(store), "STARTUP_SAFETY_FAILURE");
+});
+
+test("a stale recovery cannot clear Emergency Stop activated during exchange verification", async t => {
+  const store = withStore(t);
+  setBotState(store, "RISK_HALTED");
+  setRiskHaltReason(store, "STARTUP_SAFETY_FAILURE");
+  setEmergencyHalted(store, false);
+  setDesiredOperationalState(store, "RUNNING");
+  let releaseBalance!: (value: unknown) => void;
+  let entered!: () => void;
+  const balanceStarted = new Promise<void>(resolve => { entered = resolve; });
+  const balance = new Promise<unknown>(resolve => { releaseBalance = resolve; });
+  const now = Date.now();
+  const deps = depsFor(store, endpoint => {
+    if (endpoint === "/api/v5/account/balance") { entered(); return balance; }
+    if (endpoint === "/api/v5/public/time") return [{ ts: String(now) }];
+    if (endpoint === "/api/v5/account/positions" || endpoint === "/api/v5/trade/orders-pending") return [];
+    throw new Error(`unexpected endpoint ${endpoint}`);
+  });
+  (deps as unknown as { risk: Record<string, unknown> }).risk = {
+    clock_drift_max_ms: 60_000,
+    hard_limits: { max_concurrent_positions: 5, max_daily_loss_pct: 3, max_drawdown_pct: 10 },
+  };
+  const recovery = recoverProtectionHalt(deps);
+  await balanceStarted;
+  setEmergencyHalted(store, true);
+  setRiskHaltReason(store, "MANUAL_EMERGENCY_STOP");
+  setBotState(store, "RISK_HALTED");
+  releaseBalance([{ details: [{ ccy: "USDT", eq: "100", availEq: "100", availBal: "100" }] }]);
+  assert.equal(await recovery, false);
+  assert.equal(getBotState(store), "RISK_HALTED");
+  assert.equal(getRiskHaltReason(store), "MANUAL_EMERGENCY_STOP");
+});
+
+test("a newer risk halt supersedes an in-progress protection recovery", async t => {
+  const store = withStore(t);
+  setBotState(store, "RISK_HALTED");
+  setRiskHaltReason(store, "STARTUP_SAFETY_FAILURE");
+  setEmergencyHalted(store, false);
+  setDesiredOperationalState(store, "RUNNING");
+  let releaseBalance!: (value: unknown) => void;
+  let entered!: () => void;
+  const balanceStarted = new Promise<void>(resolve => { entered = resolve; });
+  const balance = new Promise<unknown>(resolve => { releaseBalance = resolve; });
+  const now = Date.now();
+  const deps = depsFor(store, endpoint => {
+    if (endpoint === "/api/v5/account/balance") { entered(); return balance; }
+    if (endpoint === "/api/v5/public/time") return [{ ts: String(now) }];
+    if (endpoint === "/api/v5/account/positions" || endpoint === "/api/v5/trade/orders-pending") return [];
+    throw new Error(`unexpected endpoint ${endpoint}`);
+  });
+  (deps as unknown as { risk: Record<string, unknown> }).risk = {
+    clock_drift_max_ms: 60_000,
+    hard_limits: { max_concurrent_positions: 5, max_daily_loss_pct: 3, max_drawdown_pct: 10 },
+  };
+  const recovery = recoverProtectionHalt(deps);
+  await balanceStarted;
+  setRiskHaltReason(store, "KILL_SWITCH:MAX_DAILY_LOSS_REACHED");
+  releaseBalance([{ details: [{ ccy: "USDT", eq: "100", availEq: "100", availBal: "100" }] }]);
+  assert.equal(await recovery, false);
+  assert.equal(getBotState(store), "RISK_HALTED");
+  assert.equal(getRiskHaltReason(store), "KILL_SWITCH:MAX_DAILY_LOSS_REACHED");
+});
+
+test("recovery preserves a PAUSED operator intent that predates the safety halt", async t => {
+  const store = withStore(t);
+  setBotState(store, "PAUSED");
+  setEmergencyHalted(store, false);
+  await runStartupSafetyAndStartDashboard(store, async () => false, () => ({ close() {}, address: () => null }));
+  assert.equal(getBotState(store), "RISK_HALTED");
+  const now = Date.now();
+  const deps = depsFor(store, endpoint => {
+    if (endpoint === "/api/v5/account/balance") return [{ details: [{ ccy: "USDT", eq: "100", availEq: "100", availBal: "100" }] }];
+    if (endpoint === "/api/v5/public/time") return [{ ts: String(now) }];
+    if (endpoint === "/api/v5/account/positions" || endpoint === "/api/v5/trade/orders-pending") return [];
+    throw new Error(`unexpected endpoint ${endpoint}`);
+  });
+  (deps as unknown as { risk: Record<string, unknown> }).risk = {
+    clock_drift_max_ms: 60_000,
+    hard_limits: { max_concurrent_positions: 5, max_daily_loss_pct: 3, max_drawdown_pct: 10 },
+  };
+  assert.equal(await recoverProtectionHalt(deps), true);
+  assert.equal(getBotState(store), "PAUSED");
+  assert.equal(getRiskHaltReason(store), null);
+});
+
+test("an operator pause during exchange verification aborts recovery without losing the pause intent", async t => {
+  const store = withStore(t);
+  setDesiredOperationalState(store, "RUNNING");
+  setBotState(store, "RISK_HALTED");
+  setRiskHaltReason(store, "STARTUP_SAFETY_FAILURE");
+  setEmergencyHalted(store, false);
+  let releaseBalance!: (value: unknown) => void;
+  let entered!: () => void;
+  const balanceStarted = new Promise<void>(resolve => { entered = resolve; });
+  const balance = new Promise<unknown>(resolve => { releaseBalance = resolve; });
+  const now = Date.now();
+  const deps = depsFor(store, endpoint => {
+    if (endpoint === "/api/v5/account/balance") { entered(); return balance; }
+    if (endpoint === "/api/v5/public/time") return [{ ts: String(now) }];
+    if (endpoint === "/api/v5/account/positions" || endpoint === "/api/v5/trade/orders-pending") return [];
+    throw new Error(`unexpected endpoint ${endpoint}`);
+  });
+  (deps as unknown as { risk: Record<string, unknown> }).risk = {
+    clock_drift_max_ms: 60_000,
+    hard_limits: { max_concurrent_positions: 5, max_daily_loss_pct: 3, max_drawdown_pct: 10 },
+  };
+  const recovery = recoverProtectionHalt(deps);
+  await balanceStarted;
+  setDesiredOperationalState(store, "PAUSED");
+  releaseBalance([{ details: [{ ccy: "USDT", eq: "100", availEq: "100", availBal: "100" }] }]);
+  assert.equal(await recovery, false);
+  assert.equal(getBotState(store), "RISK_HALTED");
+  assert.equal(getRiskHaltReason(store), "STARTUP_SAFETY_FAILURE");
+});
+
+test("overlapping protection recovery attempts allow only the first atomic commit", async t => {
+  const store = withStore(t);
+  setDesiredOperationalState(store, "RUNNING");
+  setBotState(store, "RISK_HALTED");
+  setRiskHaltReason(store, "STARTUP_SAFETY_FAILURE");
+  setEmergencyHalted(store, false);
+  let balanceCalls = 0;
+  let releaseBalance!: (value: unknown) => void;
+  let bothEntered!: () => void;
+  const reached = new Promise<void>(resolve => { bothEntered = resolve; });
+  const balance = new Promise<unknown>(resolve => { releaseBalance = resolve; });
+  const now = Date.now();
+  const deps = depsFor(store, endpoint => {
+    if (endpoint === "/api/v5/account/balance") {
+      balanceCalls++;
+      if (balanceCalls === 2) bothEntered();
+      return balance;
+    }
+    if (endpoint === "/api/v5/public/time") return [{ ts: String(now) }];
+    if (endpoint === "/api/v5/account/positions" || endpoint === "/api/v5/trade/orders-pending") return [];
+    throw new Error(`unexpected endpoint ${endpoint}`);
+  });
+  (deps as unknown as { risk: Record<string, unknown> }).risk = {
+    clock_drift_max_ms: 60_000,
+    hard_limits: { max_concurrent_positions: 5, max_daily_loss_pct: 3, max_drawdown_pct: 10 },
+  };
+  const first = recoverProtectionHalt(deps);
+  const second = recoverProtectionHalt(deps);
+  await bothEntered;
+  releaseBalance([{ details: [{ ccy: "USDT", eq: "100", availEq: "100", availBal: "100" }] }]);
+  const results = await Promise.all([first, second]);
+  assert.equal(results.filter(Boolean).length, 1);
+  assert.equal(getBotState(store), "RUNNING");
+  assert.equal(getRiskHaltReason(store), null);
 });
 
 test("protection recovery cannot clear a daily-loss halt or an active manual kill switch", async t => {

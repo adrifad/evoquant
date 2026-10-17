@@ -13,7 +13,7 @@ import { timingSafeEqual, createHash } from "node:crypto";
 import type { Duplex } from "node:stream";
 import type { AddressInfo } from "node:net";
 import type { Store } from "../memory/db.ts";
-import { getBotState, setBotState, isEmergencyHalted, baseline, getRiskHaltReason } from "../core/state.ts";
+import { getBotState, setBotState, setDesiredOperationalState, isEmergencyHalted, baseline, getRiskHaltReason } from "../core/state.ts";
 import { getWeights } from "../learning/signal-weights.ts";
 import { regimeStats, scopedPerformance } from "../memory/regimes.ts";
 import { kvGet, logSystemEvent } from "../memory/db.ts";
@@ -34,9 +34,12 @@ import { evolutionFamilies, scannerProjection } from "./workstation.ts";
 import type { ScanRow } from "../strategy/scanner.ts";
 import { getCandles, type Bar } from "../exchange/okx/market.ts";
 import { portfolioOpenRisk } from "../risk/portfolio-open-risk.ts";
+import { projectEntryReadiness } from "../risk/entry-readiness.ts";
+import { unresolvedEntry } from "./runtime-risk.ts";
 import { DynamicWatchlistError, type WatchlistProjection } from "../market/dynamic-watchlist.ts";
 import { getOpportunityFunnel, getRecentCandidateAttempts } from "../market/opportunity-funnel.ts";
 import { buildLossAttribution } from "../memory/loss-attribution.ts";
+import type { PositionMonitorEngine, PositionMonitorStatus } from "./monitor-health.ts";
 
 const log = createLogger("dashboard");
 const REPO_ROOT = path.resolve(import.meta.dirname, "../..");
@@ -57,6 +60,7 @@ export interface DashboardConfig {
   getLastTick: () => { features: unknown; regime: string; at: string } | null;
   getKillReason: () => string | null;
   getExistingPositionMonitoring?: () => boolean;
+  getPositionMonitoringHealth?: () => Record<PositionMonitorEngine, PositionMonitorStatus>;
   getScan: () => Array<{ instrument: string; regime: string; price: number; score: number; strategy: string | null; tradable: boolean }>;
   evolution: {
     reviewEvery: boolean; signalInterval: number; strategyInterval: number; minSample: number;
@@ -162,9 +166,36 @@ export function startDashboard(cfg: DashboardConfig): DashboardServer {
         WHERE kind IN ('STATE','RISK_EVENT') AND (payload LIKE '%RISK_RECOVERY_ATTEMPT%'
           OR payload LIKE '%RISK_RECOVERY_FAILED%' OR payload LIKE '%RISK_HALT_RECOVERED%') ORDER BY id DESC LIMIT 1`).get() as
         { ts: string; kind: string; payload: string } | undefined;
-      const entryBlocked = currentState !== "RUNNING" || isEmergencyHalted(store) || Boolean(persistedHaltReason)
-        || killObservation !== null || exchange.balance === null || exchange.positions === null
-        || protectionVerificationStatus === "UNVERIFIED" || protectionVerificationStatus === "UNEXPECTED_EXPOSURE";
+      let entryReservationUnresolved = false;
+      try { entryReservationUnresolved = unresolvedEntry(store) !== null; }
+      catch { entryReservationUnresolved = true; }
+      const exchangePositions = exchange.positions?.filter((position) => Number(position.pos) !== 0) ?? null;
+      const localOpen = open.filter((trade) => trade.status === "OPEN");
+      const localKeys = new Set(localOpen.map((trade) => `${String(trade.instrument)}:${String(trade.side).toLowerCase()}`));
+      const exchangeKeys = new Set(exchangePositions?.map((position) => `${position.instId}:${position.posSide}`) ?? []);
+      const unexpectedExposure = exchangePositions?.some((position) => !localKeys.has(`${position.instId}:${position.posSide}`)) ?? false;
+      const positionMismatch = localOpen.some((trade) => !exchangeKeys.has(`${String(trade.instrument)}:${String(trade.side).toLowerCase()}`));
+      const instrumentMetadataMissing = Boolean(exchangePositions?.some((position) => cfg.deps().instruments[position.instId]?.instId !== position.instId)
+        || localOpen.some((trade) => cfg.deps().instruments[String(trade.instrument)]?.instId !== String(trade.instrument)));
+      const dailyLossPct = base && eq !== null && base.dayStartEquity > 0
+        ? Math.max(0, (base.dayStartEquity - eq) / base.dayStartEquity * 100) : null;
+      const drawdownPct = base && eq !== null && base.peakEquity > 0
+        ? Math.max(0, (base.peakEquity - eq) / base.peakEquity * 100) : null;
+      const readiness = projectEntryReadiness({
+        botState: currentState, emergencyHalted: isEmergencyHalted(store), persistedHaltReason,
+        killSwitchObservation: killObservation, exchangeConnected: exchange.balance !== null && exchange.positions !== null,
+        entryReservationUnresolved, reconciliationPending: Number(reconciliationState.pending_count),
+        protectionStatus: protectionVerificationStatus, unexpectedExposure, positionMismatch, instrumentMetadataMissing,
+        dailyLossPct, dailyLossLimitPct: Number(cfg.risk.hard_limits.max_daily_loss_pct), drawdownPct,
+        drawdownLimitPct: Number(cfg.risk.hard_limits.max_drawdown_pct), openPositionCount: exchangePositions?.length ?? null,
+        maxConcurrentPositions: Number(cfg.risk.hard_limits.max_concurrent_positions),
+        portfolioRiskPct: portfolio.known ? portfolio.riskPct : null,
+        portfolioRiskLimitPct: Number(cfg.risk.hard_limits.max_portfolio_open_risk_pct),
+      });
+      const positionMonitoring = cfg.getPositionMonitoringHealth?.() ?? null;
+      const monitoringOperational = positionMonitoring
+        ? Object.values(positionMonitoring).filter((status) => status.required).every((status) => status.health === "HEALTHY")
+        : cfg.getExistingPositionMonitoring?.() ?? false;
       return send(200, {
         environment: "DEMO",                       // §96 always visible
         exchange: "OKX",
@@ -181,14 +212,16 @@ export function startDashboard(cfg: DashboardConfig): DashboardServer {
           nextRetryAt: reconciliationState.next_retry_at },
         lastRecoveryAttempt: recoveryEvent ? { at: recoveryEvent.ts, kind: recoveryEvent.kind,
           payload: (() => { try { return JSON.parse(recoveryEvent.payload); } catch { return null; } })() } : null,
-        newEntriesPermitted: !entryBlocked,
-        existingPositionMonitoringOperational: cfg.getExistingPositionMonitoring?.() ?? false,
+        newEntriesPermitted: readiness.permitted,
+        entryReadiness: readiness,
+        existingPositionMonitoringOperational: monitoringOperational,
+        positionMonitoring,
         equity: eq,
         capital, exchangeState: capital.state, updatedAt: new Date(exchange.at).toISOString(), marketUpdatedAt: cfg.getLastTick()?.at ?? null,
         watchlist: cfg.deps().watchlist,
         daily: { dayStart: base?.dayStartEquity ?? null, pnl: base && eq !== null ? eq - base.dayStartEquity : null,
-          lossPct: base && eq !== null && base.dayStartEquity > 0 ? Math.max(0, (base.dayStartEquity - eq) / base.dayStartEquity * 100) : null },
-        drawdownPct: base && eq !== null && base.peakEquity > 0 ? Math.max(0, (base.peakEquity - eq) / base.peakEquity * 100) : null,
+          lossPct: dailyLossPct },
+        drawdownPct,
         totals: { closed: closed.c, pnl: trustedClosed.p, expectancyR: trustedClosed.e,
           trustedNetClosed: trustedClosed.c, allClosedPnl: closed.p, accountingByEvidenceState: evidenceByState }, evidencePending,
         openPositions: projected, openPosition: projected[0] ?? null,
@@ -405,12 +438,13 @@ export function startDashboard(cfg: DashboardConfig): DashboardServer {
     }
     if (method === "POST" && (p === "/api/pause" || p === "/api/resume")) {
       if (p.endsWith("pause")) {
-        if (getBotState(store) === "RISK_HALTED") return send(409, { error: "RISK_HALT_ACTIVE", state: getBotState(store) });
-        setBotState(store, "PAUSED");
+        setDesiredOperationalState(store, "PAUSED");
+        if (getBotState(store) !== "RISK_HALTED") setBotState(store, "PAUSED");
       } else {
         if (getBotState(store) !== "PAUSED" || isEmergencyHalted(store) || getRiskHaltReason(store)) {
           return send(409, { error: "SAFE_RESUME_PRECONDITIONS_NOT_MET", state: getBotState(store) });
         }
+        setDesiredOperationalState(store, "RUNNING");
         setBotState(store, "RUNNING");
       }
       return send(200, { ok: true, state: getBotState(store) });

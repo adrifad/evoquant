@@ -14,7 +14,7 @@ export function DashboardPage({ status }: { status: ApiState<Row> }) {
   const totals = asRow(s?.totals) ?? {};
   const decision = asRow(s?.latestDecision);
   const halt = Boolean(s?.emergencyHalted || s?.killReason || s?.persistedHaltReason || s?.botState === "RISK_HALTED" || s?.botState === "ERROR");
-  const warning = !halt && (s?.botState === "PAUSED" || s?.botState === "STOPPED");
+  const warning = !halt && (s?.botState === "PAUSED" || s?.botState === "STOPPED" || s?.newEntriesPermitted !== true);
   const open = asRows(s?.openPositions)[0] ?? {};
   const recentTrades = asRows(tradesApi.data).slice(0, 6);
   const openPositions = asRows(s?.openPositions);
@@ -29,6 +29,19 @@ export function DashboardPage({ status }: { status: ApiState<Row> }) {
   const roleWarnings = roles.filter(role => role.status !== "AVAILABLE");
   const reconciliationWarnings = asRows(s?.reconciliationWarnings);
   const protectionWarnings = openPositions.filter(position => asText(position.protection_state, "UNVERIFIED") !== "VERIFIED");
+  const readiness = asRow(s?.entryReadiness) ?? {};
+  const readinessBlockers = asRows(readiness.blockers).map(blocker => asText(blocker.code)).filter(Boolean);
+  const monitors = asRow(s?.positionMonitoring) ?? {};
+  const monitorSummary = (["SWING_15M", "SCALP_5M"] as const).map(engine => {
+    const monitor = asRow(monitors[engine]);
+    return `${engine} ${asText(monitor?.health, "UNKNOWN")}${monitor?.required === true ? `, last success ${formatTimestamp(monitor.lastSuccessfulSweepAt)}` : ", not required"}`;
+  }).join("; ");
+  const bannerDetail = halt
+    ? asText(s?.persistedHaltReason, asText(s?.killReason, s?.emergencyHalted ? "Emergency stop is active." : "Trading halted by system state."))
+    : warning && s?.botState === "PAUSED" ? "Operator pause is active; existing positions remain monitored."
+    : warning && s?.botState === "STOPPED" ? "Bot is stopped; new entries are blocked."
+    : readinessBlockers.length ? `New entries are blocked: ${readinessBlockers.join(", ")}.`
+    : "New entries are not currently permitted.";
 
   if (!s) return <div className="page"><DataState loading={status.loading} error={status.error} empty={false}><span/></DataState></div>;
 
@@ -39,11 +52,11 @@ export function DashboardPage({ status }: { status: ApiState<Row> }) {
     {protectionWarnings.length ? <div className="inline-warning" role="alert"><strong>Position protection needs verification</strong> {protectionWarnings.map(row => asText(row.instrument)).join(", ")}. New entries are paused while native stop and target protection is unresolved.</div> : null}
     <CapitalSummary status={s}/>
     <div className={`risk-banner ${halt ? "risk-critical" : warning ? "risk-warning" : "risk-safe"}`} role="status">
-      <div className="risk-banner-copy"><span className="risk-banner-mark"/><div><strong>{halt ? "Trading risk halt" : warning ? `Bot ${asText(s.botState).toLowerCase()}` : "Risk controls active"}</strong><span>{halt ? asText(s.persistedHaltReason, asText(s.killReason, s.emergencyHalted ? "Emergency stop is active." : "Trading halted by system state.")) : warning ? "No new automated entries are being evaluated while the bot is paused." : "No active kill-switch condition is reported by status."}</span></div></div>
+      <div className="risk-banner-copy"><span className="risk-banner-mark"/><div><strong>{halt ? "Trading risk halt" : warning ? `Bot ${asText(s.botState).toLowerCase()}` : "Risk controls active"}</strong><span>{bannerDetail}</span></div></div>
       <StatusBadge value={halt ? "HALTED" : warning ? "WARNING" : "SAFE"}/>
     </div>
     {halt || s.exchangeConnectivity !== "CONNECTED" || Number(reconciliation.pendingCount) > 0 ? <div className="inline-warning" role="status">
-      <strong>Safety diagnostics</strong> {`Persisted halt: ${asText(s.persistedHaltReason, "none")}; latest kill-switch: ${asText(s.latestKillSwitchObservation, "no active observation")}; exchange: ${asText(s.exchangeConnectivity, "unknown")}; protection: ${asText(s.protectionVerificationStatus, "unknown")}; reconciliation pending: ${asText(reconciliation.pendingCount, "unknown")}; new entries: ${s.newEntriesPermitted === true ? "permitted subject to risk gates" : "blocked"}; position monitoring: ${s.existingPositionMonitoringOperational === true ? "operational" : "not confirmed"}.`}
+      <strong>Safety diagnostics</strong> {`Persisted halt: ${asText(s.persistedHaltReason, "none")}; latest kill-switch: ${asText(s.latestKillSwitchObservation, "no active observation")}; exchange: ${asText(s.exchangeConnectivity, "unknown")}; protection: ${asText(s.protectionVerificationStatus, "unknown")}; reconciliation pending: ${asText(reconciliation.pendingCount, "unknown")}; new entries: ${s.newEntriesPermitted === true ? "preliminary ready, final checks still apply" : `blocked${readinessBlockers.length ? ` · ${readinessBlockers.join(", ")}` : ""}`}; monitoring: ${monitorSummary}.`}
     </div> : null}
 
     <section className="activity-strip" aria-label="Latest operational activity">
