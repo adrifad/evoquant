@@ -10,7 +10,7 @@ import type { StrategyDef } from "../strategy/library.ts";
 import type { Store } from "../memory/db.ts";
 import type { TradeCandidate } from "../strategy/core-v2.ts";
 import { identityForV2 } from "../strategy/identity.ts";
-import { buildDecisionContext, decisionMemoryFingerprint, memoryDenyRequiresCitation, serializeDecisionContext, validateMemoryCitations } from "../memory/decision-context.ts";
+import { buildDecisionContext, decisionMemoryFingerprint, memoryDenyRequiresCitation, memoryDenialHasSufficientBasis, serializeDecisionContext, validateMemoryCitations } from "../memory/decision-context.ts";
 import { gateMemoryEnabled } from "../core/gate-memory.ts";
 import { createLogger } from "../core/logger.ts";
 
@@ -71,7 +71,9 @@ export async function gateCandidate(root: string, roles: RoleLlmService, candida
   if (!result) return null;
   const text = [...result.reasoning, ...result.risk_flags].join(" ");
   if (!validateMemoryCitations(result.cited_memory, memory)
-    || (memory && result.verdict === "DENY" && memoryDenyRequiresCitation(text) && result.cited_memory.length === 0)) {
+    || (memory && result.verdict === "DENY" && memoryDenyRequiresCitation(text) && result.cited_memory.length === 0)
+    || (memory && result.verdict === "DENY" && result.cited_memory.length > 0
+      && !memoryDenialHasSufficientBasis(result.cited_memory, text, memory))) {
     gateLog.warn({ event: "invalid_memory_citation", role: "gate", contextRef });
     return null;
   }

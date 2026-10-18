@@ -51,12 +51,12 @@ const scalpSignal: ScalpSignal = {
 };
 
 function addHistory(store: Store): void {
-  store.db.prepare(`INSERT INTO trades(trade_id,engine,status,evidence_state,evolution_evidence_eligible,accounting_quality,
+  const insert = store.db.prepare(`INSERT INTO trades(trade_id,engine,status,evidence_state,evolution_evidence_eligible,accounting_quality,
     result_r_basis,result_r,pnl,fees,funding,instrument,timeframe,side,strategy,strategy_core_version,strategy_version,regime,
-    regime_axes,contracts,entry_ts,exit_ts) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
-    .run("MEM-TRADE", "SWING_15M", "CLOSED", "VALID", 1, "COMPLETE", "NET", -0.5, -1, 0, 0,
-      candidate.instrument, "15m", "LONG", "BREAKOUT", 2, 7, "TRENDING_BULLISH",
-      JSON.stringify(candidate.regime), "1", "2026-10-17T00:00:00Z", "2026-10-18T00:00:00Z");
+    regime_axes,contracts,entry_ts,exit_ts) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
+  for (let i = 0; i < 30; i++) insert.run(`MEM-TRADE-${i}`, "SWING_15M", "CLOSED", "VALID", 1, "COMPLETE", "NET", -0.5, -1, 0, 0,
+    candidate.instrument, "15m", "LONG", "BREAKOUT", 2, 7, "TRENDING_BULLISH",
+    JSON.stringify(candidate.regime), "1", "2026-10-17T00:00:00Z", `2026-10-18T00:${String(i).padStart(2,"0")}:00Z`);
 }
 
 function addScalpHistory(store: Store): void {
@@ -108,7 +108,7 @@ test("enabled Swing gate supplies mapped family, categorical regime, axes, finge
   assert.match(calls[0]!.contextRef, /^candidate_gate:mem:[a-f0-9]{16}$/);
   assert.ok(calls[0]!.contextRef.length <= 80);
   const payload = JSON.parse(calls[0]!.user) as { trade_memory: { stats: Array<{ id: string; trades: number }> } };
-  assert.equal(payload.trade_memory.stats[0]?.trades, 1);
+  assert.equal(payload.trade_memory.stats[0]?.trades, 30);
   assert.equal(payload.trade_memory.stats[0]?.id, "S1");
   assert.match(calls[0]!.system, /Fewer than 10 trades is a weak\/noisy sample/i);
   assert.match(calls[0]!.system, /10–29 trades is exploratory/i);
@@ -157,6 +157,13 @@ test("Scalp gate scopes short direction and validates only supplied memory IDs",
     scalpSignal, SCALP_DEFAULTS, { stance: "NEUTRAL", regime: "TRENDING_BEARISH", atrPct15m: 0.2, spreadOk: true }, store, root);
   assert.equal(invalid.allow, false);
   assert.equal(invalid.unavailable, true);
+
+  const weakCalls: Call[] = [];
+  const weak = await gateSignal(fakeRoles(weakCalls, { verdict: "DENY", confidence: 0.9,
+    reason: "S1 has negative expectancy", cited_memory: ["S1"] }), scalpSignal, SCALP_DEFAULTS,
+  { stance: "NEUTRAL", regime: "TRENDING_BEARISH", atrPct15m: 0.2, spreadOk: true }, store, root);
+  assert.equal(weak.allow, false);
+  assert.equal(weak.unavailable, true, "one historical sample cannot independently veto a Scalp candidate");
 });
 
 test("memory flag is re-read on later gate calls and only literal true enables it", async (t) => {

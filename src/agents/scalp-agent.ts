@@ -9,7 +9,7 @@ import type { ScalpCfg, ScalpSignal, Stance } from "../scalp/signals.ts";
 import type { Regime } from "../market/regime.ts";
 import { createLogger } from "../core/logger.ts";
 import type { Store } from "../memory/db.ts";
-import { buildDecisionContext, decisionMemoryFingerprint, memoryDenyRequiresCitation, serializeDecisionContext, validateMemoryCitations } from "../memory/decision-context.ts";
+import { buildDecisionContext, decisionMemoryFingerprint, memoryDenyRequiresCitation, memoryDenialHasSufficientBasis, serializeDecisionContext, validateMemoryCitations } from "../memory/decision-context.ts";
 import { gateMemoryEnabled } from "../core/gate-memory.ts";
 import { REPO_ROOT } from "../core/env.ts";
 
@@ -84,7 +84,9 @@ export async function gateSignal(roles: RoleLlmService, signal: ScalpSignal, cfg
   if (!out) { log.warn({ event: "gate_fail_closed", instrument: signal.instrument }); return { allow: false, confidence: 0,
     reason: "LLM gate unavailable → DENY (fail-closed §21)", unavailable: true, contextRef, memoryFingerprint: fingerprint, citedMemory: [] }; }
   if (!validateMemoryCitations(out.cited_memory, memory)
-    || (memory && out.verdict === "DENY" && memoryDenyRequiresCitation(out.reason) && out.cited_memory.length === 0)) {
+    || (memory && out.verdict === "DENY" && memoryDenyRequiresCitation(out.reason) && out.cited_memory.length === 0)
+    || (memory && out.verdict === "DENY" && out.cited_memory.length > 0
+      && !memoryDenialHasSufficientBasis(out.cited_memory, out.reason, memory))) {
     log.warn({ event: "invalid_memory_citation", role: "scalp", contextRef });
     return { allow: false, confidence: 0, reason: "invalid memory citation → DENY", unavailable: true,
       contextRef, memoryFingerprint: fingerprint, citedMemory: [] };

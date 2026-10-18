@@ -224,5 +224,19 @@ export function validateMemoryCitations(citations: string[], context: DecisionMe
 export function memoryDenyRequiresCitation(text: string): boolean {
   const historical = /\b(?:trade memory|historical|expectancy|sample size|matched trades|underperform(?:ed|s)?|similar setup|lesson|S[12]|LESSON-[A-Z0-9_-]+)\b/i.test(text);
   if (historical) return true;
-  return !/\b(?:market|event|stale|contradict(?:ory|s)?|trap|blow.?off|RSI|trend|news|gap|volatility|spread|candle|price|liquidity)\b/i.test(text);
+  return !hasIndependentMarketReason(text);
+}
+
+export function hasIndependentMarketReason(text: string): boolean {
+  return /\b(?:market|event|stale|contradict(?:ory|s)?|trap|blow.?off|RSI|trend|news|gap|volatility|spread|candle|price|liquidity)\b/i.test(text);
+}
+
+/** A sub-30 memory sample may inform caution, but cannot be the sole veto basis. */
+export function memoryDenialHasSufficientBasis(citations: string[], text: string, context: DecisionMemoryContext): boolean {
+  if (hasIndependentMarketReason(text)) return true;
+  const byId = new Map<string, number>([
+    ...context.stats.map((stat) => [stat.id, stat.trades] as [string, number]),
+    ...context.lessons.map((lesson) => [lesson.id, lesson.n] as [string, number]),
+  ]);
+  return citations.some((id) => (byId.get(id) ?? 0) >= 30);
 }
