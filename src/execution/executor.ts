@@ -781,7 +781,7 @@ function usdtEquity(bal: Awaited<ReturnType<typeof getBalance>>): number {
 export type SwingCandidateOutcome = "OPENED" | "GATE_DENY" | "GATE_ERROR" | "CANDIDATE_REJECT" | "GLOBAL_STOP";
 export async function runTick(d: ExecutorDeps, ctx: TickContext, symbol: TickSymbol): Promise<{
   kill: string | null; candidateOutcome?: SwingCandidateOutcome; candidateReason?: string;
-  candidateGateResult?: "ALLOW" | "DENY" | "ERROR"; candidateRiskResult?: string;
+  candidateGateResult?: "ALLOW" | "DENY" | "ERROR" | "POLICY_REJECTED"; candidateRiskResult?: string;
 }> {
   const { trading, risk, store, client } = d;
   const instId = symbol.instId;
@@ -881,19 +881,52 @@ export async function runTick(d: ExecutorDeps, ctx: TickContext, symbol: TickSym
       const gateContextRef = ctx.getGateContextRef?.() ?? "candidate_gate";
       const latestRun = store.db.prepare(`SELECT status FROM llm_runs WHERE role='gate' AND context_ref=?
         ORDER BY id DESC LIMIT 1`).get(gateContextRef) as { status?: string } | undefined;
-      const reason = latestRun?.status === "BUDGET_EXHAUSTED" ? "LLM_BUDGET_EXHAUSTED" : "LLM_ROLE_UNAVAILABLE_OR_INVALID";
+      const reason = latestRun?.status === "BUDGET_EXHAUSTED" ? "LLM_BUDGET_EXHAUSTED"
+        : latestRun?.status === "INVALID_RESPONSE" ? "LLM_SCHEMA_INVALID" : "LLM_UNAVAILABLE";
       recordOpportunityMetric(store, "SWING_15M", "GATE_ERROR", reason);
       if (reason === "LLM_BUDGET_EXHAUSTED") recordOpportunityMetric(store, "SWING_15M", "BUDGET_EXHAUSTED");
       return { kill, candidateOutcome: "GATE_ERROR", candidateReason: reason, candidateGateResult: "ERROR" };
     }
-    recordOpportunityMetric(store, "SWING_15M", gate.verdict === "ALLOW" ? "GATE_ALLOW" : "GATE_DENY");
+    if (gate.policyDisposition === "UNSUPPORTED_DENY" || gate.policyDisposition === "MEMORY_CITATION_INVALID") {
+      recordOpportunityMetric(store, "SWING_15M", "GATE_POLICY_UNSUPPORTED", gate.policyReason ?? gate.policyDisposition);
+      logSystemEvent(store, gate.policyDisposition === "MEMORY_CITATION_INVALID" ? "GATE_MEMORY_VETO_REJECTED" : "GATE_POLICY_UNSUPPORTED", {
+        engine: "SWING_15M", instrument: ctx.candidate.instrument, strategy: ctx.candidate.strategy,
+        side: ctx.candidate.side, contextRef: gate.contextRef, memoryFingerprint: gate.memoryFingerprint,
+        denyBasis: gate.deny_basis ?? null, citedMemory: gate.cited_memory,
+        marketEvidenceRefs: gate.market_evidence_refs ?? [], policyDisposition: gate.policyDisposition,
+        memorySampleCounts: gate.memorySampleCounts, policyReason: gate.policyReason ?? null,
+      });
+      return { kill, candidateOutcome: "CANDIDATE_REJECT", candidateReason: gate.policyDisposition,
+        candidateGateResult: "POLICY_REJECTED" };
+    }
+    const ignoredMemoryVeto = gate.policyDisposition === "IGNORE_UNSUPPORTED_MEMORY_VETO";
+    if (ignoredMemoryVeto) {
+      recordOpportunityMetric(store, "SWING_15M", "GATE_MEMORY_VETO_REJECTED", gate.policyReason ?? "UNSUPPORTED_MEMORY");
+      logSystemEvent(store, "GATE_MEMORY_VETO_REJECTED", { engine: "SWING_15M", instrument: ctx.candidate.instrument,
+        strategy: ctx.candidate.strategy, side: ctx.candidate.side, contextRef: gate.contextRef,
+        memoryFingerprint: gate.memoryFingerprint, citedMemory: gate.cited_memory,
+        denyBasis: gate.deny_basis ?? null, memorySampleCounts: gate.memorySampleCounts,
+        policyReason: gate.policyReason ?? null });
+    } else {
+      recordOpportunityMetric(store, "SWING_15M", gate.effectiveVerdict === "ALLOW" ? "GATE_ALLOW" : "GATE_DENY");
+      if (gate.effectiveVerdict === "DENY" && gate.deny_basis) logSystemEvent(store,
+        gate.deny_basis === "MARKET" ? "GATE_MARKET_DENY_ACCEPTED" : "GATE_MEMORY_DENY_ACCEPTED", {
+          engine: "SWING_15M", instrument: ctx.candidate.instrument, strategy: ctx.candidate.strategy,
+          side: ctx.candidate.side, contextRef: gate.contextRef, memoryFingerprint: gate.memoryFingerprint,
+          denyBasis: gate.deny_basis, citedMemory: gate.cited_memory, marketEvidenceRefs: gate.market_evidence_refs ?? [],
+          memorySampleCounts: gate.memorySampleCounts,
+        });
+    }
   }
-  const candidateAllowed = !ctx.candidate || gate?.verdict === "ALLOW";
+  const ignoredMemoryVeto = gate?.policyDisposition === "IGNORE_UNSUPPORTED_MEMORY_VETO";
+  const candidateAllowed = !ctx.candidate || gate?.effectiveVerdict === "ALLOW";
   const decision: Decision = ctx.candidate
     ? {
       decision: candidateAllowed ? ctx.candidate.side : "HOLD",
       strategy: ctx.candidate.strategy,
-      confidence: candidateAllowed ? gate?.confidence ?? 0 : 0,
+      // An ignored weak-memory DENY has no affirmative LLM confidence. Use the
+      // deterministic setup score, then keep the ordinary calibrated Risk gate.
+      confidence: candidateAllowed ? ignoredMemoryVeto ? ctx.candidate.setupScore : gate?.confidence ?? 0 : 0,
       thesis: candidateAllowed ? gate?.reasoning ?? ctx.candidate.reasoning : ["candidate gate denied or unavailable", ...(gate?.risk_flags ?? [])],
       invalidations: gate?.risk_flags ?? [],
       suggested_stop_atr: ctx.candidate.stopAtr,
@@ -922,7 +955,8 @@ export async function runTick(d: ExecutorDeps, ctx: TickContext, symbol: TickSym
   recordDecision(store, {
     decisionId, ts: new Date().toISOString(), instrument: instId,
     decision: decision.decision,
-    gateResult: ctx.candidate ? gateErrored || !gate ? "ERROR" : gate.verdict : "NOT_EVALUATED",
+    gateResult: ctx.candidate ? gateErrored || !gate ? "ERROR"
+      : ignoredMemoryVeto ? "ALLOW" : gate.effectiveVerdict : "NOT_EVALUATED",
     strategy: decision.strategy ?? undefined, regime: ctx.regime,
     rawConfidence: decision.confidence, calibratedConfidence: calConf,
     thesis: decision.thesis, riskVerdict: verdict,
@@ -932,12 +966,16 @@ export async function runTick(d: ExecutorDeps, ctx: TickContext, symbol: TickSym
   logSystemEvent(store, "DECISION", { inst: instId, d: decision.decision, conf: calConf,
     rej: verdict.approved ? "ok" : verdict.reason });
   if (!verdict.approved) logSystemEvent(store, "RISK_REJECT", { engine: "SWING_15M", instrument: instId, reason: verdict.reason, checks: verdict.checks });
-  if (ctx.candidate) logSystemEvent(store, `LLM_GATE_${candidateAllowed ? "ALLOW" : "DENY"}`, {
+  if (ctx.candidate && !ignoredMemoryVeto) logSystemEvent(store, `LLM_GATE_${candidateAllowed ? "ALLOW" : "DENY"}`, {
     instrument: instId, strategy: ctx.candidate.strategy, side: ctx.candidate.side,
     setupScore: ctx.candidate.setupScore, reasoning: gate?.reasoning ?? [], riskFlags: gate?.risk_flags ?? [],
     contextRef: gate?.contextRef ?? ctx.getGateContextRef?.() ?? "candidate_gate",
     memoryFingerprint: gate?.memoryFingerprint ?? null, citedMemory: gate?.cited_memory ?? [],
+    denyBasis: gate?.deny_basis ?? null, marketEvidenceRefs: gate?.market_evidence_refs ?? [],
   });
+  if (ctx.candidate && ignoredMemoryVeto) log.info({ event: "swing_memory_veto_ignored_for_risk_validation",
+    instrument: instId, strategy: ctx.candidate.strategy, side: ctx.candidate.side, contextRef: gate?.contextRef,
+    setupScore: ctx.candidate.setupScore, citedMemory: gate?.cited_memory ?? [], policyReason: gate?.policyReason });
   if (ctx.candidate && !candidateAllowed) return { kill, candidateOutcome: "GATE_DENY", candidateReason: "GATE_DENIED", candidateGateResult: "DENY" };
   if (ctx.candidate && candidateAllowed && calConf < trading.decision.minimum_confidence) {
     recordOpportunityMetric(store, "SWING_15M", "CONFIDENCE_BELOW_MIN");

@@ -10,9 +10,10 @@ import type { StrategyDef } from "../strategy/library.ts";
 import type { Store } from "../memory/db.ts";
 import type { TradeCandidate } from "../strategy/core-v2.ts";
 import { identityForV2 } from "../strategy/identity.ts";
-import { buildDecisionContext, decisionMemoryFingerprint, memoryDenyRequiresCitation, memoryDenialHasSufficientBasis, serializeDecisionContext, validateMemoryCitations } from "../memory/decision-context.ts";
+import { buildDecisionContext, decisionMemoryFingerprint, serializeDecisionContext, type DecisionMemoryContext } from "../memory/decision-context.ts";
 import { gateMemoryEnabled } from "../core/gate-memory.ts";
 import { createLogger } from "../core/logger.ts";
+import { evaluateGateVetoPolicy, swingVerifiedMarketEvidence, type GateDenyBasis, type GatePolicyDisposition } from "./gate-veto-policy.ts";
 
 export const DecisionSchema = z.object({
   decision: z.enum(["LONG", "SHORT", "HOLD", "CLOSE"]),
@@ -31,9 +32,13 @@ export const CandidateGateSchema = z.object({
   reasoning: z.array(z.string().max(500)).max(5).default([]),
   risk_flags: z.array(z.string().max(250)).max(5).default([]),
   cited_memory: z.array(z.string().max(64)).max(3).default([]),
+  deny_basis: z.enum(["MARKET", "MEMORY", "MIXED"]).optional(),
+  market_evidence_refs: z.array(z.string().max(80)).max(5).optional(),
 }).strict();
 export type CandidateGate = z.infer<typeof CandidateGateSchema>;
-export type CandidateGateResult = CandidateGate & { contextRef: string; memoryFingerprint: string | null };
+export type CandidateGateResult = CandidateGate & { contextRef: string; memoryFingerprint: string | null;
+  policyDisposition: GatePolicyDisposition; effectiveVerdict: "ALLOW" | "DENY";
+  memorySampleCounts: { s1: number; s2: number } | null; policyReason?: string };
 const gateLog = createLogger("candidate-gate");
 
 /** LLM may veto or allow only; candidate side, strategy and geometry are immutable. */
@@ -46,7 +51,8 @@ export async function gateCandidate(root: string, roles: RoleLlmService, candida
     entry: candidate.entryPrice, stop: candidate.stopPrice, take_profit: candidate.takeProfitPrice,
     regime: candidate.regime, conditions: candidate.conditions, reasoning: candidate.reasoning,
   };
-  let memory: ReturnType<typeof buildDecisionContext> | null = null;
+  let memory: DecisionMemoryContext | null = null;
+  let verifiedMarketEvidence = new Set<string>();
   let fingerprint: string | null = null;
   let contextRef = "candidate_gate";
   const memoryEnabled = store !== undefined && marketRegime !== undefined && gateMemoryEnabled(root);
@@ -57,8 +63,13 @@ export async function gateCandidate(root: string, roles: RoleLlmService, candida
         strategy: identity.family, strategyCoreVersion: identity.coreVersion, strategyVersion: identity.strategyVersion,
         side: candidate.side, regime: marketRegime, regimeAxes: candidate.regime });
       const serialized = serializeDecisionContext(memory);
+      memory = (JSON.parse(serialized) as { trade_memory: DecisionMemoryContext }).trade_memory;
       fingerprint = decisionMemoryFingerprint(serialized);
-      payload.trade_memory = JSON.parse(serialized).trade_memory;
+      payload.trade_memory = memory;
+      payload.market_regime = marketRegime;
+      payload.feature_data_sufficient = candidate.features.sufficientData;
+      verifiedMarketEvidence = swingVerifiedMarketEvidence(candidate, marketRegime);
+      payload.verified_market_evidence = [...verifiedMarketEvidence];
       contextRef = `candidate_gate:mem:${fingerprint}`;
     } catch (error) {
       memory = null; fingerprint = null;
@@ -69,15 +80,30 @@ export async function gateCandidate(root: string, roles: RoleLlmService, candida
   onContextRef?.(contextRef);
   const result = await roles.json("gate", prompt, JSON.stringify(payload), CandidateGateSchema, contextRef);
   if (!result) return null;
-  const text = [...result.reasoning, ...result.risk_flags].join(" ");
-  if (!validateMemoryCitations(result.cited_memory, memory)
-    || (memory && result.verdict === "DENY" && memoryDenyRequiresCitation(text) && result.cited_memory.length === 0)
-    || (memory && result.verdict === "DENY" && result.cited_memory.length > 0
-      && !memoryDenialHasSufficientBasis(result.cited_memory, text, memory))) {
-    gateLog.warn({ event: "invalid_memory_citation", role: "gate", contextRef });
-    return null;
+  if (!memory) {
+    return { ...result, contextRef, memoryFingerprint: fingerprint, policyDisposition: "ACCEPT",
+      cited_memory: [], deny_basis: undefined, market_evidence_refs: [],
+      effectiveVerdict: result.verdict, memorySampleCounts: null };
   }
-  return { ...result, contextRef, memoryFingerprint: fingerprint };
+  const policy = evaluateGateVetoPolicy({ verdict: result.verdict,
+    ...(result.deny_basis ? { denyBasis: result.deny_basis as GateDenyBasis } : {}),
+    citedMemory: result.verdict === "DENY" ? result.cited_memory : [],
+    marketEvidenceRefs: result.verdict === "DENY" ? result.market_evidence_refs ?? [] : [],
+    reasoning: [...result.reasoning, ...result.risk_flags], memory, verifiedMarketEvidence });
+  if (policy.kind !== "ACCEPT") {
+    gateLog.warn({ event: policy.kind === "MEMORY_CITATION_INVALID" ? "GATE_MEMORY_VETO_REJECTED" : "GATE_POLICY_UNSUPPORTED",
+      role: "gate", instrument: candidate.instrument, engine: candidate.engine, strategy: candidate.strategy,
+      side: candidate.side, contextRef, denyBasis: result.deny_basis ?? null, citedMemory: result.cited_memory,
+      marketEvidenceRefs: result.market_evidence_refs ?? [], s1Trades: memory.stats[0].trades, s2Trades: memory.stats[1].trades,
+      policyReason: policy.reason });
+  }
+  return { ...result, ...(result.verdict === "ALLOW" ? { cited_memory: [], deny_basis: undefined, market_evidence_refs: [] } : {}),
+    ...(policy.kind === "ACCEPT" && policy.basis ? { deny_basis: policy.basis } : {}),
+    contextRef, memoryFingerprint: fingerprint, policyDisposition: policy.kind,
+    memorySampleCounts: { s1: memory.stats[0].trades, s2: memory.stats[1].trades },
+    effectiveVerdict: policy.kind === "IGNORE_UNSUPPORTED_MEMORY_VETO" ? "ALLOW"
+      : policy.kind === "ACCEPT" ? policy.verdict : "DENY",
+    ...(policy.kind !== "ACCEPT" ? { policyReason: policy.reason } : {}) };
 }
 
 

@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { test, type TestContext } from "node:test";
 import { openStore } from "../src/memory/db.ts";
-import { buildDecisionContext, serializeDecisionContext, decisionMemoryFingerprint, type DecisionMemoryScope } from "../src/memory/decision-context.ts";
+import { buildDecisionContext, serializeDecisionContext, decisionMemoryFingerprint, validateMemoryCitations, type DecisionMemoryScope } from "../src/memory/decision-context.ts";
 
 const at = new Date("2026-10-18T12:00:00.000Z");
 const scope: DecisionMemoryScope = {
@@ -181,6 +181,13 @@ test("serializer is deterministic, capped, preserves primary statistics, and fin
   assert.equal(serialized, serializeDecisionContext(context, 2_400));
   assert.equal(decisionMemoryFingerprint(serialized), decisionMemoryFingerprint(serialized));
   assert.notEqual(decisionMemoryFingerprint(serialized), decisionMemoryFingerprint(`${serialized} `));
+  const bounded = serializeDecisionContext(context, 450);
+  const transmitted = (JSON.parse(bounded) as { trade_memory: typeof context }).trade_memory;
+  assert.ok(bounded.length <= 450);
+  const omitted = context.lessons.find((lesson) => !transmitted.lessons.some((sent) => sent.id === lesson.id));
+  assert.ok(omitted, "the reduced budget removes lower-priority lessons");
+  assert.equal(validateMemoryCitations([omitted.id], transmitted), false,
+    "citation validation against serialized context rejects an omitted lesson");
 });
 
 test("decision context retrieval is SELECT-only", (t) => {

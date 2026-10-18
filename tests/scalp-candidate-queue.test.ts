@@ -12,6 +12,18 @@ test("Scalp queue continues after Gate DENY and opens the next candidate", async
   assert.deepEqual(result, { result: "OPENED", attempted: 2 });
 });
 
+test("unsupported memory policy denial skips only the current Scalp candidate", async () => {
+  const attempted: string[] = [];
+  const result = await runScalpCandidateQueue(["BTC", "SOL"], 3, async (symbol): Promise<ScalpEntryOutcome> => {
+    attempted.push(symbol);
+    return symbol === "BTC"
+      ? { kind: "CANDIDATE_REJECT", reason: "MEMORY_VETO_UNSUPPORTED" }
+      : { kind: "OPENED" };
+  });
+  assert.deepEqual(attempted, ["BTC", "SOL"]);
+  assert.deepEqual(result, { result: "OPENED", attempted: 2 });
+});
+
 test("Scalp queue continues after candidate-local sizing rejection", async () => {
   const attempted: string[] = [];
   const result = await runScalpCandidateQueue(["BTC", "SOL"], 3, async (symbol): Promise<ScalpEntryOutcome> => {

@@ -248,8 +248,35 @@ export class ScalpRunner {
         }
         const snap = snaps.find((s) => s.instrument === sig.instrument)!;
         const g = await gateSignal(this.d.llm, sig, this.d.cfg, {
-          stance: this.stance, regime: snap.regime, atrPct15m: snap.features.atrPct, spreadOk: true,
+          stance: this.stance, regime: snap.regime, atrPct15m: snap.features.atrPct, spreadOk: true, features: snap.features,
         }, this.d.store);
+        if (g.policyDisposition === "UNSUPPORTED_DENY" || g.policyDisposition === "MEMORY_CITATION_INVALID") {
+          recordOpportunityMetric(this.d.store, "SCALP_5M", "GATE_POLICY_UNSUPPORTED", g.policyReason ?? g.policyDisposition);
+          trace("POLICY_REJECTED", null, "CANDIDATE_REJECT", g.policyDisposition);
+          logSystemEvent(this.d.store, "GATE_POLICY_UNSUPPORTED", { engine: "SCALP_5M", instrument: sig.instrument,
+            strategy: "SCALP", side: sig.direction === 1 ? "LONG" : "SHORT", contextRef: g.contextRef,
+            memoryFingerprint: g.memoryFingerprint, citedMemory: g.citedMemory, policyDisposition: g.policyDisposition,
+            memorySampleCounts: g.memorySampleCounts, policyReason: g.policyReason ?? null });
+          return { kind: "CANDIDATE_REJECT", reason: g.policyDisposition };
+        }
+        const ignoredMemoryVeto = g.policyDisposition === "IGNORE_UNSUPPORTED_MEMORY_VETO";
+        if (ignoredMemoryVeto) {
+          recordOpportunityMetric(this.d.store, "SCALP_5M", "GATE_MEMORY_VETO_REJECTED", g.policyReason ?? "UNSUPPORTED_MEMORY");
+          logSystemEvent(this.d.store, "GATE_MEMORY_VETO_REJECTED", { engine: "SCALP_5M", instrument: sig.instrument,
+            strategy: "SCALP", side: sig.direction === 1 ? "LONG" : "SHORT", contextRef: g.contextRef,
+            memoryFingerprint: g.memoryFingerprint, citedMemory: g.citedMemory, memorySampleCounts: g.memorySampleCounts,
+            policyReason: g.policyReason ?? null });
+        }
+        if (!g.allow && g.policyDisposition === "ACCEPT" && (g.denyBasis || g.marketEvidenceRefs.length)) logSystemEvent(this.d.store,
+          g.denyBasis === "MARKET" ? "GATE_MARKET_DENY_ACCEPTED"
+            : g.denyBasis === "MEMORY" || g.denyBasis === "MIXED" ? "GATE_MEMORY_DENY_ACCEPTED"
+              : "GATE_MARKET_DENY_ACCEPTED", {
+            engine: "SCALP_5M", instrument: sig.instrument, strategy: "SCALP",
+            side: sig.direction === 1 ? "LONG" : "SHORT", contextRef: g.contextRef,
+            memoryFingerprint: g.memoryFingerprint, denyBasis: g.denyBasis ?? null, citedMemory: g.citedMemory,
+            marketEvidenceRefs: g.marketEvidenceRefs,
+            memorySampleCounts: g.memorySampleCounts,
+          });
         if (!g.allow) {
           if (g.unavailable) {
             const latestRun = this.d.store.db.prepare(`SELECT status FROM llm_runs WHERE role='scalp' AND context_ref=?
@@ -268,10 +295,10 @@ export class ScalpRunner {
           log.info({ event: "scalp_llm_deny", inst: sig.instrument, reason: g.reason.slice(0, 120) });
           return { kind: "CANDIDATE_REJECT", reason: "GATE_DENY" };
         }
-        recordOpportunityMetric(this.d.store, "SCALP_5M", "GATE_ALLOW");
-        log.info({ event: "scalp_llm_allow", inst: sig.instrument, conf: g.confidence });
+        if (!ignoredMemoryVeto) recordOpportunityMetric(this.d.store, "SCALP_5M", "GATE_ALLOW");
+        log.info({ event: ignoredMemoryVeto ? "scalp_memory_veto_ignored" : "scalp_llm_allow", inst: sig.instrument, conf: g.confidence });
         const outcome = await this.openScalp(sig, snap.features);
-        trace("ALLOW", outcome.riskResult ?? null, outcome.kind, outcome.reason);
+        trace(ignoredMemoryVeto ? "MEMORY_VETO_REJECTED" : "ALLOW", outcome.riskResult ?? null, outcome.kind, outcome.reason);
         return outcome;
       });
     } catch (e) {
@@ -597,11 +624,11 @@ function scalpRiskBlocker(reason: string): string {
 }
 
 function safeLlmFailureDimension(status?: string): string {
-  if (status === "BUDGET_EXHAUSTED") return "BUDGET_EXHAUSTED";
+  if (status === "BUDGET_EXHAUSTED") return "LLM_BUDGET_EXHAUSTED";
   if (status === "RATE_LIMIT") return "RATE_LIMIT";
   if (status === "TIMEOUT") return "TIMEOUT";
   if (status === "AUTHENTICATION_FAILED") return "AUTHENTICATION_FAILED";
-  if (status === "INVALID_RESPONSE") return "INVALID_RESPONSE";
+  if (status === "INVALID_RESPONSE") return "LLM_SCHEMA_INVALID";
   if (status === "NETWORK_ERROR") return "NETWORK_ERROR";
   if (status === "HTTP_ERROR") return "HTTP_ERROR";
   if (status === "PROVIDER_ERROR") return "PROVIDER_ERROR";

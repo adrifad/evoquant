@@ -56,6 +56,21 @@ test("ranked queue continues after candidate-local Gate and risk rejection, open
   assert.equal(outcome.attempted.length, 3, "at most one position is opened and attempt limit is respected");
 });
 
+test("unsupported memory veto is a candidate-local policy rejection, not a global Gate error", async () => {
+  const attempted: string[] = [];
+  const outcome = await attemptRankedCandidates(rows(["ETH", .86], ["BTC", .81]), {
+    entrySymbols: new Set(["ETH", "BTC"]), occupiedSymbols: new Set(), metadataSymbols: new Set(["ETH", "BTC"]), maxAttempts: 3,
+  }, async item => {
+    attempted.push(item.instrument);
+    return item.instrument === "ETH"
+      ? { disposition: "CANDIDATE_REJECT", reason: "MEMORY_VETO_UNSUPPORTED" }
+      : { disposition: "OPENED" };
+  });
+  assert.deepEqual(attempted, ["ETH", "BTC"]);
+  assert.equal(outcome.stoppedByGlobalCondition, false);
+  assert.equal(outcome.opened?.instrument, "BTC");
+});
+
 test("Swing top Gate denial falls through to the second candidate and stops after its entry", async () => {
   const attempted: string[] = [];
   const outcome = await attemptRankedCandidates(rows(["ETH", .86], ["BTC", .81], ["SOL", .75]), {
