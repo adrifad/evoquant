@@ -37,7 +37,7 @@ import type { Decision } from "../agents/decision-agent.ts";
 import type { StrategyDef } from "../strategy/library.ts";
 import type { TradeCandidate } from "../strategy/core-v2.ts";
 import { familyForV2, identityForV2 } from "../strategy/identity.ts";
-import type { CandidateGate } from "../agents/decision-agent.ts";
+import type { CandidateGateResult } from "../agents/decision-agent.ts";
 import { serializeTradeMutation } from "./trade-mutation.ts";
 import { msForBar } from "../core/scheduler.ts";
 import { isTradeOwnedBy } from "../memory/engines.ts";
@@ -764,7 +764,8 @@ export interface TickContext {
   strategies: StrategyDef[];
   decideFn: (f: FeatureSnapshot, regime: Regime, hasPosition: boolean) => Promise<Decision>;
   candidate?: TradeCandidate;
-  gateCandidateFn?: (candidate: TradeCandidate) => Promise<CandidateGate | null>;
+  gateCandidateFn?: (candidate: TradeCandidate) => Promise<CandidateGateResult | null>;
+  getGateContextRef?: () => string;
 }
 
 // USDT collateral equity — the $100-scale demo runs on actual USDT balance,
@@ -871,14 +872,15 @@ export async function runTick(d: ExecutorDeps, ctx: TickContext, symbol: TickSym
 
   const f = ctx.features;
   const hasPosition = false;
-  let gate: CandidateGate | null = null;
+  let gate: CandidateGateResult | null = null;
   let gateErrored = false;
   if (ctx.candidate) {
     try { gate = await ctx.gateCandidateFn?.(ctx.candidate) ?? null; }
     catch { gateErrored = true; }
     if (!gate || gateErrored) {
-      const latestRun = store.db.prepare(`SELECT status FROM llm_runs WHERE role='gate' AND context_ref='candidate_gate'
-        ORDER BY id DESC LIMIT 1`).get() as { status?: string } | undefined;
+      const gateContextRef = ctx.getGateContextRef?.() ?? "candidate_gate";
+      const latestRun = store.db.prepare(`SELECT status FROM llm_runs WHERE role='gate' AND context_ref=?
+        ORDER BY id DESC LIMIT 1`).get(gateContextRef) as { status?: string } | undefined;
       const reason = latestRun?.status === "BUDGET_EXHAUSTED" ? "LLM_BUDGET_EXHAUSTED" : "LLM_ROLE_UNAVAILABLE_OR_INVALID";
       recordOpportunityMetric(store, "SWING_15M", "GATE_ERROR", reason);
       if (reason === "LLM_BUDGET_EXHAUSTED") recordOpportunityMetric(store, "SWING_15M", "BUDGET_EXHAUSTED");
@@ -933,6 +935,8 @@ export async function runTick(d: ExecutorDeps, ctx: TickContext, symbol: TickSym
   if (ctx.candidate) logSystemEvent(store, `LLM_GATE_${candidateAllowed ? "ALLOW" : "DENY"}`, {
     instrument: instId, strategy: ctx.candidate.strategy, side: ctx.candidate.side,
     setupScore: ctx.candidate.setupScore, reasoning: gate?.reasoning ?? [], riskFlags: gate?.risk_flags ?? [],
+    contextRef: gate?.contextRef ?? ctx.getGateContextRef?.() ?? "candidate_gate",
+    memoryFingerprint: gate?.memoryFingerprint ?? null, citedMemory: gate?.cited_memory ?? [],
   });
   if (ctx.candidate && !candidateAllowed) return { kill, candidateOutcome: "GATE_DENY", candidateReason: "GATE_DENIED", candidateGateResult: "DENY" };
   if (ctx.candidate && candidateAllowed && calConf < trading.decision.minimum_confidence) {
