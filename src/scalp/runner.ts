@@ -249,11 +249,11 @@ export class ScalpRunner {
         const snap = snaps.find((s) => s.instrument === sig.instrument)!;
         const g = await gateSignal(this.d.llm, sig, this.d.cfg, {
           stance: this.stance, regime: snap.regime, atrPct15m: snap.features.atrPct, spreadOk: true,
-        });
+        }, this.d.store);
         if (!g.allow) {
           if (g.unavailable) {
-            const latestRun = this.d.store.db.prepare(`SELECT status FROM llm_runs WHERE role='scalp' AND context_ref='scalp_candidate_gate'
-              ORDER BY id DESC LIMIT 1`).get() as { status?: string } | undefined;
+            const latestRun = this.d.store.db.prepare(`SELECT status FROM llm_runs WHERE role='scalp' AND context_ref=?
+              ORDER BY id DESC LIMIT 1`).get(g.contextRef) as { status?: string } | undefined;
             const failure = safeLlmFailureDimension(latestRun?.status);
             recordOpportunityMetric(this.d.store, "SCALP_5M", "GATE_ERROR", failure);
             if (latestRun?.status === "BUDGET_EXHAUSTED") recordOpportunityMetric(this.d.store, "SCALP_5M", "BUDGET_EXHAUSTED");
@@ -262,7 +262,9 @@ export class ScalpRunner {
             return { kind: "GLOBAL_STOP", reason: failure };
           }
           recordOpportunityMetric(this.d.store, "SCALP_5M", "GATE_DENY", "DENY");
-          trace("DENY", null, "GATE_DENY", "DENY");
+          const citationTrace = g.citedMemory.length ? `:${g.citedMemory.join(",")}` : "";
+          const memoryTrace = g.memoryFingerprint ? `:mem:${g.memoryFingerprint}` : "";
+          trace("DENY", null, "GATE_DENY", `DENY${memoryTrace}${citationTrace}`.slice(0, 150));
           log.info({ event: "scalp_llm_deny", inst: sig.instrument, reason: g.reason.slice(0, 120) });
           return { kind: "CANDIDATE_REJECT", reason: "GATE_DENY" };
         }

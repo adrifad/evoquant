@@ -212,13 +212,18 @@ async function main(): Promise<void> {
   log.info({ event: "bot_started", state: getBotState(store) });
   const dash = startup.dashboard;
 
-  const ctxFor = (instId2: string, features: FeatureSnapshot, regime: Regime, strategies: StrategyDef[], candidate?: TradeCandidate) => ({
+  const ctxFor = (instId2: string, features: FeatureSnapshot, regime: Regime, strategies: StrategyDef[], candidate?: TradeCandidate) => {
+    let gateContextRef = "candidate_gate";
+    return {
     features, regime, strategies,
-    ...(candidate ? { candidate, gateCandidateFn: (c: TradeCandidate) => gateCandidate(REPO_ROOT, llmRoles, c) } : {}),
+    ...(candidate ? { candidate,
+      gateCandidateFn: (c: TradeCandidate) => gateCandidate(REPO_ROOT, llmRoles, c, store, regime, (ref) => { gateContextRef = ref; }),
+      getGateContextRef: () => gateContextRef } : {}),
     decideFn: async (feat: FeatureSnapshot, reg: Regime, hasPos: boolean): Promise<Decision> =>
       strategyCoreVersion === 2 ? holdBecause("Strategy Core V2: deterministic exit policy; AI CLOSE disabled")
         : decide(REPO_ROOT, llmRoles, instId2, trading.timeframe, feat, reg, strategies, hasPos, store),
-  });
+    };
+  };
 
   const reviewsInFlight = new Set<string>();
   let ticking = false;
