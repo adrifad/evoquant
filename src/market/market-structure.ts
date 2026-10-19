@@ -13,7 +13,7 @@ export interface ConfirmedPivot {
   price: number;
   sourceCandleIds: number[];
   confirmationState: "CONFIRMED";
-  algorithmVersion: "structure-v1";
+  algorithmVersion: "structure-v2";
 }
 
 export interface StructureEvent {
@@ -26,7 +26,13 @@ export interface StructureEvent {
   direction: "BULLISH" | "BEARISH";
   sourceCandleIds: number[];
   confirmationState: "CONFIRMED";
-  algorithmVersion: "structure-v1";
+  algorithmVersion: "structure-v2";
+  sourcePivotTs: number;
+  sourcePivotConfirmedAt: number;
+  breakConfirmedAt?: number;
+  biasBeforeBreak?: StructureDirection;
+  biasAfterBreak?: StructureDirection;
+  brokenLevel?: number;
 }
 
 export interface MarketStructureSnapshot {
@@ -38,19 +44,43 @@ export interface MarketStructureSnapshot {
   bias: StructureDirection;
   invalidationLevel: number | null;
   invalidated: boolean;
-  algorithmVersion: "structure-v1";
+  algorithmVersion: "structure-v2";
 }
 
 export interface MarketStructureOptions { leftBars?: number; rightBars?: number }
 
-/** Deterministic non-repainting structure from confirmed candles only. A pivot
- * becomes available at `confirmedAt`, after all configured right-side bars close.
+/**
+ * Normalize confirmed candles into a timestamp-unique chronological history.
+ * Conflicting duplicates are discarded rather than letting input order choose
+ * market structure. This is shared by derived market-intelligence modules.
+ */
+export function normalizeConfirmedCandles(input: readonly Candle[]): Candle[] {
+  const grouped = new Map<number, Candle[]>();
+  for (const candle of input) {
+    if (!isConfirmedValid(candle)) continue;
+    const values = grouped.get(candle.ts) ?? [];
+    values.push(candle);
+    grouped.set(candle.ts, values);
+  }
+  const result: Candle[] = [];
+  for (const [ts, values] of [...grouped].sort(([a], [b]) => a - b)) {
+    const first = values[0]!;
+    if (values.every((bar) => sameCandle(first, bar))) result.push(first);
+    // A timestamp with conflicting confirmed records is not safe evidence.
+  }
+  return result;
+}
+
+/**
+ * Incremental, non-repainting structure from confirmed candles only. Pivots
+ * enter the state only at their right-bar confirmation timestamp. BOS/CHOCH
+ * are classified from the bias known at the break close, never final history.
  */
 export function detectMarketStructure(instrument: string, timeframe: string, input: readonly Candle[], options: MarketStructureOptions = {}): MarketStructureSnapshot {
   const left = options.leftBars ?? 2;
   const right = options.rightBars ?? 2;
   if (!Number.isInteger(left) || left < 1 || !Number.isInteger(right) || right < 1) throw new Error("pivot confirmation bars must be positive integers");
-  const candles = input.filter(isConfirmedValid).slice().sort((a, b) => a.ts - b.ts);
+  const candles = normalizeConfirmedCandles(input);
   const pivots: ConfirmedPivot[] = [];
   for (let i = left; i < candles.length - right; i++) {
     const window = candles.slice(i - left, i + right + 1);
@@ -65,54 +95,86 @@ export function detectMarketStructure(instrument: string, timeframe: string, inp
   }
   pivots.sort((a, b) => a.confirmedAt - b.confirmedAt || a.ts - b.ts || a.kind.localeCompare(b.kind));
 
+  const pivotsByConfirmation = new Map<number, ConfirmedPivot[]>();
+  for (const point of pivots) {
+    const atTime = pivotsByConfirmation.get(point.confirmedAt) ?? [];
+    atTime.push(point);
+    pivotsByConfirmation.set(point.confirmedAt, atTime);
+  }
   const events: StructureEvent[] = [];
+  const brokenPivots = new Set<string>();
   let previousHigh: ConfirmedPivot | undefined;
   let previousLow: ConfirmedPivot | undefined;
-  for (const point of pivots) {
-    if (point.kind === "SWING_HIGH") {
-      if (previousHigh) events.push(event(point.price > previousHigh.price ? "HH" : "LH", instrument, timeframe, point,
-        point.price > previousHigh.price ? "BULLISH" : "BEARISH", [previousHigh.ts, point.ts]));
-      previousHigh = point;
-    } else {
-      if (previousLow) events.push(event(point.price > previousLow.price ? "HL" : "LL", instrument, timeframe, point,
-        point.price > previousLow.price ? "BULLISH" : "BEARISH", [previousLow.ts, point.ts]));
-      previousLow = point;
-    }
-  }
-
-  const lastHigh = [...pivots].reverse().find((point) => point.kind === "SWING_HIGH");
-  const lastLow = [...pivots].reverse().find((point) => point.kind === "SWING_LOW");
-  const lastHighClassification = [...events].reverse().find((item) => item.kind === "HH" || item.kind === "LH")?.kind;
-  const lastLowClassification = [...events].reverse().find((item) => item.kind === "HL" || item.kind === "LL")?.kind;
-  const bias: StructureDirection = lastHighClassification === "HH" && lastLowClassification === "HL" ? "BULLISH"
-    : lastHighClassification === "LH" && lastLowClassification === "LL" ? "BEARISH" : "NEUTRAL";
-
+  let highTrend: "HH" | "LH" | undefined;
+  let lowTrend: "HL" | "LL" | undefined;
+  let bias: StructureDirection = "NEUTRAL";
   let brokenLevel: ConfirmedPivot | undefined;
-  let brokeAgainstBias = false;
-  let priorClose: Candle | undefined;
-  const pivotByTs = new Map(pivots.map((point) => [`${point.kind}:${point.ts}`, point]));
+  let invalidated = false;
+  let prior: Candle | undefined;
+
   for (const bar of candles) {
-    if (priorClose) {
+    // A pivot confirmed on this candle becomes available before this close is
+    // evaluated; it cannot be used on any earlier candle.
+    for (const point of pivotsByConfirmation.get(bar.ts) ?? []) {
+      if (point.kind === "SWING_HIGH") {
+        if (previousHigh) {
+          highTrend = point.price > previousHigh.price ? "HH" : "LH";
+          events.push(pivotEvent(highTrend, instrument, timeframe, point, highTrend === "HH" ? "BULLISH" : "BEARISH",
+            [previousHigh.ts, point.ts]));
+        }
+        previousHigh = point;
+      } else {
+        if (previousLow) {
+          lowTrend = point.price > previousLow.price ? "HL" : "LL";
+          events.push(pivotEvent(lowTrend, instrument, timeframe, point, lowTrend === "HL" ? "BULLISH" : "BEARISH",
+            [previousLow.ts, point.ts]));
+        }
+        previousLow = point;
+      }
+      bias = deriveBias(highTrend, lowTrend, bias);
+    }
+
+    if (prior) {
+      // Only pivots confirmed before this close are breakable evidence.
       for (const point of pivots) {
-        if (bar.ts <= point.confirmedAt) continue;
-        const crossed = point.kind === "SWING_HIGH" ? priorClose.c <= point.price && bar.c > point.price
-          : priorClose.c >= point.price && bar.c < point.price;
         const key = `${point.kind}:${point.ts}`;
-        if (!crossed || pivotByTs.get(key) !== point || events.some((item) => item.kind === "BREAK_OF_STRUCTURE" && item.sourceCandleIds[0] === point.ts)) continue;
+        if (point.confirmedAt >= bar.ts || brokenPivots.has(key)) continue;
+        const crossed = point.kind === "SWING_HIGH" ? prior.c <= point.price && bar.c > point.price
+          : prior.c >= point.price && bar.c < point.price;
+        if (!crossed) continue;
         const direction = point.kind === "SWING_HIGH" ? "BULLISH" : "BEARISH";
-        const kind = bias !== "NEUTRAL" && direction !== bias ? "CHANGE_OF_CHARACTER" : "BREAK_OF_STRUCTURE";
+        const before = bias;
+        const kind: StructureEventKind = before !== "NEUTRAL" && direction !== before ? "CHANGE_OF_CHARACTER" : "BREAK_OF_STRUCTURE";
+        const after: StructureDirection = kind === "CHANGE_OF_CHARACTER" ? direction : before;
         events.push({ kind, instrument, timeframe, ts: bar.ts, confirmedAt: bar.ts, price: point.price, direction,
-          sourceCandleIds: [point.ts, bar.ts], confirmationState: "CONFIRMED", algorithmVersion: "structure-v1" });
+          sourceCandleIds: [point.ts, bar.ts], confirmationState: "CONFIRMED", algorithmVersion: "structure-v2",
+          sourcePivotTs: point.ts, sourcePivotConfirmedAt: point.confirmedAt, breakConfirmedAt: bar.ts,
+          biasBeforeBreak: before, biasAfterBreak: after, brokenLevel: point.price });
+        brokenPivots.add(key);
         brokenLevel = point;
-        brokeAgainstBias = kind === "CHANGE_OF_CHARACTER";
+        invalidated = kind === "CHANGE_OF_CHARACTER";
+        if (kind === "CHANGE_OF_CHARACTER") {
+          bias = after;
+        }
       }
     }
-    priorClose = bar;
+    prior = bar;
   }
-  events.sort((a, b) => a.confirmedAt - b.confirmedAt || a.ts - b.ts || a.kind.localeCompare(b.kind));
+
+  events.sort((a, b) => a.confirmedAt - b.confirmedAt || a.ts - b.ts || a.kind.localeCompare(b.kind)
+    || a.sourcePivotTs - b.sourcePivotTs);
+  const lastHigh = [...pivots].reverse().find((point) => point.kind === "SWING_HIGH");
+  const lastLow = [...pivots].reverse().find((point) => point.kind === "SWING_LOW");
   return { instrument, timeframe, evaluatedAt: candles.at(-1)?.ts ?? null, pivots, events, bias,
-    invalidationLevel: bias === "BULLISH" ? lastLow?.price ?? null : bias === "BEARISH" ? lastHigh?.price ?? null : brokenLevel?.price ?? null,
-    invalidated: brokeAgainstBias, algorithmVersion: "structure-v1" };
+    invalidationLevel: bias === "BULLISH" ? lastLow?.price ?? brokenLevel?.price ?? null
+      : bias === "BEARISH" ? lastHigh?.price ?? brokenLevel?.price ?? null : brokenLevel?.price ?? null,
+    invalidated, algorithmVersion: "structure-v2" };
+}
+
+function deriveBias(high: "HH" | "LH" | undefined, low: "HL" | "LL" | undefined, current: StructureDirection): StructureDirection {
+  if (high === "HH" && low === "HL") return "BULLISH";
+  if (high === "LH" && low === "LL") return "BEARISH";
+  return current;
 }
 
 function isConfirmedValid(candle: Candle): boolean {
@@ -121,14 +183,19 @@ function isConfirmedValid(candle: Candle): boolean {
     && candle.l <= Math.min(candle.o, candle.c) && candle.h >= candle.l;
 }
 
+function sameCandle(a: Candle, b: Candle): boolean {
+  return a.o === b.o && a.h === b.h && a.l === b.l && a.c === b.c && a.vol === b.vol && a.volCcy === b.volCcy;
+}
+
 function pivot(kind: StructurePivotKind, instrument: string, timeframe: string, source: Candle, confirmation: Candle,
   sourceCandleIds: number[], price: number): ConfirmedPivot {
   return { kind, instrument, timeframe, ts: source.ts, confirmedAt: confirmation.ts, price, sourceCandleIds,
-    confirmationState: "CONFIRMED", algorithmVersion: "structure-v1" };
+    confirmationState: "CONFIRMED", algorithmVersion: "structure-v2" };
 }
 
-function event(kind: StructureEventKind, instrument: string, timeframe: string, point: ConfirmedPivot,
+function pivotEvent(kind: "HH" | "HL" | "LH" | "LL", instrument: string, timeframe: string, point: ConfirmedPivot,
   direction: "BULLISH" | "BEARISH", sourceCandleIds: number[]): StructureEvent {
   return { kind, instrument, timeframe, ts: point.ts, confirmedAt: point.confirmedAt, price: point.price, direction,
-    sourceCandleIds, confirmationState: "CONFIRMED", algorithmVersion: "structure-v1" };
+    sourceCandleIds, confirmationState: "CONFIRMED", algorithmVersion: "structure-v2", sourcePivotTs: point.ts,
+    sourcePivotConfirmedAt: point.confirmedAt };
 }

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { PositionMonitorHealthTracker, runMonitorItemsIsolated } from "../src/core/monitor-health.ts";
+import { areRequiredPositionMonitorsOperational, PositionMonitorHealthTracker, runMonitorItemsIsolated } from "../src/core/monitor-health.ts";
 
 test("monitor health reports successful sweeps and returns from DEGRADED to HEALTHY", async () => {
   const tracker = new PositionMonitorHealthTracker();
@@ -10,11 +10,14 @@ test("monitor health reports successful sweeps and returns from DEGRADED to HEAL
   assert.ok(scalp.lastAttemptAt);
   assert.ok(scalp.lastSuccessfulSweepAt);
   assert.ok(Date.parse(scalp.lastSuccessfulSweepAt) >= Date.parse(scalp.lastAttemptAt!));
+  const completeSweepAt = scalp.lastSuccessfulSweepAt;
 
   await tracker.execute("SCALP_5M", async (partialFailure) => partialFailure(new Error("one instrument failed")));
   scalp = tracker.snapshot({ SWING_15M: false, SCALP_5M: true }).SCALP_5M;
   assert.equal(scalp.health, "DEGRADED");
   assert.equal(scalp.lastError, "one instrument failed");
+  assert.equal(scalp.lastSuccessfulSweepAt, completeSweepAt, "partial sweeps must not advance complete-success time");
+  assert.ok(scalp.lastPartialSweepAt);
 
   await tracker.execute("SCALP_5M", async () => undefined);
   scalp = tracker.snapshot({ SWING_15M: false, SCALP_5M: true }).SCALP_5M;
@@ -61,4 +64,14 @@ test("one position failure does not prevent later position checks", async () => 
   }, (instrument, error) => failures.push(`${instrument}:${(error as Error).message}`));
   assert.deepEqual(visited, ["BTC", "ETH", "SOL"]);
   assert.deepEqual(failures, ["ETH:temporary exchange read failure"]);
+});
+
+test("account monitoring operational flag requires at least one active required monitor", () => {
+  assert.equal(areRequiredPositionMonitorsOperational(null), false);
+  assert.equal(areRequiredPositionMonitorsOperational({
+    SWING_15M: { enabled: true, required: false, lastAttemptAt: null, lastSuccessfulSweepAt: null, lastPartialSweepAt: null,
+      lastErrorAt: null, lastError: null, consecutiveFailures: 0, currentlyRunning: false, durationMs: null, health: "NOT_REQUIRED" },
+    SCALP_5M: { enabled: true, required: false, lastAttemptAt: null, lastSuccessfulSweepAt: null, lastPartialSweepAt: null,
+      lastErrorAt: null, lastError: null, consecutiveFailures: 0, currentlyRunning: false, durationMs: null, health: "NOT_REQUIRED" },
+  }), false);
 });

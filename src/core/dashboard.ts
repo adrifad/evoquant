@@ -35,6 +35,7 @@ import type { ScanRow } from "../strategy/scanner.ts";
 import { getCandles, type Bar } from "../exchange/okx/market.ts";
 import { portfolioOpenRisk } from "../risk/portfolio-open-risk.ts";
 import { projectEntryReadiness } from "../risk/entry-readiness.ts";
+import { areRequiredPositionMonitorsOperational } from "./monitor-health.ts";
 import { unresolvedEntry } from "./runtime-risk.ts";
 import { DynamicWatchlistError, type WatchlistProjection } from "../market/dynamic-watchlist.ts";
 import { getOpportunityFunnel, getRecentCandidateAttempts } from "../market/opportunity-funnel.ts";
@@ -195,7 +196,7 @@ export function startDashboard(cfg: DashboardConfig): DashboardServer {
       });
       const positionMonitoring = cfg.getPositionMonitoringHealth?.() ?? null;
       const monitoringOperational = positionMonitoring
-        ? Object.values(positionMonitoring).filter((status) => status.required).every((status) => status.health === "HEALTHY")
+        ? areRequiredPositionMonitorsOperational(positionMonitoring)
         : cfg.getExistingPositionMonitoring?.() ?? false;
       return send(200, {
         environment: "DEMO",                       // §96 always visible
@@ -226,6 +227,7 @@ export function startDashboard(cfg: DashboardConfig): DashboardServer {
         totals: { closed: closed.c, pnl: trustedClosed.p, expectancyR: trustedClosed.e,
           trustedNetClosed: trustedClosed.c, allClosedPnl: closed.p, accountingByEvidenceState: evidenceByState }, evidencePending,
         openPositions: projected, openPosition: projected[0] ?? null,
+        openPositionCount: exchangePositions?.length ?? null,
         criticalEvents: store.db.prepare("SELECT ts,kind,payload FROM system_events WHERE kind IN ('ERROR','RISK_EVENT','LLM_TIMEOUT','LLM_AUTH_FAILURE','STATE') ORDER BY id DESC LIMIT 4").all(),
         reconciliationWarnings: store.db.prepare("SELECT trade_id,instrument,side,entry_ts,exit_reason FROM trades WHERE status='RECONCILIATION_PENDING' ORDER BY entry_ts DESC").all(),
         aiRoles: cfg.llmRoles?.settings() ?? [],
@@ -364,7 +366,7 @@ export function startDashboard(cfg: DashboardConfig): DashboardServer {
         WHERE instId=? AND bar=? AND confirm='1' ORDER BY ts DESC LIMIT 400`).all(inst, bar) as Array<Record<string, unknown>>;
       const candles = rows.reverse().map((row) => ({ ts: Number(row.ts), o: Number(row.o), h: Number(row.h), l: Number(row.l),
         c: Number(row.c), vol: Number(row.vol), volCcy: Number(row.volCcy), confirm: "1" as const }));
-      return send(200, buildMarketIntelligence(inst, bar, candles));
+      return send(200, buildMarketIntelligence(inst, bar, candles, Date.now()));
     }
     if (p === "/api/scan") {
       return send(200, scannerProjection(store, cfg.getScan() as ScanRow[], cfg.getLastTick()?.at ?? null, cfg.deps().watchlist));

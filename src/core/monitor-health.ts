@@ -6,6 +6,7 @@ export interface PositionMonitorStatus {
   required: boolean;
   lastAttemptAt: string | null;
   lastSuccessfulSweepAt: string | null;
+  lastPartialSweepAt: string | null;
   lastErrorAt: string | null;
   lastError: string | null;
   consecutiveFailures: number;
@@ -15,6 +16,15 @@ export interface PositionMonitorStatus {
 }
 
 export type PositionOwnership = "OWNED_BY_ENGINE" | "OWNED_BY_OTHER_ENGINE" | "ORPHAN" | "OWNERSHIP_CONFLICT";
+
+/** No required monitors is not evidence of an operational position sweep. */
+export function areRequiredPositionMonitorsOperational(
+  statuses: Record<PositionMonitorEngine, PositionMonitorStatus> | null,
+): boolean {
+  if (!statuses) return false;
+  const required = Object.values(statuses).filter((status) => status.required);
+  return required.length > 0 && required.every((status) => status.health === "HEALTHY");
+}
 
 /** Classify the exchange snapshot against all locally managed engines before
  * an engine labels another engine's valid position as orphan exposure.
@@ -39,6 +49,7 @@ type InternalStatus = Omit<PositionMonitorStatus, "health" | "required"> & {
   partialFailure: boolean;
   lastAttemptMs: number | null;
   lastSuccessMs: number | null;
+  lastPartialMs: number | null;
 };
 
 const INTERVAL_MS: Record<PositionMonitorEngine, number> = { SWING_15M: 60_000, SCALP_5M: 15_000 };
@@ -66,7 +77,7 @@ export class PositionMonitorHealthTracker {
   private initialState(): InternalStatus {
     return { enabled: true, lastAttemptAt: null, lastSuccessfulSweepAt: null, lastErrorAt: null,
       lastError: null, consecutiveFailures: 0, currentlyRunning: false, durationMs: null,
-      partialFailure: false, lastAttemptMs: null, lastSuccessMs: null };
+      lastPartialSweepAt: null, partialFailure: false, lastAttemptMs: null, lastSuccessMs: null, lastPartialMs: null };
   }
 
   setEnabled(engine: PositionMonitorEngine, enabled: boolean): void { this.state[engine].enabled = enabled; }
@@ -86,10 +97,15 @@ export class PositionMonitorHealthTracker {
     };
     try {
       await work(partialFailure);
-      state.lastSuccessMs = Date.now();
-      state.lastSuccessfulSweepAt = new Date(state.lastSuccessMs).toISOString();
-      if (!state.partialFailure) state.consecutiveFailures = 0;
-      else state.consecutiveFailures++;
+      if (!state.partialFailure) {
+        state.lastSuccessMs = Date.now();
+        state.lastSuccessfulSweepAt = new Date(state.lastSuccessMs).toISOString();
+        state.consecutiveFailures = 0;
+      } else {
+        state.lastPartialMs = Date.now();
+        state.lastPartialSweepAt = new Date(state.lastPartialMs).toISOString();
+        state.consecutiveFailures++;
+      }
       return true;
     } catch (error) {
       state.lastErrorAt = new Date().toISOString();
@@ -114,11 +130,16 @@ export class PositionMonitorHealthTracker {
     let health: PositionMonitorHealth;
     if (!required) health = "NOT_REQUIRED";
     else if (!state.enabled) health = "FAILED";
+    // A completed partial sweep is evidence of degraded monitoring even when
+    // no fully successful sweep has happened yet. Keep UNKNOWN for no result.
+    else if (state.lastPartialMs !== null && (state.lastSuccessMs === null || state.lastPartialMs > state.lastSuccessMs))
+      health = state.consecutiveFailures >= 3 ? "FAILED" : "DEGRADED";
     else if (state.lastSuccessMs === null) health = state.consecutiveFailures >= 3 ? "FAILED" : "UNKNOWN";
     else if (now - state.lastSuccessMs > INTERVAL_MS[engine] * STALE_FACTOR) health = state.consecutiveFailures >= 3 ? "FAILED" : "DEGRADED";
     else if (state.partialFailure || (state.lastAttemptMs !== null && state.lastSuccessMs < state.lastAttemptMs)) health = "DEGRADED";
     else health = "HEALTHY";
-    const { partialFailure: _partialFailure, lastAttemptMs: _lastAttemptMs, lastSuccessMs: _lastSuccessMs, ...publicState } = state;
+    const { partialFailure: _partialFailure, lastAttemptMs: _lastAttemptMs, lastSuccessMs: _lastSuccessMs,
+      lastPartialMs: _lastPartialMs, ...publicState } = state;
     return { ...publicState, required, health };
   }
 }

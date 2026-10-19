@@ -180,29 +180,56 @@ const features = { ts: 0, instrument: symbol, price: 100, atr14: 1, atrPct: 1, e
 const signal: ScalpSignal = { instrument: symbol, direction: 1, score: 0.9, price: 100,
   stopPx: 98, tpPx: 104, atr: 1, reason: "fixture", regime: "TRENDING_BULLISH", ts: 0 };
 
-function executionFixture(t: test.TestContext, onLeverage?: () => void, fillPrice = 100, tickSz = "0.01") {
+function executionFixture(t: test.TestContext, onLeverage?: () => void, fillPrice = 100, tickSz = "0.01", failProtectionAt?: number) {
   const f = fixture(t);
   f.risk.hard_limits.max_concurrent_positions = 1;
   const fixtureMeta = { ...meta, tickSz };
   const positions: Array<Record<string, string>> = [], writes: Array<{ url: string; body: Record<string, string> }> = [];
+  const algos = new Map<string, Record<string, string>>();
+  let nextAlgo = 0;
+  const orders = new Map<string, Record<string, string>>();
+  let nextOrder = 0;
   const client = {
-    get: async (url: string) => {
+    get: async (url: string, query?: Record<string, string>) => {
       if (url.endsWith("/balance")) return [{ totalEq: "100", details: [{ ccy: "USDT", eq: "100", availEq: "100" }] }];
       if (url.endsWith("/positions")) return structuredClone(positions);
       if (url.endsWith("/time")) return [{ ts: String(Date.now()) }];
       if (url.endsWith("/orders-pending") || url.endsWith("/fills")) return [];
-      if (url.endsWith("/order")) return [{ ordId: "O1", instId: symbol, state: "filled", avgPx: String(fillPrice), lever: "3", accFillSz: "200", sz: "200" }];
+      if (url.endsWith("/orders-algo-pending")) return [];
+      if (url.endsWith("/order-algo")) return query?.algoId && algos.has(query.algoId) ? [algos.get(query.algoId)] : [];
+      if (url.endsWith("/order")) {
+        if (query?.clOrdId) return [];
+        const orderId = query?.ordId ?? "O1";
+        return orders.has(orderId) ? [orders.get(orderId)] : [{ ordId: orderId, instId: symbol, state: "filled", avgPx: String(fillPrice), lever: "3", accFillSz: "200", sz: "200" }];
+      }
       throw new Error(`unexpected fake GET ${url}`);
     },
     post: async (url: string, body: Record<string, string>) => {
       writes.push({ url, body });
       if (url.endsWith("/set-leverage")) { onLeverage?.(); return [body]; }
       if (url.endsWith("/order")) {
-        assert.equal(unresolvedEntry(f.store)?.clOrdId, body.clOrdId);
-        positions.push({ instId: body.instId!, posSide: body.posSide!, pos: body.sz!, avgPx: String(fillPrice), markPx: "100", lever: "4", margin: "5", mgnMode: "isolated" });
-        return [{ ordId: "O1", sCode: "0" }];
+        nextOrder += 1;
+        const ordId = `O${nextOrder}`;
+        const existing = positions.findIndex((position) => position.instId === body.instId && position.posSide === body.posSide);
+        if (existing < 0) assert.equal(unresolvedEntry(f.store)?.clOrdId, body.clOrdId);
+        if (existing >= 0) positions.splice(existing, 1);
+        else positions.push({ instId: body.instId!, posSide: body.posSide!, pos: body.sz!, avgPx: String(fillPrice), markPx: "100", lever: "4", margin: "5", mgnMode: "isolated" });
+        orders.set(ordId, { ordId, instId: body.instId!, state: "filled", avgPx: String(fillPrice), lever: "3",
+          accFillSz: body.sz!, sz: body.sz!, side: body.side!, posSide: body.posSide!, ordType: body.ordType!, clOrdId: body.clOrdId! });
+        return [{ ordId, sCode: "0" }];
       }
-      if (url.endsWith("/order-algo")) return [{ algoId: "A1", sCode: "0" }];
+      if (url.endsWith("/order-algo")) {
+        nextAlgo += 1;
+        if (nextAlgo === failProtectionAt) throw new Error("simulated native protection rejection");
+        const algoId = `A${nextAlgo}`;
+        const protection = body.slTriggerPx ? { slTriggerPx: body.slTriggerPx, slTriggerPxType: body.slTriggerPxType }
+          : { tpTriggerPx: body.tpTriggerPx!, tpTriggerPxType: body.tpTriggerPxType! };
+        algos.set(algoId, { algoId, state: "live", instId: body.instId!, tdMode: body.tdMode!, side: body.side!,
+          posSide: body.posSide!, ordType: body.ordType!, sz: body.sz!, slTriggerPx: protection.slTriggerPx ?? "",
+          slTriggerPxType: protection.slTriggerPxType ?? "", tpTriggerPx: protection.tpTriggerPx ?? "",
+          tpTriggerPxType: protection.tpTriggerPxType ?? "" });
+        return [{ algoId, algoClOrdId: body.algoClOrdId!, sCode: "0" }];
+      }
       throw new Error(`unexpected fake POST ${url}`);
     },
   } as unknown as OkxClient;
@@ -213,7 +240,7 @@ function executionFixture(t: test.TestContext, onLeverage?: () => void, fillPric
     strategies: [{ name: "TREND_FOLLOWING", version: 1 } as TickContext["strategies"][number]],
     decideFn: async () => ({ decision: "LONG", strategy: "TREND_FOLLOWING_V1", confidence: 1,
       suggested_stop_atr: 2, suggested_take_profit_atr: 4, thesis: ["fixture"], invalidations: [] }) };
-  return { ...deps, writes,
+  return { ...deps, writes, positions,
     openSwing: () => runTick(deps, ctx, { instId: symbol, meta }),
     openScalp: () => (runner as unknown as { openScalp(s: ScalpSignal, f: FeatureSnapshot): Promise<void> }).openScalp(signal, features),
   };
@@ -249,15 +276,46 @@ for (const engine of ["openSwing", "openScalp"] as const) {
   });
 }
 
-test("Scalp filled entry with tick-rounded invalid protection is persisted as degraded and halts new entries", async t => {
+test("Scalp rejects tick-rounded invalid signal protection geometry before submitting an entry", async t => {
   const f = executionFixture(t, undefined, 100, "10");
   await f.openScalp();
   const trade = f.store.db.prepare("SELECT status,entry_px,stop_px,take_profit_px,protection_state FROM trades WHERE engine='SCALP_5M'").get() as
     { status: string; entry_px: number; stop_px: number; take_profit_px: number; protection_state: string } | undefined;
-  assert.equal(trade?.status, "OPEN");
-  assert.equal(trade?.entry_px, 100);
-  assert.equal(trade?.protection_state, "DEGRADED");
-  assert.ok(trade!.stop_px < trade!.take_profit_px, "signal thesis geometry remains auditable for software fallback");
+  assert.equal(trade, undefined);
+  assert.equal(f.writes.some(w => w.url.endsWith("/order")), false, "invalid static geometry must be rejected before entry");
   assert.equal(f.writes.some(w => w.url.endsWith("/order-algo")), false, "invalid geometry must not be submitted as native protection");
-  assert.equal(kvGet(f.store, "bot_state"), "RISK_HALTED");
+  assert.equal(kvGet(f.store, "bot_state"), "RUNNING", "a candidate-local geometry rejection is not account-wide uncertainty");
+});
+
+test("Scalp persists and halts a filled entry when slippage invalidates tick geometry, then uses serialized reduce-risk close", async t => {
+  const f = executionFixture(t, undefined, 101.5, "3");
+  await f.openScalp();
+  const trade = f.store.db.prepare("SELECT status,protection_state,entry_px FROM trades WHERE engine='SCALP_5M'").get() as
+    { status: string; protection_state: string; entry_px: number } | undefined;
+  assert.equal(trade?.entry_px, 101.5);
+  assert.equal(trade?.status, "RECONCILIATION_PENDING");
+  assert.equal(trade?.protection_state, "EXITED_PENDING_ACCOUNTING");
+  assert.equal(f.positions.length, 0, "the proven matching exposure was flattened");
+  assert.equal(kvGet(f.store, "risk_halt_reason"), "LIVE_POSITION_PROTECTION_UNVERIFIED");
+  assert.equal(f.writes.filter((write) => write.url.endsWith("/order")).length, 2,
+    "one confirmed entry and one stable reduce-risk close; never a second entry");
+  assert.equal(f.writes.filter((write) => write.url.endsWith("/order-algo")).length, 0,
+    "invalid post-fill geometry is never submitted as native protection");
+});
+
+test("Scalp halts and risk-reduces a verified fill when native TP placement fails after SL acceptance", async t => {
+  const f = executionFixture(t, undefined, 100, "0.01", 2);
+  await f.openScalp();
+  const trade = f.store.db.prepare("SELECT status,protection_state,sl_algo_id,tp_algo_id FROM trades WHERE engine='SCALP_5M'").get() as
+    { status: string; protection_state: string; sl_algo_id: string | null; tp_algo_id: string | null } | undefined;
+  assert.equal(trade?.status, "RECONCILIATION_PENDING");
+  assert.equal(trade?.protection_state, "DEGRADED",
+    "an accepted SL whose cleanup cannot be verified remains a protection failure, not healthy flat accounting");
+  assert.ok(trade?.sl_algo_id, "accepted SL identity remains auditable");
+  assert.equal(trade?.tp_algo_id, null, "rejected TP is not represented as active protection");
+  assert.equal(f.positions.length, 0, "only the exact verified fill was flattened");
+  assert.equal(kvGet(f.store, "risk_halt_reason"), "EXIT_PROTECTION_CLEANUP_UNVERIFIED");
+  assert.equal(f.writes.filter((write) => write.url.endsWith("/order")).length, 2,
+    "one entry and one risk-reducing close; no duplicate entry or close");
+  assert.equal(f.writes.filter((write) => write.url.endsWith("/order-algo")).length, 2);
 });

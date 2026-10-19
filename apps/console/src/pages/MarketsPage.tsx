@@ -14,6 +14,7 @@ export function MarketsPage({ status }: { status: ApiState<Row> }) {
   const instrument = selected || asText(status.data?.instrument);
   const intelligence = useApi<unknown>(`/api/market-intelligence?instId=${encodeURIComponent(instrument)}&bar=15m`, 60_000);
   const intelligenceRow = asRow(intelligence.data);
+  const intelligenceFreshness = asRow(intelligenceRow?.freshness);
   const structure = asRow(intelligenceRow?.structure);
   const range = asRow(intelligenceRow?.range);
   const zones = asRow(intelligenceRow?.supportResistance);
@@ -139,9 +140,16 @@ export function MarketsPage({ status }: { status: ApiState<Row> }) {
         </Panel>
       </div>
     </DataState>
-    <Panel title="Market intelligence" subtitle={`${instrument} · deterministic context from persisted confirmed 15m candles`}>
+    <Panel title="Market intelligence" subtitle={`${instrument} · persisted confirmed 15m candles · ${asText(intelligenceFreshness?.dataSource, "source unavailable")}`} action={<StatusBadge value={asText(intelligenceFreshness?.status, "UNKNOWN")}/> }>
       <DataState loading={intelligence.loading} error={intelligence.error} empty={!intelligence.data} hasData={intelligence.data !== null}
         emptyTitle="Structural context unavailable" emptyDetail="No persisted confirmed candle history is available for this instrument.">
+        {intelligenceFreshness ? <p className={`market-freshness market-freshness-${asText(intelligenceFreshness.status).toLowerCase()}`}>
+          {asText(intelligenceFreshness.status) === "CURRENT" ? "Latest confirmed candle is within the expected publication window."
+            : asText(intelligenceFreshness.status) === "STALE" ? "Persisted market context is stale; this does not by itself indicate exchange disconnection."
+              : asText(intelligenceFreshness.status) === "INSUFFICIENT_DATA" ? "History is too short for reliable structural context."
+                : "No persisted confirmed candles are available."}
+          <span>Last confirmed {formatTimestamp(intelligenceFreshness.lastConfirmedCandleAt)} · age {intelligenceFreshness.ageMs == null ? "Unavailable" : `${formatNumber(Number(intelligenceFreshness.ageMs) / 60_000, 1)} min`} · evaluated {formatTimestamp(intelligenceFreshness.evaluatedAt)}</span>
+        </p> : null}
         {asText(intelligenceRow?.status) === "INSUFFICIENT_CONFIRMED_DATA" ?
           <div className="empty-state"><strong>Insufficient confirmed history</strong><span>{formatNumber(intelligenceRow?.candleCount, 0)} candles · no structural conclusion reported.</span></div> :
           <div className="feature-groups">

@@ -321,6 +321,17 @@ export class ScalpRunner {
       return { kind: "GLOBAL_STOP", reason: "INSTRUMENT_METADATA_UNAVAILABLE", riskResult: "STATE_UNCERTAIN" };
     }
     try {
+      // Validate signal-side geometry and tick executability before any entry
+      // request. The post-fill check below remains necessary for slippage.
+      deriveScalpExitGeometry({ side: sig.direction === 1 ? "LONG" : "SHORT", signalPrice: sig.price,
+        signalStop: sig.stopPx, signalTakeProfit: sig.tpPx, fillPrice: sig.price, tickSz: meta.tickSz });
+    } catch (error) {
+      recordOpportunityMetric(store, "SCALP_5M", "RISK_REJECT", "INVALID_EXIT_GEOMETRY");
+      logSystemEvent(store, "RISK_REJECT", { engine: "SCALP_5M", instId: sig.instrument,
+        reason: "INVALID_SIGNAL_EXIT_GEOMETRY", detail: error instanceof Error ? error.message.slice(0, 120) : "UNKNOWN" });
+      return { kind: "CANDIDATE_REJECT", reason: "INVALID_SIGNAL_EXIT_GEOMETRY", riskResult: "INVALID_EXIT_GEOMETRY" };
+    }
+    try {
       const usdt = (await getPositions(client)).filter((p) => p.pos !== "0");
       const bal = await getBalance(client);
       const u = bal.details.find((x) => x.ccy === "USDT");
@@ -487,6 +498,8 @@ export class ScalpRunner {
           exchangePositionVerified: positionReadbackVerified, newEntriesHalted: true });
         log.error({ event: "scalp_filled_entry_geometry_invalid", tradeId, instrument: sig.instrument,
           orderId: placed.ordId, positionReadbackVerified });
+        await this.recoverUnprotectedFilledEntry(tradeId, sig.instrument, side, actualContracts, positionReadbackVerified,
+          "FILLED_ENTRY_GEOMETRY_INVALID");
         return { kind: "GLOBAL_STOP", reason: "PROTECTION_UNVERIFIED", riskResult: "GLOBAL_STOP" };
       }
       const stopPx = exitGeometry.stopPrice;
@@ -528,6 +541,8 @@ export class ScalpRunner {
         setBotState(store, "RISK_HALTED");
         logSystemEvent(store, "RISK_EVENT", { protection_degraded: error instanceof Error ? error.message : "UNKNOWN", tradeId, newEntriesHalted: true });
         releaseEntry(store, clOpen);
+        await this.recoverUnprotectedFilledEntry(tradeId, sig.instrument, side, actualContracts, positionReadbackVerified,
+          "NATIVE_PROTECTION_UNVERIFIED");
         throw new Error("STATE_UNCERTAIN: native position protection was not fully verified");
       }
       releaseEntry(store, clOpen);
@@ -618,6 +633,56 @@ export class ScalpRunner {
     } catch (e) {
       log.warn({ event: "scalp_sweep_error", error: e instanceof Error ? e.message.slice(0, 100) : "" });
     } finally { this.sweeping = false; }
+  }
+
+  /**
+   * A filled but unprotected entry is owned and halted before reaching here.
+   * Flatten only after a fresh, exact position readback proves that the
+   * matching exposure is no larger than this entry. Executor close semantics
+   * persist a stable client ID and serialize retries, so timeouts cannot cause
+   * a blind second close. Unknown/mismatched exchange state remains halted.
+   */
+  private async recoverUnprotectedFilledEntry(tradeId: string, instrument: string, side: "LONG" | "SHORT",
+    expectedContracts: string, entryPositionVerified: boolean, reason: string): Promise<void> {
+    const store = this.d.store;
+    if (!entryPositionVerified) {
+      logSystemEvent(store, "RISK_EVENT", { protection_recovery: "SKIPPED_POSITION_READBACK_UNVERIFIED", tradeId,
+        instrument, reason, newEntriesHalted: true });
+      return;
+    }
+    try {
+      const positions = (await getPositions(this.d.client, instrument)).filter((position) => Number(position.pos) > 0);
+      const matching = positions.filter((position) => position.instId === instrument && position.posSide === side.toLowerCase());
+      const opposite = positions.some((position) => position.instId === instrument && position.posSide !== side.toLowerCase());
+      if (opposite || matching.length > 1) {
+        logSystemEvent(store, "RISK_EVENT", { protection_recovery: "SKIPPED_POSITION_MISMATCH", tradeId, instrument,
+          reason, livePositions: positions.length, newEntriesHalted: true });
+        return;
+      }
+      const position = matching[0];
+      if (!position) {
+        logSystemEvent(store, "RISK_EVENT", { protection_recovery: "NO_MATCHING_LIVE_POSITION", tradeId, instrument,
+          reason, accountingReconciliationRequired: true, newEntriesHalted: true });
+        return;
+      }
+      const liveContracts = Number(position.pos), expected = Number(expectedContracts);
+      if (!Number.isFinite(liveContracts) || liveContracts <= 0 || !Number.isFinite(expected) || expected <= 0
+        || liveContracts > expected + Math.max(1e-9, expected * 1e-8)) {
+        logSystemEvent(store, "RISK_EVENT", { protection_recovery: "SKIPPED_QUANTITY_MISMATCH", tradeId, instrument,
+          reason, expectedContracts, liveContracts: Number.isFinite(liveContracts) ? liveContracts : null, newEntriesHalted: true });
+        return;
+      }
+      const trade = store.db.prepare("SELECT * FROM trades WHERE trade_id=? AND status='OPEN'").get(tradeId) as Record<string, unknown> | undefined;
+      if (!trade) return;
+      await closeTradeOnExchange(this.depsFor(), trade, position, "PROTECTION_RECOVERY");
+      logSystemEvent(store, "RISK_EVENT", { protection_recovery: "RISK_REDUCING_CLOSE_SUBMITTED_AND_CONFIRMED", tradeId,
+        instrument, reason, liveContracts, newEntriesHalted: true });
+    } catch (error) {
+      logSystemEvent(store, "RISK_EVENT", { protection_recovery: "CLOSE_UNCONFIRMED", tradeId, instrument, reason,
+        error: error instanceof Error ? error.message.slice(0, 180) : "UNKNOWN", newEntriesHalted: true });
+      log.error({ event: "scalp_unprotected_entry_recovery_unconfirmed", tradeId, instrument,
+        error: error instanceof Error ? error.message.slice(0, 120) : "UNKNOWN" });
+    }
   }
 
   // small helper so sweep can call executor with the same deps shape

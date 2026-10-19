@@ -1,5 +1,5 @@
 import type { Candle } from "../exchange/okx/types.ts";
-import { detectMarketStructure, type ConfirmedPivot } from "./market-structure.ts";
+import { detectMarketStructure, normalizeConfirmedCandles, type ConfirmedPivot } from "./market-structure.ts";
 
 export interface PriceZone {
   kind: "SUPPORT" | "RESISTANCE";
@@ -9,11 +9,13 @@ export interface PriceZone {
   touches: number;
   firstTouchedAt: number;
   lastTouchedAt: number;
+  firstConfirmedAt: number;
+  lastConfirmedAt: number;
   ageBars: number;
   confirmed: true;
   broken: boolean;
   rejectionStrength: number;
-  algorithmVersion: "zones-v1";
+  algorithmVersion: "zones-v2";
 }
 
 export interface SupportResistanceOptions {
@@ -35,7 +37,7 @@ export interface SupportResistanceSnapshot {
   nearestSupport: PriceZone | null;
   nearestResistance: PriceZone | null;
   positionInRange: number | null;
-  algorithmVersion: "zones-v1";
+  algorithmVersion: "zones-v2";
 }
 
 /** Cluster only confirmed pivots; separated pivot confirmations are counted as
@@ -44,7 +46,7 @@ export interface SupportResistanceSnapshot {
 export function detectSupportResistance(instrument: string, timeframe: string, input: readonly Candle[], atr: number,
   options: SupportResistanceOptions = {}): SupportResistanceSnapshot {
   if (!Number.isFinite(atr) || atr <= 0) throw new Error("support/resistance requires positive finite ATR");
-  const candles = input.filter((c) => c.confirm === "1").slice().sort((a, b) => a.ts - b.ts);
+  const candles = normalizeConfirmedCandles(input);
   const lookback = options.lookbackBars ?? 120;
   const toleranceAtr = options.toleranceAtr ?? 0.25;
   const separation = options.minTouchSeparationBars ?? 3;
@@ -77,9 +79,10 @@ export function detectSupportResistance(instrument: string, timeframe: string, i
     const broken = Boolean(latest && (group.kind === "RESISTANCE" ? latest.c > high : latest.c < low));
     return { kind: group.kind, low, high, center, touches: group.points.length,
       firstTouchedAt: group.points[0]!.pivot.ts, lastTouchedAt: group.points.at(-1)!.pivot.ts,
+      firstConfirmedAt: group.points[0]!.pivot.confirmedAt, lastConfirmedAt: group.points.at(-1)!.pivot.confirmedAt,
       ageBars: latest ? selected.length - 1 - (indexByTs.get(group.points.at(-1)!.pivot.ts) ?? selected.length - 1) : 0,
       confirmed: true as const, broken, rejectionStrength: round(group.points.reduce((sum, point) => sum + point.rejection, 0) / group.points.length),
-      algorithmVersion: "zones-v1" as const };
+      algorithmVersion: "zones-v2" as const };
   }).sort((a, b) => a.center - b.center || a.kind.localeCompare(b.kind));
   const price = latest?.c ?? NaN;
   const support = zones.filter((zone) => zone.kind === "SUPPORT");
@@ -89,7 +92,7 @@ export function detectSupportResistance(instrument: string, timeframe: string, i
   const positionInRange = nearestSupport && nearestResistance && nearestResistance.center > nearestSupport.center
     ? round(Math.max(0, Math.min(1, (price - nearestSupport.center) / (nearestResistance.center - nearestSupport.center)))) : null;
   return { instrument, timeframe, evaluatedAt: latest?.ts ?? null, atr, zones, support, resistance,
-    nearestSupport, nearestResistance, positionInRange, algorithmVersion: "zones-v1" };
+    nearestSupport, nearestResistance, positionInRange, algorithmVersion: "zones-v2" };
 }
 
 function round(value: number): number { return Math.round(value * 1e6) / 1e6; }

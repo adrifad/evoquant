@@ -12,6 +12,7 @@ const fields = [
   ["max_daily_loss_pct", "Daily loss limit", "%", 0.1],
   ["max_drawdown_pct", "Maximum drawdown", "%", 0.1],
 ] as const;
+const positionFields = new Set(["risk_per_trade_pct", "max_concurrent_positions", "max_leverage"]);
 
 export function RiskSettings({ equity, positions, onSaved }: { equity: unknown; positions: Row[]; onSaved: () => Promise<void> }) {
   const api = useApi<Row>("/api/risk", 30_000);
@@ -49,9 +50,12 @@ export function RiskSettings({ equity, positions, onSaved }: { equity: unknown; 
   const discrepancies = positions.filter(p => Number(p.actual_leverage) > Number(current.max_leverage));
   return <DataState loading={api.loading} error={api.error} empty={!api.data} hasData={Boolean(api.data)} emptyTitle="Risk configuration unavailable">
     <div className="risk-editor">
-      <Panel title="Trading risk" subtitle="Operational settings, enforced below absolute safety ceilings">
+      <Panel title="Operational risk settings" subtitle="Editable limits below fixed server-side safety ceilings">
         <form className="risk-form" onSubmit={event => void save(event)}>
-          {fields.map(([key, label, unit, step]) => <label className="risk-form-row" key={key}><span>{label}</span><input type="number" required min={step} max={Number(ceilings[key])} step={step} value={values[key] ?? ""} onChange={e => change(key, e.target.value)} disabled={saving}/><small>{unit} · ceiling {asText(ceilings[key])}</small></label>)}
+          <h3 className="risk-form-group-title">Position limits</h3>
+          {fields.filter(([key]) => positionFields.has(key)).map(([key, label, unit, step]) => <label className="risk-form-row" key={key}><span>{label}</span><input aria-label={label} type="number" required min={step} max={Number(ceilings[key])} step={step} value={values[key] ?? ""} onChange={e => change(key, e.target.value)} disabled={saving}/><small>{unit} · absolute ceiling {asText(ceilings[key])}</small></label>)}
+          <h3 className="risk-form-group-title">Account protection</h3>
+          {fields.filter(([key]) => !positionFields.has(key)).map(([key, label, unit, step]) => <label className="risk-form-row" key={key}><span>{label}</span><input aria-label={label} type="number" required min={step} max={Number(ceilings[key])} step={step} value={values[key] ?? ""} onChange={e => change(key, e.target.value)} disabled={saving}/><small>{unit} · absolute ceiling {asText(ceilings[key])}</small></label>)}
           {eq !== null && eq > 0 && Number(values.risk_per_trade_pct) > 0 ? <div className="risk-preview">Maximum planned loss per new trade at {formatAmount(eq)} equity: <strong>{formatAmount(eq * Number(current.risk_per_trade_pct) / 100)}</strong> to <strong>{formatAmount(eq * Number(values.risk_per_trade_pct) / 100)}</strong>. Actual sizing may use less.</div> : null}
           {Number(values.risk_per_trade_pct) > Number(values.max_portfolio_open_risk_pct) ? <p className="inline-warning">Configured per-trade risk exceeds the portfolio open-risk limit. The deterministic portfolio gate can reject a new entry even when its individual trade limit is valid.</p> : null}
           {staleDraft ? <p className="inline-warning">Settings changed while editing. Reload before saving.</p> : null}

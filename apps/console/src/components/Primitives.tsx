@@ -120,11 +120,14 @@ function toneClass(tone: string): string {
 
 function statusTone(value: string): string {
   const status = value.toUpperCase();
-  if (["AVAILABLE", "SUCCESS"].includes(status)) return "positive";
+  if (["AVAILABLE", "SUCCESS", "HEALTHY", "CURRENT", "VERIFIED_OR_FLAT"].includes(status)) return "positive";
+  if (["STALE", "INSUFFICIENT_DATA", "DEGRADED", "WARNING"].includes(status)) return "warning";
+  if (["FAILED", "UNVERIFIED", "UNEXPECTED_EXPOSURE"].includes(status)) return "critical";
   if (["BUDGET_EXHAUSTED", "UNCONFIGURED", "DISABLED"].includes(status)) return status === "BUDGET_EXHAUSTED" ? "warning" : "neutral";
   if (["RUNNING", "APPROVED", "CHAMPION", "VERIFIED", "PROMOTED", "SAFE", "LONG", "WIN"].includes(status)) return status === "LONG" ? "long" : "positive";
-  if (["RISK_HALTED", "ERROR", "REJECTED", "HALTED", "LOSS", "SHORT", "DISCONNECTED"].includes(status)) return status === "SHORT" ? "short" : "critical";
+  if (["RISK_HALTED", "ERROR", "REJECTED", "HALTED", "LOSS", "SHORT", "DISCONNECTED", "CRITICAL"].includes(status)) return status === "SHORT" ? "short" : "critical";
   if (["PAUSED", "WARNING", "CHALLENGER", "PROVISIONAL", "REINFORCED", "TESTING"].includes(status)) return "warning";
-  if (["CONNECTED", "DEMO", "OKX"].includes(status)) return "info";
+  if (["INFO"].includes(status)) return "info";
+  if (["CONNECTED", "DEMO", "OKX", "READY_FOR_PRECHECK"].includes(status)) return "info";
   return "neutral";
 }

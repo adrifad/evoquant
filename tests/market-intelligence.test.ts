@@ -34,7 +34,53 @@ test("market structure identifies higher highs/lows and produces stable confirme
   assert.ok(full.events.some((event) => event.kind === "HH"));
   assert.ok(full.events.some((event) => event.kind === "HL"));
   assert.deepEqual(full.pivots.filter((event) => event.confirmedAt < 8), partial.pivots.filter((event) => event.confirmedAt < 8));
-  assert.equal(full.algorithmVersion, "structure-v1");
+  assert.equal(full.algorithmVersion, "structure-v2");
+});
+
+test("historical market-structure breaks retain chronological bias as future candles are appended", () => {
+  const bars = [
+    candle(0, 5, 6, 4, 5), candle(1, 5, 8, 4, 7), candle(2, 6, 7, 3, 5),
+    candle(3, 5, 6, 4, 5), candle(4, 6, 9, 5, 8), candle(5, 7, 8, 4, 6),
+    candle(6, 6, 7, 5, 6), candle(7, 7, 10, 6, 9), candle(8, 8, 9, 5, 7),
+    candle(9, 7, 8, 3, 4), candle(10, 4, 6, 2, 3), candle(11, 3, 5, 1, 2),
+    candle(12, 2, 7, 2, 6), candle(13, 6, 8, 5, 7), candle(14, 7, 9, 6, 8),
+  ];
+  const options = { leftBars: 1, rightBars: 1 };
+  const prefix = detectMarketStructure("ETH-USDT-SWAP", "15m", bars.slice(0, 10), options);
+  const extended = detectMarketStructure("ETH-USDT-SWAP", "15m", bars, options);
+  const prefixBreaks = prefix.events.filter((item) => item.kind === "BREAK_OF_STRUCTURE" || item.kind === "CHANGE_OF_CHARACTER");
+  const extendedBreaks = extended.events.filter((item) => (item.kind === "BREAK_OF_STRUCTURE" || item.kind === "CHANGE_OF_CHARACTER")
+    && item.confirmedAt <= 9);
+  assert.deepEqual(extendedBreaks, prefixBreaks);
+  assert.ok(prefixBreaks.every((item) => item.breakConfirmedAt === item.confirmedAt
+    && item.sourcePivotConfirmedAt < item.breakConfirmedAt && item.biasBeforeBreak && item.biasAfterBreak && item.brokenLevel === item.price));
+});
+
+test("structure candles are timestamp-ordered, duplicate-safe, and conflicting duplicate timestamps are excluded", () => {
+  const bars = [candle(2, 4, 8, 3, 6), candle(0, 3, 4, 2, 3), candle(1, 3, 5, 2, 4),
+    candle(1, 3, 5.5, 2, 4), candle(3, 5, 6, 2, 4), candle(4, 4, 5, 1, 3)];
+  const result = detectMarketStructure("BTC-USDT-SWAP", "5m", bars, { leftBars: 1, rightBars: 1 });
+  assert.deepEqual(result.pivots.map((point) => point.ts), [2]);
+  const exactDuplicates = detectMarketStructure("BTC-USDT-SWAP", "5m", [...bars.filter((bar) => bar.ts !== 1), bars[2]!], { leftBars: 1, rightBars: 1 });
+  assert.deepEqual(exactDuplicates.pivots.map((point) => point.ts), [2]);
+});
+
+test("BOS and CHOCH are classified using the bias known at each confirmed break", () => {
+  const bars = [candle(0, 5, 6, 4, 5), candle(1, 7, 10, 6, 8), candle(2, 6, 8, 4, 5),
+    candle(3, 7, 9, 6, 8), candle(4, 6, 8, 5, 6), candle(5, 9, 11, 7, 10),
+    candle(6, 7, 9, 6, 7), candle(7, 10, 12, 8, 11), candle(8, 9, 10, 7, 9),
+    candle(9, 12, 14, 9, 13), candle(10, 6, 13, 4, 5)];
+  const result = detectMarketStructure("BTC-USDT-SWAP", "5m", bars, { leftBars: 1, rightBars: 1 });
+  const bos = result.events.find((item) => item.kind === "BREAK_OF_STRUCTURE" && item.confirmedAt === 9);
+  const choch = result.events.find((item) => item.kind === "CHANGE_OF_CHARACTER");
+  assert.equal(bos?.direction, "BULLISH");
+  assert.equal(bos?.biasBeforeBreak, "BULLISH");
+  assert.equal(bos?.biasAfterBreak, "BULLISH");
+  assert.equal(bos?.breakConfirmedAt, 9);
+  assert.equal(choch?.direction, "BEARISH");
+  assert.equal(choch?.biasBeforeBreak, "BULLISH");
+  assert.equal(choch?.biasAfterBreak, "BEARISH");
+  assert.equal(choch?.breakConfirmedAt, 10);
 });
 
 test("support/resistance counts distinct pivot reactions rather than repeated overlapping bars", () => {
@@ -60,7 +106,29 @@ test("structural range requires duration, two distinct boundaries, sufficient wi
   const breakout = [...bars.slice(0, -1), candle(20, 108, 110, 107, 109)];
   const invalidated = assessStructuralRange("BTC-USDT-SWAP", "15m", breakout, 2, { lookbackBars: 20, minDurationBars: 12,
     minBoundaryTouches: 2, toleranceAtr: 0.5, minWidthAtr: 2, maxWidthAtr: 6, pivotLeftBars: 1, pivotRightBars: 1 });
-  assert.equal(invalidated.state, "TRANSITION");
+  assert.equal(invalidated.state, "TRANSITION", JSON.stringify(invalidated));
+  const downside = [...bars.slice(0, -1), candle(20, 93, 94, 89, 90)];
+  assert.equal(assessStructuralRange("BTC-USDT-SWAP", "15m", downside, 2, { lookbackBars: 20,
+    minDurationBars: 12, minBoundaryTouches: 2, toleranceAtr: 0.5, minWidthAtr: 2, maxWidthAtr: 6,
+    pivotLeftBars: 1, pivotRightBars: 1 }).state, "TRANSITION");
+  const failedBreakout = [...bars.slice(0, -1), candle(20, 108, 110, 107, 109), candle(21, 105, 106, 103, 105)];
+  const returned = assessStructuralRange("BTC-USDT-SWAP", "15m", failedBreakout, 2, { lookbackBars: 20,
+    minDurationBars: 12, minBoundaryTouches: 2, toleranceAtr: 0.5, minWidthAtr: 2, maxWidthAtr: 6,
+    pivotLeftBars: 1, pivotRightBars: 1 });
+  assert.notEqual(returned.state, "TRANSITION", "a close back inside the same active pair is no longer a live boundary break");
+});
+
+test("structural range ignores an older unrelated resistance when selecting the current active pair", () => {
+  const closes = [90, 85, 90, 85, 90, 85, 90, 85, 90, 85,
+    105, 110, 105, 100, 105, 110, 105, 100, 105, 110, 105, 100, 105, 110, 105, 100, 105, 110, 105, 100, 105, 110, 105, 100, 105, 105];
+  const bars = closes.map((close, index) => candle(index, close, close + 0.1, close - 0.1, close));
+  const result = assessStructuralRange("BTC-USDT-SWAP", "15m", bars, 1, { lookbackBars: 40,
+    minDurationBars: 8, minBoundaryTouches: 2, toleranceAtr: 0.4, minWidthAtr: 3, maxWidthAtr: 15,
+    pivotLeftBars: 1, pivotRightBars: 1 });
+  assert.notEqual(result.breakoutDirection, "UP");
+  assert.notEqual(result.state, "TRANSITION");
+  assert.ok((result.support?.center ?? 0) >= 99);
+  assert.ok((result.resistance?.center ?? Infinity) <= 111);
 });
 
 test("price action describes confirmed candle rejection and does not declare an entry", () => {
@@ -78,9 +146,28 @@ test("market intelligence is timestamp-bounded and excludes the latest unconfirm
     return candle(i, center - 0.2, center + 0.5, center - 0.5, center);
   });
   bars.push(candle(80, 109, 111, 108, 110, "0"));
-  const result = buildMarketIntelligence("BTC-USDT-SWAP", "15m", bars);
+  const result = buildMarketIntelligence("BTC-USDT-SWAP", "15m", bars, 79 + 15 * 60_000 + 60_000);
   assert.equal(result.status, "AVAILABLE");
   assert.equal(result.candleCount, 80);
   assert.equal(result.evaluatedAt, 79);
   if (result.status === "AVAILABLE") assert.notEqual(result.features.price, 110);
+  assert.equal(result.freshness.status, "CURRENT");
+  assert.equal(result.freshness.lastConfirmedCandleAt, 79);
+  assert.equal(result.freshness.dataSource, "PERSISTED_CONFIRMED_CANDLES");
+});
+
+test("market intelligence freshness distinguishes stale, insufficient, and unavailable history", () => {
+  const fresh = Array.from({ length: 60 }, (_, i) => candle(i * 300_000, 100, 101, 99, 100));
+  assert.equal(buildMarketIntelligence("BTC-USDT-SWAP", "5m", fresh, 60 * 300_000).freshness.status, "CURRENT");
+  assert.equal(buildMarketIntelligence("BTC-USDT-SWAP", "5m", fresh, 59 * 300_000 + 390_000).freshness.status, "CURRENT",
+    "freshness allows one candle interval plus the documented 90s publication grace from candle open");
+  assert.equal(buildMarketIntelligence("BTC-USDT-SWAP", "5m", fresh, 59 * 300_000 + 390_001).freshness.status, "STALE");
+  assert.equal(buildMarketIntelligence("BTC-USDT-SWAP", "5m", fresh, 70 * 300_000).freshness.status, "STALE");
+  const insufficient = buildMarketIntelligence("BTC-USDT-SWAP", "5m", fresh.slice(0, 4), 4 * 300_000).freshness;
+  assert.equal(insufficient.status, "INSUFFICIENT_DATA");
+  assert.equal(insufficient.dataSufficient, false);
+  const staleInsufficient = buildMarketIntelligence("BTC-USDT-SWAP", "5m", fresh.slice(0, 4), 10 * 300_000).freshness;
+  assert.equal(staleInsufficient.status, "STALE", "staleness must not be hidden by a short history");
+  assert.equal(staleInsufficient.dataSufficient, false);
+  assert.equal(buildMarketIntelligence("BTC-USDT-SWAP", "5m", [], 0).freshness.status, "UNAVAILABLE");
 });

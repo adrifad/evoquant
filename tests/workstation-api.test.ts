@@ -226,11 +226,15 @@ test("market intelligence API is read-only and explicit when persisted confirmed
   const f = await fixture(t);
   const response = await f.request(`/api/market-intelligence?instId=${symbol}&bar=15m`);
   assert.equal(response.status, 200);
-  const payload = await json<{ status: string; candleCount: number; marketRegime: string; range: unknown }>(response);
+  const payload = await json<{ status: string; candleCount: number; marketRegime: string; range: unknown;
+    freshness: { status: string; lastConfirmedCandleAt: number | null; evaluatedAt: number; ageMs: number | null; dataSource: string } }>(response);
   assert.equal(payload.status, "INSUFFICIENT_CONFIRMED_DATA");
   assert.equal(payload.candleCount, 0);
   assert.equal(payload.marketRegime, "UNKNOWN");
   assert.equal(payload.range, null);
+  assert.equal(payload.freshness.status, "UNAVAILABLE");
+  assert.equal(payload.freshness.lastConfirmedCandleAt, null);
+  assert.equal(payload.freshness.dataSource, "PERSISTED_CONFIRMED_CANDLES");
   assert.equal(f.exchangeRequests(), 0, "diagnostics must not fetch live or substitute missing history");
   assert.equal((await f.request(`/api/market-intelligence?instId=${symbol}&bar=3m`)).status, 400);
   assert.equal((await f.request(`/api/market-intelligence?instId=${symbol}&bar=15m`, { method: "POST" })).status, 405);
