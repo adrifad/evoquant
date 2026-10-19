@@ -31,3 +31,17 @@ breakout_retest_v1:
   stop_atr: 1.3
   target_r: 2.1
   max_hold_bars: 24
+
+# Structural range mean reversion is research-only and is not linked to live entries.
+range_mean_reversion_v1:
+  lookback_bars: 80
+  min_duration_bars: 20
+  min_boundary_touches: 2
+  tolerance_atr: 0.25
+  min_width_atr: 3
+  max_width_atr: 12
+  boundary_position_max: 0.2
+  rejection_wick_to_body: 2
+  stop_buffer_atr: 0.25
+  minimum_net_reward_risk: 1.25
+  max_hold_bars: 24
