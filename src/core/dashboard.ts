@@ -40,6 +40,7 @@ import { DynamicWatchlistError, type WatchlistProjection } from "../market/dynam
 import { getOpportunityFunnel, getRecentCandidateAttempts } from "../market/opportunity-funnel.ts";
 import { buildLossAttribution } from "../memory/loss-attribution.ts";
 import type { PositionMonitorEngine, PositionMonitorStatus } from "./monitor-health.ts";
+import { buildMarketIntelligence } from "../market/intelligence.ts";
 
 const log = createLogger("dashboard");
 const REPO_ROOT = path.resolve(import.meta.dirname, "../..");
@@ -349,6 +350,21 @@ export function startDashboard(cfg: DashboardConfig): DashboardServer {
         } catch { if (!rows.length) return send(503, { error: "Market candles unavailable. Retry after the exchange feed recovers." }); }
       }
       return send(200, rows.reverse()); // chronological for the chart
+    }
+    if (p === "/api/market-intelligence") {
+      if (method !== "GET") return send(405, { error: "Method not allowed." });
+      const inst = url.searchParams.get("instId") || cfg.trading.instrument.id;
+      const bar = url.searchParams.get("bar") ?? cfg.trading.timeframe;
+      if (!["1m", "5m", "15m", "1H"].includes(bar) || !cfg.deps().watchlist.includes(inst)) {
+        return send(400, { error: "Unsupported instrument or timeframe." });
+      }
+      // Diagnostic features use only persisted confirmed bars; no network
+      // fallback can make stale or unavailable history look current.
+      const rows = store.db.prepare(`SELECT ts,o,h,l,c,vol,volCcy,confirm FROM candles
+        WHERE instId=? AND bar=? AND confirm='1' ORDER BY ts DESC LIMIT 400`).all(inst, bar) as Array<Record<string, unknown>>;
+      const candles = rows.reverse().map((row) => ({ ts: Number(row.ts), o: Number(row.o), h: Number(row.h), l: Number(row.l),
+        c: Number(row.c), vol: Number(row.vol), volCcy: Number(row.volCcy), confirm: "1" as const }));
+      return send(200, buildMarketIntelligence(inst, bar, candles));
     }
     if (p === "/api/scan") {
       return send(200, scannerProjection(store, cfg.getScan() as ScanRow[], cfg.getLastTick()?.at ?? null, cfg.deps().watchlist));

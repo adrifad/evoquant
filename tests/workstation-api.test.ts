@@ -222,6 +222,20 @@ test("candles remain isolated by instrument and timeframe, bounded and explicit 
   }
 });
 
+test("market intelligence API is read-only and explicit when persisted confirmed history is insufficient", async t => {
+  const f = await fixture(t);
+  const response = await f.request(`/api/market-intelligence?instId=${symbol}&bar=15m`);
+  assert.equal(response.status, 200);
+  const payload = await json<{ status: string; candleCount: number; marketRegime: string; range: unknown }>(response);
+  assert.equal(payload.status, "INSUFFICIENT_CONFIRMED_DATA");
+  assert.equal(payload.candleCount, 0);
+  assert.equal(payload.marketRegime, "UNKNOWN");
+  assert.equal(payload.range, null);
+  assert.equal(f.exchangeRequests(), 0, "diagnostics must not fetch live or substitute missing history");
+  assert.equal((await f.request(`/api/market-intelligence?instId=${symbol}&bar=3m`)).status, 400);
+  assert.equal((await f.request(`/api/market-intelligence?instId=${symbol}&bar=15m`, { method: "POST" })).status, 405);
+});
+
 test("proposal context survives shadow and atomic promotion, and family API retains provenance", async t => {
   const f = await fixture(t);
   const proposal = { evidenceCutoffTs: "2026-01-01T00:00:00.000Z", sample: 31, criticVerdict: "ACCEPT", criticModel: "fixture-critic", evolutionModel: "fixture-evolution" };

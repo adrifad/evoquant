@@ -11,10 +11,16 @@ export function MarketsPage({ status }: { status: ApiState<Row> }) {
   const funnel = useApi<unknown>("/api/opportunity-funnel?hours=24", 60_000);
   const [selected, setSelected] = useState("");
   const d = asRow(market.data);
+  const instrument = selected || asText(status.data?.instrument);
+  const intelligence = useApi<unknown>(`/api/market-intelligence?instId=${encodeURIComponent(instrument)}&bar=15m`, 60_000);
+  const intelligenceRow = asRow(intelligence.data);
+  const structure = asRow(intelligenceRow?.structure);
+  const range = asRow(intelligenceRow?.range);
+  const zones = asRow(intelligenceRow?.supportResistance);
+  const priceAction = asRow(intelligenceRow?.priceAction);
   const snapshot = asRow(d?.snapshot);
   const scanner = asRows(d?.scan);
   const weights = asRow(d?.weights) ?? {};
-  const instrument = selected || asText(status.data?.instrument);
   const selectedRow = scanner.find(row => row.instrument === instrument);
   const wl = asRow(watchlist.data);
   const watchlistConfig = asRow(wl?.config) ?? {};
@@ -133,6 +139,30 @@ export function MarketsPage({ status }: { status: ApiState<Row> }) {
         </Panel>
       </div>
     </DataState>
+    <Panel title="Market intelligence" subtitle={`${instrument} · deterministic context from persisted confirmed 15m candles`}>
+      <DataState loading={intelligence.loading} error={intelligence.error} empty={!intelligence.data} hasData={intelligence.data !== null}
+        emptyTitle="Structural context unavailable" emptyDetail="No persisted confirmed candle history is available for this instrument.">
+        {asText(intelligenceRow?.status) === "INSUFFICIENT_CONFIRMED_DATA" ?
+          <div className="empty-state"><strong>Insufficient confirmed history</strong><span>{formatNumber(intelligenceRow?.candleCount, 0)} candles · no structural conclusion reported.</span></div> :
+          <div className="feature-groups">
+            <section><DividerLabel>Structure</DividerLabel><Field label="Bias" value={asText(structure?.bias, "UNKNOWN")}/>
+              <Field label="Confirmed pivots" value={formatNumber(asRows(structure?.pivots).length, 0)}/>
+              <Field label="Recent events" value={asRows(structure?.events).slice(-3).map(event => asText(asRow(event)?.kind)).join(" · ") || "None"}/>
+              <Field label="Invalidation level" value={formatPrice(structure?.invalidationLevel)}/></section>
+            <section><DividerLabel>Range</DividerLabel><Field label="Assessment" value={asText(range?.state, "UNKNOWN")}/>
+              <Field label="Reason" value={asText(range?.reason, "Unavailable")}/>
+              <Field label="Boundaries" value={range && range.low !== null && range.high !== null ? `${formatPrice(range.low)} – ${formatPrice(range.high)}` : "Unavailable"}/>
+              <Field label="Position in range" value={range?.positionInRange == null ? "Unavailable" : formatNumber(range.positionInRange, 2)}/></section>
+            <section><DividerLabel>Nearby zones</DividerLabel><Field label="Support" value={formatPrice(asRow(zones?.nearestSupport)?.center)}/>
+              <Field label="Resistance" value={formatPrice(asRow(zones?.nearestResistance)?.center)}/>
+              <Field label="Zone count" value={formatNumber(asRows(zones?.zones).length, 0)}/></section>
+            <section><DividerLabel>Price action</DividerLabel><Field label="Regime" value={asText(intelligenceRow?.marketRegime, "UNKNOWN")}/>
+              <Field label="Rejection" value={asText(priceAction?.rejection, "Unavailable")}/>
+              <Field label="Breakout / false break" value={`${asText(priceAction?.breakout, "—")} / ${asText(priceAction?.falseBreakout, "—")}`}/>
+              <p className="muted-small">Descriptive research features only; they do not authorize entries.</p></section>
+          </div>}
+      </DataState>
+    </Panel>
   </div>;
 }
 
