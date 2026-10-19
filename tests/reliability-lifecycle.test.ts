@@ -12,7 +12,7 @@ import { startDashboard } from "../src/core/dashboard.ts";
 import type { AddressInfo } from "node:net";
 import { SCALP_DEFAULTS } from "../src/scalp/signals.ts";
 import { loadRiskConfig, loadTradingConfig } from "../src/core/config.ts";
-import { PositionMonitorHealthTracker } from "../src/core/monitor-health.ts";
+import { classifyPositionOwnership, PositionMonitorHealthTracker } from "../src/core/monitor-health.ts";
 
 const instrument = "BTC-USDT-SWAP";
 const meta = { instId: instrument, tickSz: "0.1", lotSz: "1", minSz: "1", ctVal: "1", ctValCcy: "USDT" };
@@ -128,6 +128,40 @@ test("Scalp Layer B monitors without opening when there are no live Scalp positi
   const runner = new ScalpRunner(deps);
   await (runner as unknown as { sweep(): Promise<void> }).sweep();
   assert.equal(requests, 0);
+});
+
+test("monitor ownership distinguishes a valid Scalp position from an orphan Swing position", () => {
+  const exchangePosition = { instId: instrument, posSide: "long" };
+  const scalpTrade = { trade_id: "SCP-OWNED", instrument, side: "LONG", engine: "SCALP_5M", status: "OPEN" };
+  assert.equal(classifyPositionOwnership(exchangePosition, [scalpTrade], "SWING_15M"), "OWNED_BY_OTHER_ENGINE");
+  assert.equal(classifyPositionOwnership(exchangePosition, [scalpTrade], "SCALP_5M"), "OWNED_BY_ENGINE");
+  assert.equal(classifyPositionOwnership(exchangePosition, [], "SWING_15M"), "ORPHAN");
+  assert.equal(classifyPositionOwnership(exchangePosition, [scalpTrade, { ...scalpTrade, trade_id: "DUPLICATE", engine: "SWING_15M" }], "SWING_15M"),
+    "OWNERSHIP_CONFLICT");
+});
+
+test("Scalp monitoring marks degraded health when protection and instrument metadata are unavailable", async (t) => {
+  const store = storeFor(t);
+  const now = new Date().toISOString();
+  store.db.prepare(`INSERT INTO trades(trade_id,engine,status,instrument,timeframe,side,strategy,strategy_version,regime,contracts,
+    entry_px,entry_ts,stop_px,initial_stop_px,take_profit_px,ord_open_id,protection_state)
+    VALUES('SCP-MONITOR-DEGRADED','SCALP_5M','OPEN',?,'scalp','LONG','SCALP',1,'TRENDING_BULLISH','1',100,?,95,95,110,'OPEN-1','UNVERIFIED')`)
+    .run(instrument, now);
+  const position = { instId: instrument, posSide: "long", pos: "1", avgPx: "100", markPx: "100", lever: "2", mgnMode: "isolated" };
+  const client = { get: async (endpoint: string) => {
+    if (endpoint === "/api/v5/account/positions") return [position];
+    if (endpoint === "/api/v5/trade/orders-algo-pending") return [];
+    throw new Error(`unexpected mock GET ${endpoint}`);
+  } };
+  const monitorHealth = new PositionMonitorHealthTracker();
+  const trading = loadTradingConfig();
+  const runner = new ScalpRunner({ client, store, trading, risk: loadRiskConfig(), instruments: {},
+    cfg: { ...SCALP_DEFAULTS, watchlist: [instrument] }, llm: {} as never, monitorHealth } as unknown as ScalpDeps);
+  await (runner as unknown as { sweep(): Promise<void> }).sweep();
+  const status = monitorHealth.snapshot({ SWING_15M: false, SCALP_5M: true }).SCALP_5M;
+  assert.equal(status.health, "DEGRADED");
+  assert.equal(status.consecutiveFailures, 1);
+  assert.match(status.lastError ?? "", /metadata unavailable|protection verification failed/i);
 });
 
 test("disabled Scalp entry engine does not call stance or candidate LLM and leaves monitor callable", async (t) => {

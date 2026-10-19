@@ -4,8 +4,8 @@ import { calculateSlPlusStop } from "../execution/sl-plus.ts";
 import { summarize, type PerfSummary } from "./performance.ts";
 import { calculateExecutionCostR, DEFAULT_V2_COSTS, type V2CostModel } from "./backtest.ts";
 import {
-  DEFAULT_BREAKOUT_RETEST_V1, DEFAULT_TREND_PULLBACK_V1, evaluateBreakoutRetestV1,
-  evaluateTrendPullbackV1, type ResearchStrategyConfig, type ResearchStrategyId,
+  DEFAULT_BREAKOUT_RETEST_V1, DEFAULT_RANGE_MEAN_REVERSION_V1, DEFAULT_TREND_PULLBACK_V1, evaluateBreakoutRetestV1,
+  evaluateRangeMeanReversionV1, evaluateTrendPullbackV1, type ResearchStrategyConfig, type ResearchStrategyId,
 } from "../strategy/research-v1.ts";
 
 export interface ResearchTrade {
@@ -33,25 +33,31 @@ export interface ResearchValidationResult {
 
 export function backtestResearchV1(strategy: ResearchStrategyId, instrument: string, input: Candle[],
   costs: V2CostModel = DEFAULT_V2_COSTS, signalStartTs = -Infinity,
-  params: ResearchStrategyConfig = { trend_pullback_v1: DEFAULT_TREND_PULLBACK_V1, breakout_retest_v1: DEFAULT_BREAKOUT_RETEST_V1 }): ResearchBacktestResult {
+  params: ResearchStrategyConfig = { trend_pullback_v1: DEFAULT_TREND_PULLBACK_V1, breakout_retest_v1: DEFAULT_BREAKOUT_RETEST_V1,
+    range_mean_reversion_v1: DEFAULT_RANGE_MEAN_REVERSION_V1 }): ResearchBacktestResult {
   const candles = input.filter(c => c.confirm === "1").slice().sort((a, b) => a.ts - b.ts);
   const trades: ResearchTrade[] = [];
   let i = 59;
   while (i < candles.length - 1) {
     const prefix = candles.slice(0, i + 1);
     const f = buildFeatures(instrument, prefix.slice().reverse());
-    const evaluation = strategy === "TREND_PULLBACK_V1"
-      ? evaluateTrendPullbackV1(f, prefix, params.trend_pullback_v1)
-      : evaluateBreakoutRetestV1(f, prefix, params.breakout_retest_v1);
+    const roundTripCostPct = costs.entryFeePct + costs.exitFeePct + 2 * (costs.slippageBps + costs.spreadBps) / 100;
+    const evaluation = strategy === "TREND_PULLBACK_V1" ? evaluateTrendPullbackV1(f, prefix, params.trend_pullback_v1)
+      : strategy === "BREAKOUT_RETEST_V1" ? evaluateBreakoutRetestV1(f, prefix, params.breakout_retest_v1)
+        : evaluateRangeMeanReversionV1(f, prefix, roundTripCostPct, params.range_mean_reversion_v1);
     const candidate = evaluation.candidate;
     if (!candidate || f.ts < signalStartTs) { i++; continue; }
     const entryBar = candles[i + 1]!;
     const entryPrice = entryBar.o;
-    const riskDistance = candidate.stopAtr * f.atr14;
-    if (!(entryPrice > 0 && riskDistance > 0)) { i++; continue; }
     const sign = candidate.side === "LONG" ? 1 : -1;
-    const initialStop = entryPrice - sign * riskDistance;
-    const target = entryPrice + sign * riskDistance * candidate.targetR;
+    // Preserve candidate geometry at the next executable open. A gap through
+    // either exit invalidates the setup instead of silently rebuilding it.
+    const initialStop = candidate.stopPrice;
+    const target = candidate.takeProfitPrice;
+    const riskDistance = Math.abs(entryPrice - initialStop);
+    const validGeometry = entryPrice > 0 && riskDistance > 0 && Number.isFinite(target)
+      && (candidate.side === "LONG" ? initialStop < entryPrice && target > entryPrice : target < entryPrice && entryPrice < initialStop);
+    if (!validGeometry) { i++; continue; }
     let activeStop = initialStop, exitPrice = entryPrice, exitTs = entryBar.ts, exitReason: ResearchTrade["exitReason"] = "DATA_END";
     let exitIndex = candles.length - 1, mfe = 0, mae = 0, resolved = false;
     for (let j = i + 1; j < Math.min(candles.length, i + candidate.maxHoldBars + 1); j++) {
@@ -87,14 +93,16 @@ export function backtestResearchV1(strategy: ResearchStrategyId, instrument: str
     i = Math.max(i + 1, exitIndex + 1);
   }
   return { summary: summarize(trades.map(t => t.resultR)), trades,
-    assumptions: ["confirmed close signal enters at next candle open", "stop wins if stop and target touch on one candle",
+    assumptions: ["confirmed close signal enters at next candle open", "candidate stop/target are preserved; gaps that invalidate geometry are skipped",
+      "stop wins if stop and target touch on one candle",
       "fees, slippage, spread and SL+ use the current V2 cost model", "research-only; no order or promotion authority"] };
 }
 
 /** Stable per-symbol time splits; OOS bars use preceding candles only as feature warm-up. */
 export function validateResearchV1(strategy: ResearchStrategyId, histories: ReadonlyMap<string, Candle[]>,
   costs: V2CostModel = DEFAULT_V2_COSTS, trainFraction = 0.8, rollingFolds = 5,
-  params: ResearchStrategyConfig = { trend_pullback_v1: DEFAULT_TREND_PULLBACK_V1, breakout_retest_v1: DEFAULT_BREAKOUT_RETEST_V1 }): ResearchValidationResult {
+  params: ResearchStrategyConfig = { trend_pullback_v1: DEFAULT_TREND_PULLBACK_V1, breakout_retest_v1: DEFAULT_BREAKOUT_RETEST_V1,
+    range_mean_reversion_v1: DEFAULT_RANGE_MEAN_REVERSION_V1 }): ResearchValidationResult {
   if (!(trainFraction > 0 && trainFraction < 1) || !Number.isInteger(rollingFolds) || rollingFolds < 2) throw new Error("invalid research split configuration");
   const trainBySymbol: Record<string, PerfSummary> = {}, oosBySymbol: Record<string, PerfSummary> = {};
   const trainTrades: ResearchTrade[] = [], oosTrades: ResearchTrade[] = [], rollingExpectancies: number[] = [];

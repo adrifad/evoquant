@@ -180,9 +180,10 @@ const features = { ts: 0, instrument: symbol, price: 100, atr14: 1, atrPct: 1, e
 const signal: ScalpSignal = { instrument: symbol, direction: 1, score: 0.9, price: 100,
   stopPx: 98, tpPx: 104, atr: 1, reason: "fixture", regime: "TRENDING_BULLISH", ts: 0 };
 
-function executionFixture(t: test.TestContext, onLeverage?: () => void) {
+function executionFixture(t: test.TestContext, onLeverage?: () => void, fillPrice = 100, tickSz = "0.01") {
   const f = fixture(t);
   f.risk.hard_limits.max_concurrent_positions = 1;
+  const fixtureMeta = { ...meta, tickSz };
   const positions: Array<Record<string, string>> = [], writes: Array<{ url: string; body: Record<string, string> }> = [];
   const client = {
     get: async (url: string) => {
@@ -190,7 +191,7 @@ function executionFixture(t: test.TestContext, onLeverage?: () => void) {
       if (url.endsWith("/positions")) return structuredClone(positions);
       if (url.endsWith("/time")) return [{ ts: String(Date.now()) }];
       if (url.endsWith("/orders-pending") || url.endsWith("/fills")) return [];
-      if (url.endsWith("/order")) return [{ ordId: "O1", instId: symbol, state: "filled", avgPx: "100", lever: "3", accFillSz: "200", sz: "200" }];
+      if (url.endsWith("/order")) return [{ ordId: "O1", instId: symbol, state: "filled", avgPx: String(fillPrice), lever: "3", accFillSz: "200", sz: "200" }];
       throw new Error(`unexpected fake GET ${url}`);
     },
     post: async (url: string, body: Record<string, string>) => {
@@ -198,14 +199,14 @@ function executionFixture(t: test.TestContext, onLeverage?: () => void) {
       if (url.endsWith("/set-leverage")) { onLeverage?.(); return [body]; }
       if (url.endsWith("/order")) {
         assert.equal(unresolvedEntry(f.store)?.clOrdId, body.clOrdId);
-        positions.push({ instId: body.instId!, posSide: body.posSide!, pos: body.sz!, avgPx: "100", markPx: "100", lever: "4", margin: "5", mgnMode: "isolated" });
+        positions.push({ instId: body.instId!, posSide: body.posSide!, pos: body.sz!, avgPx: String(fillPrice), markPx: "100", lever: "4", margin: "5", mgnMode: "isolated" });
         return [{ ordId: "O1", sCode: "0" }];
       }
       if (url.endsWith("/order-algo")) return [{ algoId: "A1", sCode: "0" }];
       throw new Error(`unexpected fake POST ${url}`);
     },
   } as unknown as OkxClient;
-  const deps = { ...f, client, instruments: { [symbol]: meta, [second]: { ...meta, instId: second } }, watchlist: [symbol, second] };
+  const deps = { ...f, client, instruments: { [symbol]: fixtureMeta, [second]: { ...fixtureMeta, instId: second } }, watchlist: [symbol, second] };
   setBotState(f.store, "RUNNING"); setEmergencyHalted(f.store, false);
   const runner = new ScalpRunner({ ...deps, cfg: { ...SCALP_DEFAULTS, position_pct: 20 }, llm: {} as RoleLlmService });
   const ctx: TickContext = { features, regime: "TRENDING_BULLISH",
@@ -247,3 +248,16 @@ for (const engine of ["openSwing", "openScalp"] as const) {
     assert.equal(f.writes.length, writesBefore, "runtime changes must not resize existing positions");
   });
 }
+
+test("Scalp filled entry with tick-rounded invalid protection is persisted as degraded and halts new entries", async t => {
+  const f = executionFixture(t, undefined, 100, "10");
+  await f.openScalp();
+  const trade = f.store.db.prepare("SELECT status,entry_px,stop_px,take_profit_px,protection_state FROM trades WHERE engine='SCALP_5M'").get() as
+    { status: string; entry_px: number; stop_px: number; take_profit_px: number; protection_state: string } | undefined;
+  assert.equal(trade?.status, "OPEN");
+  assert.equal(trade?.entry_px, 100);
+  assert.equal(trade?.protection_state, "DEGRADED");
+  assert.ok(trade!.stop_px < trade!.take_profit_px, "signal thesis geometry remains auditable for software fallback");
+  assert.equal(f.writes.some(w => w.url.endsWith("/order-algo")), false, "invalid geometry must not be submitted as native protection");
+  assert.equal(kvGet(f.store, "bot_state"), "RISK_HALTED");
+});

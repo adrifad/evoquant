@@ -46,6 +46,7 @@ import { recordCandidateAttempt, recordOpportunityMetric } from "../market/oppor
 import { scanSymbolsIsolated } from "../market/isolated-scan.ts";
 import { runScalpCandidateQueue, type ScalpEntryOutcome } from "./candidate-queue.ts";
 import { latestConfirmedCandleClose } from "./candles.ts";
+import { deriveScalpExitGeometry } from "./geometry.ts";
 import { runMonitorItemsIsolated, type PositionMonitorHealthTracker } from "../core/monitor-health.ts";
 
 const log = createLogger("scalp");
@@ -445,9 +446,8 @@ export class ScalpRunner {
       if (filled.state !== "filled") throw new Error(`scalp entry not filled: ${filled.state}`);
       const filledContracts = Number(filled.accFillSz);
       if (!Number.isFinite(filledContracts) || filledContracts <= 0) throw new Error("scalp entry fill quantity unavailable");
-      const entryPx = Number(filled.avgPx) || sig.price;
-      const stopPx = side === "LONG" ? entryPx - (sig.price - sig.stopPx) : entryPx + (sig.stopPx - sig.price);
-      const tpPx = side === "LONG" ? entryPx + (sig.tpPx - sig.price) : entryPx - (sig.tpPx - sig.price);
+      const entryPx = Number(filled.avgPx);
+      if (!Number.isFinite(entryPx) || entryPx <= 0) throw new Error("scalp entry average fill price unavailable");
       const tradeId = `SCP-${String(Date.now()).slice(-8)}`;
       const decisionId = nextDecisionId();
       recordDecision(store, { decisionId, ts: new Date().toISOString(),
@@ -460,6 +460,37 @@ export class ScalpRunner {
       const actualContracts = Number.isFinite(exchangeContracts) && exchangeContracts > 0 ? String(exchangeContracts) : String(filledContracts);
       const positionReadbackVerified = Boolean(entryPosition && Number.isFinite(exchangeContracts) && exchangeContracts > 0
         && Math.abs(exchangeContracts - filledContracts) <= Math.max(1e-9, filledContracts * 1e-8));
+      let exitGeometry;
+      try {
+        exitGeometry = deriveScalpExitGeometry({ side, signalPrice: sig.price, signalStop: sig.stopPx,
+          signalTakeProfit: sig.tpPx, fillPrice: entryPx, tickSz: meta.tickSz });
+      } catch (error) {
+        // The exchange has already filled the entry. Preserve ownership and
+        // fail closed if slippage makes the planned protection geometry invalid.
+        // The Scalp monitor remains active and can run deterministic fallback
+        // exits while native protection is unavailable.
+        openTrade(store, {
+          tradeId, engine: "SCALP_5M", instrument: sig.instrument, timeframe: TF_TAG, side,
+          strategy: "SCALP", strategyVersion: 1, regime: sig.regime, contracts: actualContracts,
+          entryPx, entryTs: new Date().toISOString(), stopPx: sig.stopPx, takeProfitPx: sig.tpPx,
+          clOpenId: clOpen, ordOpenId: placed.ordId, decisionId,
+          rawConfidence: sig.score, calibratedConfidence: sig.score,
+          plannedRiskPct: Number(actualContracts) * Number(meta.ctVal) * Math.abs(entryPx - sig.stopPx) / finalEquity * 100,
+          leverage: confirmedFillLeverage(entryPosition ?? filled, confirmedFillLeverage(filled, leverage)), entryFeatures: features,
+        });
+        store.db.prepare("UPDATE trades SET protection_state='DEGRADED' WHERE trade_id=?").run(tradeId);
+        setRiskHaltReason(store, "LIVE_POSITION_PROTECTION_UNVERIFIED");
+        setBotState(store, "RISK_HALTED");
+        releaseEntry(store, clOpen);
+        logSystemEvent(store, "RISK_EVENT", { protection_degraded: "FILLED_ENTRY_GEOMETRY_INVALID", tradeId,
+          instrument: sig.instrument, orderId: placed.ordId, entryPrice: entryPx, reason: error instanceof Error ? error.message : "UNKNOWN",
+          exchangePositionVerified: positionReadbackVerified, newEntriesHalted: true });
+        log.error({ event: "scalp_filled_entry_geometry_invalid", tradeId, instrument: sig.instrument,
+          orderId: placed.ordId, positionReadbackVerified });
+        return { kind: "GLOBAL_STOP", reason: "PROTECTION_UNVERIFIED", riskResult: "GLOBAL_STOP" };
+      }
+      const stopPx = exitGeometry.stopPrice;
+      const tpPx = exitGeometry.takeProfitPrice;
       openTrade(store, {
         tradeId, engine: "SCALP_5M", instrument: sig.instrument, timeframe: TF_TAG, side,
         strategy: "SCALP", strategyVersion: 1, regime: sig.regime, contracts: actualContracts,
@@ -507,7 +538,7 @@ export class ScalpRunner {
         notional: Math.round(sz.notionalUsdt * 100) / 100 });
       recordOpportunityMetric(store, "SCALP_5M", "POSITION_OPENED");
       log.info({ event: "scalp_open", tradeId, inst: sig.instrument, side, ct: sz.contracts,
-        notional: Math.round(sz.notionalUsdt * 100) / 100, fills: fills.length });
+        notional: Math.round(sz.notionalUsdt * 100) / 100, fills: fills.length, rewardRisk: exitGeometry.rewardRisk });
       return { kind: "OPENED", reason: "POSITION_OPENED", riskResult: "RISK_PASS" };
     } catch (e) {
       log.error({ event: "scalp_open_failed", inst: sig.instrument, error: e instanceof Error ? e.message.slice(0, 140) : String(e) });
@@ -538,8 +569,11 @@ export class ScalpRunner {
       const nowS = Math.floor(Date.now() / 1000);
       await runMonitorItemsIsolated(scalps, async (t) => {
         const verified = await verifyOpenTradeProtection(this.d, String(t.instrument));
-        if (!verified) log.warn({ event: "scalp_monitor_protection_unverified", tradeId: String(t.trade_id),
-          instrument: String(t.instrument), nativeProtectionPrimary: true, softwareMonitorContinuing: true });
+        if (!verified) {
+          partialFailure("native protection verification failed");
+          log.warn({ event: "scalp_monitor_protection_unverified", tradeId: String(t.trade_id),
+            instrument: String(t.instrument), nativeProtectionPrimary: true, softwareMonitorContinuing: true });
+        }
         const pos = poss.find((p) => p.instId === String(t.instrument) && p.posSide === String(t.side).toLowerCase());
         if (!pos) {
           if (t.status === "OPEN") {
@@ -552,6 +586,7 @@ export class ScalpRunner {
         }
         const meta = this.d.instruments[String(t.instrument)];
         if (!meta) {
+          partialFailure("instrument metadata unavailable");
           log.warn({ event: "scalp_monitor_metadata_unavailable", tradeId: String(t.trade_id), instrument: String(t.instrument) });
           return;
         }

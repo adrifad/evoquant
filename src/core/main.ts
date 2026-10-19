@@ -39,7 +39,7 @@ import { parseEvolutionConfig } from "./evolution-config.ts";
 import { resolveRuntimePolicy } from "./runtime-policy.ts";
 import { RuntimeRiskService } from "./runtime-risk.ts";
 import { RuntimeTradingService } from "./runtime-trading.ts";
-import { PositionMonitorHealthTracker } from "./monitor-health.ts";
+import { classifyPositionOwnership, PositionMonitorHealthTracker } from "./monitor-health.ts";
 import { runOncePerGlobalCycle } from "./global-cycle.ts";
 import { RoleLlmService } from "./llm-role-service.ts";
 import { createLogger } from "./logger.ts";
@@ -463,13 +463,19 @@ async function main(): Promise<void> {
   const sweepSwingPositions = () => {
     void monitorHealth.execute("SWING_15M", async (partialFailure) => {
       const poss = (await getPositions(deps.client)).filter((p) => p.pos !== "0");
-      const local = (getOpenTrades(store) as Array<Record<string, unknown>>)
+      const allLocal = getOpenTrades(store) as Array<Record<string, unknown>>;
+      const local = allLocal
         .filter((t) => isTradeOwnedBy(t, "SWING_15M"));
-      if (local.length === 0) return;
       for (const pos of poss) {
         try {
+          const ownership = classifyPositionOwnership(pos, allLocal, "SWING_15M");
+          if (ownership === "OWNED_BY_OTHER_ENGINE") continue;
+          if (ownership === "ORPHAN" || ownership === "OWNERSHIP_CONFLICT") {
+            partialFailure(`exchange position ${ownership.toLowerCase()}: ${pos.instId}`);
+            continue;
+          }
           const t = local.find((x) => String(x.instrument) === pos.instId && String(x.side).toLowerCase() === pos.posSide);
-          if (!t) { partialFailure(`exchange position lacks local SWING trade: ${pos.instId}`); continue; }
+          if (!t) { partialFailure(`exchange position ownership changed during Swing sweep: ${pos.instId}`); continue; }
           const meta = instruments[pos.instId];
           if (!meta) { partialFailure(`instrument metadata unavailable: ${pos.instId}`); continue; }
           const slPlus = await updateTradeStopPlus(client, store, t, pos, meta, trading.position_management.sl_plus);

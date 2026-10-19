@@ -10,8 +10,9 @@ import { scanSymbolsIsolated } from "../src/market/isolated-scan.ts";
 import { attemptRankedCandidates } from "../src/strategy/candidate-queue.ts";
 import type { ScanRow } from "../src/strategy/scanner.ts";
 import type { TradeCandidate } from "../src/strategy/core-v2.ts";
-import { DEFAULT_BREAKOUT_RETEST_V1, DEFAULT_TREND_PULLBACK_V1, evaluateBreakoutRetestV1,
-  evaluateTrendPullbackV1, parseResearchStrategyConfig } from "../src/strategy/research-v1.ts";
+import { DEFAULT_BREAKOUT_RETEST_V1, DEFAULT_RANGE_MEAN_REVERSION_V1, DEFAULT_TREND_PULLBACK_V1, evaluateBreakoutRetestV1,
+  evaluateRangeMeanReversionV1, evaluateTrendPullbackV1, parseResearchStrategyConfig } from "../src/strategy/research-v1.ts";
+import { backtestResearchV1 } from "../src/evaluation/research-strategies.ts";
 import type { FeatureSnapshot } from "../src/market/features.ts";
 import type { Candle } from "../src/exchange/okx/types.ts";
 
@@ -148,7 +149,7 @@ test("hourly opportunity funnel aggregates by engine and blocker without event r
 });
 
 const features = (patch: Partial<FeatureSnapshot> = {}): FeatureSnapshot => ({
-  ts: 1_800_000, instrument: "TEST-USDT-SWAP", price: 100.3, ema20: 100, ema50: 99.7,
+  ts: 22, instrument: "TEST-USDT-SWAP", price: 100.3, ema20: 100, ema50: 99.7,
   emaSpreadPct: 0.3, ema20SlopePct: 0.1, rsi14: 53, adx14: 30, atr14: 1, atrPct: 0.5,
   volume: 120, volumeSma20: 100, volumeRatio: 1.2, sufficientData: true, ...patch,
 });
@@ -167,6 +168,9 @@ test("Trend Pullback research evaluator is direction-symmetric and keeps ATR ris
     ema20SlopePct: -0.1, rsi14: 47 }), [...trendWarmup, candle(21, 100.1, 100.5, 100.2, 100.4), candle(22, 99.9, 100, 99.6, 99.7)]);
   assert.equal(short.candidate?.side, "SHORT");
   assert.equal(short.candidate?.stopPrice, 101.0);
+  const withFutureBars = evaluateTrendPullbackV1(features(), [...trendWarmup, candle(21, 100, 100.2, 99.5, 99.6),
+    candle(22, 100.1, 100.4, 100, 100.3), candle(23, 100.4, 103, 100.3, 102), candle(24, 102, 103, 99, 99.5)]);
+  assert.deepEqual(withFutureBars, long, "bars later than the feature timestamp cannot alter a historical evaluation");
 });
 
 test("research setup score cannot rescue failed hard conditions and parameter objects reject unknown fields", () => {
@@ -175,9 +179,29 @@ test("research setup score cannot rescue failed hard conditions and parameter ob
   assert.equal(rejected.candidate, null);
   assert.ok(rejected.setupScore > 0, "score is informational and does not override deterministic hard failures");
   const config = { trend_pullback_v1: DEFAULT_TREND_PULLBACK_V1, breakout_retest_v1: DEFAULT_BREAKOUT_RETEST_V1 };
-  assert.deepEqual(parseResearchStrategyConfig(config), config);
+  assert.deepEqual(parseResearchStrategyConfig(config), { ...config, range_mean_reversion_v1: DEFAULT_RANGE_MEAN_REVERSION_V1 });
   assert.throws(() => parseResearchStrategyConfig({ ...config, new_knob: 1 }));
   assert.throws(() => parseResearchStrategyConfig({ ...config, trend_pullback_v1: { ...DEFAULT_TREND_PULLBACK_V1, stop_atr: 0.1 } }));
+});
+
+test("range mean reversion research requires confirmed range, boundary rejection and after-cost geometry", () => {
+  const bars = Array.from({ length: 80 }, (_, i) => {
+    const center = 100 + Math.sin(i * Math.PI / 4) * 4;
+    return candle(i, center - 0.2, center + 0.5, center - 0.5, center);
+  });
+  bars[79] = candle(79, 96.4, 96.8, 95.3, 96.6);
+  const f = features({ ts: 79, price: 96.6, atr14: 2, atrPct: 2, ema20: 100, ema50: 100,
+    emaSpreadPct: 0, rsi14: 35, adx14: 12 });
+  const candidate = evaluateRangeMeanReversionV1(f, bars, 0.15);
+  assert.equal(candidate.candidate?.strategy, "MEAN_REVERSION_RANGE_V1");
+  assert.equal(candidate.candidate?.side, "LONG");
+  assert.ok(candidate.candidate!.stopPrice < f.price && f.price < candidate.candidate!.takeProfitPrice);
+  assert.ok(candidate.candidate!.targetR > 0);
+  assert.equal(evaluateRangeMeanReversionV1(f, bars, 10).candidate, null, "friction that consumes the target blocks the research setup");
+  const unconfirmed = [...bars, candle(80, 96.6, 97, 95, 96.7, 120)];
+  unconfirmed[80] = { ...unconfirmed[80]!, confirm: "0" };
+  assert.deepEqual(evaluateRangeMeanReversionV1(f, unconfirmed, 0.15), candidate,
+    "unconfirmed candles cannot create or change a historical candidate");
 });
 
 test("Breakout Retest research evaluator recognizes bullish and bearish confirmed retests", () => {
@@ -185,13 +209,16 @@ test("Breakout Retest research evaluator recognizes bullish and bearish confirme
   for (let i = 0; i < 20; i++) base.push(candle(i, 99.4, 100, 99, 99.5, 100));
   const longCandles = [...base, candle(20, 99.6, 100.5, 99.5, 100.3, 160), candle(21, 100.2, 100.3, 99.95, 100.05),
     candle(22, 100.05, 100.2, 99.98, 100.1), candle(23, 100.1, 100.25, 100.02, 100.2), candle(24, 100.2, 100.6, 100.15, 100.5)];
-  const long = evaluateBreakoutRetestV1(features({ price: 100.5, volumeRatio: 1.2 }), longCandles);
+  const long = evaluateBreakoutRetestV1(features({ ts: 24, price: 100.5, volumeRatio: 1.2 }), longCandles);
   assert.equal(long.candidate?.side, "LONG");
+  const longWithFuture = evaluateBreakoutRetestV1(features({ ts: 24, price: 100.5, volumeRatio: 1.2 }), [...longCandles,
+    candle(25, 100.5, 104, 100.4, 103), candle(26, 103, 104, 98, 99)]);
+  assert.deepEqual(longWithFuture, long, "future confirmed bars cannot revise the setup at timestamp 24");
   const downBase: Candle[] = [];
   for (let i = 0; i < 20; i++) downBase.push(candle(i, 100.6, 101, 100, 100.5, 100));
   const shortCandles = [...downBase, candle(20, 100.4, 100.5, 99.5, 99.7, 160), candle(21, 99.8, 100.05, 99.7, 99.95),
     candle(22, 99.95, 100.02, 99.8, 99.9), candle(23, 99.9, 99.98, 99.75, 99.8), candle(24, 99.8, 99.85, 99.4, 99.5)];
-  const short = evaluateBreakoutRetestV1(features({ price: 99.5, ema20: 100, ema50: 100.3, emaSpreadPct: -0.3,
+  const short = evaluateBreakoutRetestV1(features({ ts: 24, price: 99.5, ema20: 100, ema50: 100.3, emaSpreadPct: -0.3,
     ema20SlopePct: -0.1, rsi14: 45, volumeRatio: 1.2 }), shortCandles);
   assert.equal(short.candidate?.side, "SHORT");
   assert.equal(short.candidate?.targetR, 2.1);
