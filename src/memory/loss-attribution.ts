@@ -15,6 +15,8 @@ export interface TrustedTradeMetrics {
   averageGrossPnlUsdt: number | null;
   averageWinUsdt: number | null;
   averageLossUsdt: number | null;
+  averageWinR: number | null;
+  averageLossR: number | null;
   profitFactor: number | null;
   expectancyR: number | null;
   averageMfe: number | null;
@@ -77,6 +79,7 @@ function metrics(rows: readonly TrustedTrade[]): TrustedTradeMetrics {
     averageNetPnlUsdt: rows.length ? rounded(netTotal / rows.length) : null,
     averageGrossPnlUsdt: average(gross), averageWinUsdt: average(wins.map(row => row.pnl)),
     averageLossUsdt: average(losses.map(row => row.pnl)),
+    averageWinR: average(wins.map(row => row.result_r)), averageLossR: average(losses.map(row => row.result_r)),
     profitFactor: negativePnl > 0 ? rounded(positivePnl / negativePnl) : null,
     expectancyR: average(rows.map(row => row.result_r)),
     // MFE/MAE are recorded in raw price units; cross-instrument averages are not comparable.
@@ -145,6 +148,8 @@ export function buildLossAttribution(store: Store, sinceIso: string | null = nul
       maxTradeSequenceDrawdownUsdt: "peak-to-trough drawdown of cumulative closed-trade NET PnL from zero within the selected window; not account-equity drawdown",
       averageMfeMae: "average raw price movement; only aggregated within a single instrument because price units differ across instruments",
       winRate: "trades with net pnl > 0 divided by complete valid NET trades",
+      averageWinR: "arithmetic mean of NET result_r for trades with positive NET PnL",
+      averageLossR: "arithmetic mean of NET result_r for trades with negative NET PnL",
       profitFactor: "sum of positive net pnl divided by absolute sum of negative net pnl; unavailable without losses",
     },
     accounting: {

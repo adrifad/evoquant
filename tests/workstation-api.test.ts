@@ -78,6 +78,9 @@ test("loss attribution API excludes incomplete accounting from trusted results",
     "SCALP", 1, 1, "SIDEWAYS", "1", now, now, -3, 1, 0.5, -0.3, 1, 2, 300, "SL");
   add.run("LOSS-API-PENDING", "SCALP_5M", "PENDING", "CLOSED", "EVIDENCE_PENDING", 0, "FUNDING_PENDING", "ETH-USDT-SWAP", "scalp", "LONG",
     "SCALP", 1, 1, "UNKNOWN", "1", now, now, null, 1, null, null, null, null, 300, "SL");
+  const trades = await json<Array<{ trade_id: string; engine: string }>>(await f.request("/api/trades"));
+  assert.equal(trades.find(row => row.trade_id === "LOSS-API-VALID")?.engine, "SCALP_5M",
+    "the additive engine field supports truthful client filtering");
   const result = await json<{ accounting: { closedTrades: number; completeValidNetTrades: number; byEvidenceState: Record<string, number> };
     overall: { tradeCount: number; totalNetPnlUsdt: number }; unavailable: string[] }>(await f.request("/api/loss-attribution?window=30d"));
   assert.equal(result.accounting.closedTrades, 2);

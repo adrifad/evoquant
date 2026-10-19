@@ -51,6 +51,8 @@ test("loss attribution uses only complete valid NET evidence and states its acco
     assert.equal(report.overall.averageGrossPnlUsdt, 4.5, "gross = net + fees - signed funding");
     assert.equal(report.overall.averageWinUsdt, 8);
     assert.equal(report.overall.averageLossUsdt, -4);
+    assert.equal(report.overall.averageWinR, 0.8);
+    assert.equal(report.overall.averageLossR, -0.4);
     assert.equal(report.overall.profitFactor, 2);
     assert.equal(report.overall.expectancyR, 0.2);
     assert.equal(report.overall.averageMfe, 2);
