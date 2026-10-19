@@ -14,6 +14,27 @@ export interface PositionMonitorStatus {
   health: PositionMonitorHealth;
 }
 
+export type PositionOwnership = "OWNED_BY_ENGINE" | "OWNED_BY_OTHER_ENGINE" | "ORPHAN" | "OWNERSHIP_CONFLICT";
+
+/** Classify the exchange snapshot against all locally managed engines before
+ * an engine labels another engine's valid position as orphan exposure.
+ */
+export function classifyPositionOwnership(
+  position: { instId: string; posSide: string },
+  trades: readonly Record<string, unknown>[],
+  engine: PositionMonitorEngine,
+): PositionOwnership {
+  const matches = trades.filter((trade) => String(trade.instrument) === position.instId
+    && String(trade.side).toLowerCase() === position.posSide.toLowerCase()
+    && ["OPEN", "RECONCILIATION_PENDING"].includes(String(trade.status)));
+  if (matches.length === 0) return "ORPHAN";
+  if (matches.length > 1) return "OWNERSHIP_CONFLICT";
+  const tradeEngine = String(matches[0]!.engine);
+  return (engine === "SWING_15M" && tradeEngine === "SWING_15M")
+    || (engine === "SCALP_5M" && tradeEngine === "SCALP_5M")
+    ? "OWNED_BY_ENGINE" : "OWNED_BY_OTHER_ENGINE";
+}
+
 type InternalStatus = Omit<PositionMonitorStatus, "health" | "required"> & {
   partialFailure: boolean;
   lastAttemptMs: number | null;
