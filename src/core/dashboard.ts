@@ -40,6 +40,10 @@ import { unresolvedEntry } from "./runtime-risk.ts";
 import { DynamicWatchlistError, type WatchlistProjection } from "../market/dynamic-watchlist.ts";
 import { getOpportunityFunnel, getRecentCandidateAttempts } from "../market/opportunity-funnel.ts";
 import { buildLossAttribution } from "../memory/loss-attribution.ts";
+import { reconcilePerformanceEvidence } from "../evaluation/evidence.ts";
+import { summarizeCostAssessments } from "../evaluation/cost-gate.ts";
+import { buildSuitabilityReport } from "../evaluation/suitability.ts";
+import { DEFAULT_RESEARCH_FUNDING, type ResearchFundingModel } from "../evaluation/research-funding.ts";
 import type { PositionMonitorEngine, PositionMonitorStatus } from "./monitor-health.ts";
 import { buildMarketIntelligence } from "../market/intelligence.ts";
 
@@ -70,6 +74,7 @@ export interface DashboardConfig {
     enabled?: boolean; automaticPromotion?: boolean; shadowMinimum?: number; championShadowMinimum?: number;
   };
   llmRoles?: RoleLlmService;
+  researchFunding?: ResearchFundingModel;
   runtimeRisk?: RuntimeRiskService;
   runtimeTrading?: RuntimeTradingService;
   dynamicWatchlist?: { projection(): WatchlistProjection; refreshManual(): Promise<WatchlistProjection> };
@@ -298,6 +303,42 @@ export function startDashboard(cfg: DashboardConfig): DashboardServer {
         performance: scopedPerformance(store, { engine: "SWING_15M", strategyCoreVersion: cfg.strategyCoreVersion ?? 1 }),
         weights, ...(weightsByFamily ? { weightsByFamily } : {}),
         calibration: JSON.parse(kvGet(store, `calibration:SWING_15M:core${cfg.strategyCoreVersion ?? 1}:*:*:*:*:*`) ?? "null") }); // §73–§82
+    }
+    if (p === "/api/research-intelligence") {
+      if (method !== "GET") return send(405, { error: "Method not allowed." });
+      const performance = reconcilePerformanceEvidence(store);
+      const riskBlocked = getBotState(store) !== "RUNNING" || Boolean(getRiskHaltReason(store)) || isEmergencyHalted(store);
+      const suitability = buildSuitabilityReport(store, { riskBlocked, minimumSample: cfg.evolution.minSample });
+      const shadowResults = store.db.prepare(`SELECT strategy,strategy_core_version,strategy_version,shadow_role,
+          COUNT(*) trades, AVG(net_r) expectancy_r,
+          SUM(CASE WHEN net_r>0 THEN 1 ELSE 0 END) wins,
+          SUM(CASE WHEN net_r<0 THEN 1 ELSE 0 END) losses
+        FROM shadow_trades WHERE status='CLOSED'
+        GROUP BY strategy,strategy_core_version,strategy_version,shadow_role
+        ORDER BY strategy,strategy_version,shadow_role`).all();
+      const comparisons = store.db.prepare(`SELECT ts,champion,challenger,promoted,reasons,champion_metrics,challenger_metrics
+        FROM evolution_comparisons ORDER BY id DESC LIMIT 20`).all();
+      return send(200, {
+        generatedAt: new Date().toISOString(),
+        mode: { costGate: "SHADOW", observationOnly: true, authorizationImpact: "NONE" },
+        performance,
+        costGate: summarizeCostAssessments(store),
+        researchFunding: cfg.researchFunding ?? DEFAULT_RESEARCH_FUNDING,
+        suitability,
+        shadowResults,
+        championChallenger: comparisons,
+        researchStrategies: [
+          { id: "TREND_PULLBACK_V1", family: "TREND_FOLLOWING", status: "RESEARCH_ONLY" },
+          { id: "BREAKOUT_RETEST_V1", family: "BREAKOUT", status: "RESEARCH_ONLY" },
+          { id: "MEAN_REVERSION_RANGE_V1", family: "MEAN_REVERSION", status: "RESEARCH_ONLY" },
+        ],
+        limitations: [
+          "Cost gate observations never authorize or block an order.",
+          "Suitability is historical, observation-only context.",
+          "Shadow results are simulated and separate from realized Demo NET PnL.",
+          "Research strategy results require a reproducible historical evaluation and are not implied by this projection.",
+        ],
+      });
     }
     if (p === "/api/lessons") {
       const rows = store.db.prepare("SELECT lesson_id,statement,status,scope_engine,scope_strategy,scope_strategy_version,scope_instrument,scope_regime,scope_regime_axes,scope_direction,confidence,observations,wins,losses,expectancy_r,updated_ts FROM lessons ORDER BY CASE status WHEN 'VERIFIED' THEN 0 WHEN 'REINFORCED' THEN 1 ELSE 2 END, confidence DESC LIMIT 50").all();

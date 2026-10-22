@@ -8,6 +8,7 @@ import { summarize, type PerfSummary } from "./performance.ts";
 import { DEFAULT_V2_PARAMS, evaluateV2Setup, type StrategyV2Id, type StrategyV2Params } from "../strategy/core-v2.ts";
 import type { RegimeAxes } from "../market/regime.ts";
 import { calculateSlPlusStop } from "../execution/sl-plus.ts";
+import type { ResearchFundingModel } from "./research-funding.ts";
 
 export interface BacktestResult {
   summary: PerfSummary;
@@ -91,6 +92,8 @@ export interface V2CostModel {
   entryFeePct: number; exitFeePct: number; // percent of notional, each side
   slippageBps: number; spreadBps: number; // each side
   slPlus: { enabled: boolean; activationR: number; lockInR: number; minProfitBufferPct: number };
+  /** Research-only funding assumption; live/V2 paths ignore this optional field. */
+  researchFunding?: ResearchFundingModel;
 }
 
 /** Costs are charged once per side against that side's notional, then normalized to initial risk. */

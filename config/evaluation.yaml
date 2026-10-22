@@ -7,3 +7,21 @@ costs:
   exit_fee_pct: 0.05
   slippage_bps_per_side: 1.5
   spread_bps_per_side: 1.5
+
+# Observation-only economic gate. SHADOW means it records evidence but never
+# authorizes or blocks an order. A positive expected R requires a calibrated
+# historical conditional probability with at least min_conditional_sample.
+cost_gate:
+  max_cost_to_risk_ratio: 0.35
+  funding_bps_per_hold: 1.0
+  min_conditional_sample: 100
+
+# Research backtests include funding in NET R. A positive rate is paid by LONG
+# and received by SHORT once per crossed settlement. When historical funding
+# evidence is unavailable, this explicit conservative estimate is used and is
+# surfaced in every research result's assumptions.
+research_funding:
+  enabled: true
+  rate_bps_per_settlement: 1.0
+  settlement_interval_hours: 8
+  source: CONFIGURED_CONSERVATIVE_ESTIMATE

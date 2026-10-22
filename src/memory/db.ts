@@ -213,6 +213,25 @@ CREATE TABLE IF NOT EXISTS shadow_trades (
   UNIQUE(strategy,strategy_core_version,strategy_version,shadow_role,instrument,signal_ts)
 );
 CREATE INDEX IF NOT EXISTS idx_shadow_trades_evidence ON shadow_trades(strategy,strategy_version,status,instrument,exit_ts);
+CREATE TABLE IF NOT EXISTS cost_gate_assessments (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts TEXT NOT NULL,
+  instrument TEXT NOT NULL,
+  engine TEXT NOT NULL CHECK(engine IN ('SWING_15M','SCALP_5M')),
+  strategy TEXT NOT NULL,
+  strategy_core_version INTEGER,
+  strategy_version INTEGER,
+  side TEXT NOT NULL CHECK(side IN ('LONG','SHORT')),
+  regime TEXT,
+  verdict TEXT NOT NULL,
+  net_payout_tp_r REAL,
+  net_payout_sl_r REAL,
+  cost_to_risk REAL,
+  evidence_quality TEXT NOT NULL,
+  payload TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_cost_gate_assessments_ts ON cost_gate_assessments(id DESC);
+CREATE INDEX IF NOT EXISTS idx_cost_gate_assessments_verdict ON cost_gate_assessments(verdict,id DESC);
 CREATE TABLE IF NOT EXISTS strategy_v2_evaluations (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   ts TEXT NOT NULL,

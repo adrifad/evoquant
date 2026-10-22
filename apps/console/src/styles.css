@@ -126,6 +126,9 @@ a { color: var(--accent); }
 .metric-strip { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); border: 1px solid var(--line); border-radius: var(--radius-panel); background: var(--surface); overflow: hidden; }
 .metric { display: grid; align-content: start; gap: 3px; min-width: 0; min-height: 82px; padding: 12px 14px; border-right: 1px solid var(--line); }
 .metric:last-child { border-right: 0; }
+.compact-strip { margin: 0 0 12px; }
+.compact-strip .metric { min-height: 70px; padding: 10px 12px; }
+.compact-strip .metric-value { font-size: 16px; }
 .metric-label { color: var(--muted); font-size: 10px; }
 .metric-value { overflow-wrap: anywhere; color: var(--text-strong); font-size: 18px; font-weight: 560; letter-spacing: -.025em; }
 .metric-detail { overflow: hidden; color: var(--quiet); font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }

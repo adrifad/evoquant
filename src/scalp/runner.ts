@@ -48,6 +48,7 @@ import { runScalpCandidateQueue, type ScalpEntryOutcome } from "./candidate-queu
 import { latestConfirmedCandleClose } from "./candles.ts";
 import { deriveScalpExitGeometry } from "./geometry.ts";
 import { runMonitorItemsIsolated, type PositionMonitorHealthTracker } from "../core/monitor-health.ts";
+import { assessTradeEconomics, recordCostAssessment } from "../evaluation/cost-gate.ts";
 
 const log = createLogger("scalp");
 const TF_TAG = "scalp";
@@ -64,6 +65,14 @@ export interface ScalpDeps {
   entryEnabled?: boolean;
   monitorHealth?: PositionMonitorHealthTracker;
   entryUniverse?: () => readonly string[];
+  /** Optional research-only observation. It never affects Scalp entry authorization. */
+  costGate?: {
+    maxCostToRiskRatio: number;
+    fundingBps: number;
+    minConditionalSample: number;
+    spreadBps: number;
+    slippageBps: number;
+  };
 }
 
 function dayStartIso(): string {
@@ -218,6 +227,33 @@ export class ScalpRunner {
         }
       }
       signals.sort((a, b) => b.score - a.score);
+
+      // Research-only cost observation. It is intentionally outside the entry
+      // queue and cannot veto, resize, or delay a Scalp order.
+      if (this.d.costGate) {
+        for (const signal of signals) {
+          const meta = this.d.instruments[signal.instrument];
+          if (!meta) continue;
+          try {
+            recordCostAssessment(this.d.store, assessTradeEconomics({
+              instrument: signal.instrument, engine: "SCALP_5M", strategy: "SCALP_V1",
+              strategyCoreVersion: 1, strategyVersion: 1, side: signal.direction === 1 ? "LONG" : "SHORT",
+              entryPrice: signal.price, stopPrice: signal.stopPx, takeProfitPrice: signal.tpPx,
+              tickSize: Number(meta.tickSz), lotSize: Number(meta.lotSz), minSize: Number(meta.minSz),
+              contractValue: Number(meta.ctVal), atr: signal.atr,
+              atrPct: signal.price > 0 ? signal.atr / signal.price * 100 : NaN,
+              costs: { entryFeePct: this.d.cfg.fee_pct, exitFeePct: this.d.cfg.fee_pct,
+                slippageBps: this.d.costGate.slippageBps, spreadBps: this.d.costGate.spreadBps,
+                fundingBps: this.d.costGate.fundingBps },
+              maxCostToRiskRatio: this.d.costGate.maxCostToRiskRatio,
+              minConditionalSample: this.d.costGate.minConditionalSample,
+            }));
+          } catch (error) {
+            log.warn({ event: "cost_gate_observation_failed", inst: signal.instrument,
+              error: error instanceof Error ? error.message.slice(0, 160) : "UNKNOWN" });
+          }
+        }
+      }
 
       const cycleId = `SCALP-${Date.now()}`;
       await runScalpCandidateQueue(signals, this.d.cfg.max_candidate_attempts_per_cycle, async (sig, rank): Promise<ScalpEntryOutcome> => {

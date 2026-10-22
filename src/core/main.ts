@@ -34,6 +34,8 @@ import { compareAndMaybePromote } from "../evaluation/champion-challenger.ts";
 import { DEFAULT_V2_COSTS } from "../evaluation/backtest.ts";
 import { processShadowCycle } from "../evaluation/shadow-challenger.ts";
 import { evaluateV2Lifecycle } from "../evaluation/v2-promotion.ts";
+import { assessTradeEconomics, recordCostAssessment } from "../evaluation/cost-gate.ts";
+import { researchFundingFromConfig } from "../evaluation/research-funding.ts";
 import { familyForV2 } from "../strategy/identity.ts";
 import { parseEvolutionConfig } from "./evolution-config.ts";
 import { resolveRuntimePolicy } from "./runtime-policy.ts";
@@ -76,7 +78,15 @@ async function main(): Promise<void> {
   const evaluationConfig = YAML.parse(readFileSync(path.join(REPO_ROOT, "config/evaluation.yaml"), "utf8")) as {
     history_days: number; history_page_size: number; history_max_pages: number;
     costs: { entry_fee_pct: number; exit_fee_pct: number; slippage_bps_per_side: number; spread_bps_per_side: number };
+    cost_gate?: { max_cost_to_risk_ratio?: number; funding_bps_per_hold?: number; min_conditional_sample?: number };
   };
+  // Observation-only research gate. These values never enter entry authorization.
+  const costGateConfig = {
+    maxCostToRiskRatio: evaluationConfig.cost_gate?.max_cost_to_risk_ratio ?? 0.35,
+    fundingBps: evaluationConfig.cost_gate?.funding_bps_per_hold ?? 1,
+    minConditionalSample: evaluationConfig.cost_gate?.min_conditional_sample ?? 100,
+  };
+  const researchFunding = researchFundingFromConfig(evaluationConfig);
   const historyConfig = evaluationConfig;
   const backtestCosts = { ...DEFAULT_V2_COSTS,
     entryFeePct: evaluationConfig.costs.entry_fee_pct, exitFeePct: evaluationConfig.costs.exit_fee_pct,
@@ -84,6 +94,8 @@ async function main(): Promise<void> {
     slPlus: { enabled: trading.position_management.sl_plus.enabled,
       activationR: trading.position_management.sl_plus.activation_r, lockInR: trading.position_management.sl_plus.lock_in_r,
       minProfitBufferPct: trading.position_management.sl_plus.min_profit_buffer_pct },
+    // Research backtests consume the configured funding model through costs.
+    researchFunding,
   };
 
   const store = openStore(REPO_ROOT);
@@ -158,6 +170,7 @@ async function main(): Promise<void> {
     ...(env.DASHBOARD_BIND ? { bind: env.DASHBOARD_BIND } : {}),
     ...(env.DASHBOARD_USER ? { auth: { user: env.DASHBOARD_USER, password: env[["DASHBOARD","PASSWORD"].join("_")] ?? "" } } : {}),
     trading, risk, runtimeRisk, runtimeTrading, strategyCoreVersion, baselineMode, deps: () => deps,
+    researchFunding,
     evolution: {
       enabled: runtimePolicy.evolutionEnabled,
       automaticPromotion: evolution.automatic_promotion_enabled,
@@ -223,6 +236,30 @@ async function main(): Promise<void> {
       strategyCoreVersion === 2 ? holdBecause("Strategy Core V2: deterministic exit policy; AI CLOSE disabled")
         : decide(REPO_ROOT, llmRoles, instId2, trading.timeframe, feat, reg, strategies, hasPos, store),
     };
+  };
+
+  /** Persist a shadow economic assessment only. It cannot change tradability. */
+  const observeSwingCostGate = (candidate: TradeCandidate): void => {
+    const meta = instruments[candidate.instrument];
+    if (!meta) return;
+    try {
+      recordCostAssessment(store, assessTradeEconomics({
+        instrument: candidate.instrument, engine: "SWING_15M", strategy: candidate.strategy,
+        strategyCoreVersion: strategyCoreVersion, strategyVersion: candidate.strategyVersion, side: candidate.side,
+        entryPrice: candidate.entryPrice, stopPrice: candidate.stopPrice, takeProfitPrice: candidate.takeProfitPrice,
+        tickSize: Number(meta.tickSz), lotSize: Number(meta.lotSz), minSize: Number(meta.minSz),
+        contractValue: Number(meta.ctVal), atr: candidate.features.atr14, atrPct: candidate.features.atrPct,
+        regime: candidate.regime,
+        costs: { entryFeePct: backtestCosts.entryFeePct, exitFeePct: backtestCosts.exitFeePct,
+          slippageBps: backtestCosts.slippageBps, spreadBps: backtestCosts.spreadBps,
+          fundingBps: costGateConfig.fundingBps },
+        maxCostToRiskRatio: costGateConfig.maxCostToRiskRatio,
+        minConditionalSample: costGateConfig.minConditionalSample,
+      }));
+    } catch (error) {
+      log.warn({ event: "cost_gate_observation_failed", instrument: candidate.instrument,
+        error: error instanceof Error ? error.message.slice(0, 160) : "UNKNOWN" });
+    }
   };
 
   const reviewsInFlight = new Set<string>();
@@ -295,10 +332,13 @@ async function main(): Promise<void> {
       recordSwingScanResults(store, rows, new Map(entrySnaps.map((snap) => [snap.instrument, snap.features.ts])), undefined, trading.timeframe);
       lastScan = rows;
       for (const row of rows) {
-        if (row.candidate) logSystemEvent(store, "STRATEGY_CANDIDATE", {
+        if (!row.candidate) continue;
+        logSystemEvent(store, "STRATEGY_CANDIDATE", {
           engine: "SWING_15M", instrument: row.instrument, strategy: row.candidate.strategy,
           side: row.candidate.side, setupScore: row.candidate.setupScore, conditions: row.candidate.conditions,
         });
+        // SHADOW/OBSERVE only: record cost evidence; never alter live authorization.
+        observeSwingCostGate(row.candidate);
       }
 
       // 3) monitor every symbol holding an open position (SL/TP/AI-CLOSE)
@@ -558,6 +598,9 @@ async function main(): Promise<void> {
       monitorHealth,
       llm: llmRoles,
       entryUniverse: () => dynamicWatchlist.currentEntryUniverse(),
+      costGate: { maxCostToRiskRatio: costGateConfig.maxCostToRiskRatio,
+        fundingBps: costGateConfig.fundingBps, minConditionalSample: costGateConfig.minConditionalSample,
+        spreadBps: backtestCosts.spreadBps, slippageBps: backtestCosts.slippageBps },
     });
     scalpRunner.start();
   }
